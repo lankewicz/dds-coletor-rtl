@@ -126,15 +126,97 @@ def changed_fields(
     previous: dict[str, typing.Any] | None,
     current: dict[str, typing.Any],
 ) -> dict[str, dict[str, typing.Any]]:
-    """Retorna o diff de primeiro nível entre o snapshot anterior e o atual."""
+    """Retorna o diff entre o documento anterior e o atual (compatível com Schema v2 e v1)."""
     if previous is None:
-        return {
-            field: {"anterior": None, "novo": current.get(field)}
-            for field in TRACKED_FIELDS
-            if current.get(field) is not None
-        }
+        return {"novo": {"anterior": None, "novo": True}}
 
     changes: dict[str, dict[str, typing.Any]] = {}
+
+    # Se o documento atual utiliza Schema v2:
+    if "ordensServico" in current or "jornada" in current:
+        prev_conexao = previous.get("conexao") or {}
+        curr_conexao = current.get("conexao") or {}
+        for k in ("isOnline", "status", "veiculo", "colaborador"):
+            if prev_conexao.get(k) != curr_conexao.get(k):
+                changes[f"conexao.{k}"] = {"anterior": prev_conexao.get(k), "novo": curr_conexao.get(k)}
+
+        prev_jornada = previous.get("jornada") or {}
+        curr_jornada = current.get("jornada") or {}
+        if prev_jornada.get("emIntervalo") != curr_jornada.get("emIntervalo"):
+            changes["jornada.emIntervalo"] = {"anterior": prev_jornada.get("emIntervalo"), "novo": curr_jornada.get("emIntervalo")}
+
+        prev_turno = prev_jornada.get("turno") or {}
+        curr_turno = curr_jornada.get("turno") or {}
+        for k in ("status", "fim"):
+            if prev_turno.get(k) != curr_turno.get(k):
+                changes[f"jornada.turno.{k}"] = {"anterior": prev_turno.get(k), "novo": curr_turno.get(k)}
+
+        if len(prev_jornada.get("intervalos") or []) != len(curr_jornada.get("intervalos") or []):
+            changes["jornada.intervalos"] = {"anterior": len(prev_jornada.get("intervalos") or []), "novo": len(curr_jornada.get("intervalos") or [])}
+
+        prev_os = previous.get("ordensServico") or {}
+        curr_os = current.get("ordensServico") or {}
+        if _operational_value(prev_os.get("atual")) != _operational_value(curr_os.get("atual")):
+            changes["ordensServico.atual"] = {"anterior": prev_os.get("atual"), "novo": curr_os.get("atual")}
+
+        prev_concluidos = prev_os.get("totalConcluidos")
+        if prev_concluidos is None:
+            prev_concluidos = len(prev_os.get("historico") or [])
+        curr_concluidos = curr_os.get("totalConcluidos")
+        if curr_concluidos is None:
+            curr_concluidos = len(curr_os.get("historico") or [])
+
+        if prev_concluidos != curr_concluidos:
+            changes["ordensServico.historico"] = {"anterior": prev_concluidos, "novo": curr_concluidos}
+
+        return changes
+
+
+def compactar_equipe_para_index(document: dict[str, typing.Any]) -> dict[str, typing.Any]:
+    """Gera a versão compacta da equipe para o index.json (tempo real / torre de controle).
+    
+    Remove o array pesado de histórico, mantendo apenas o serviço atual (se em turno aberto)
+    e contadores resumidos para acompanhamento operacional em tempo real.
+    """
+    jornada = document.get("jornada") or {}
+    turno = jornada.get("turno") or {}
+    turno_status = str(turno.get("status") or "").upper()
+
+    os_section = document.get("ordensServico") or {}
+    servico_atual = os_section.get("atual")
+    historico = os_section.get("historico") or []
+
+    # Se o turno estiver FECHADO, o serviço atual fica nulo
+    if turno_status == "FECHADO":
+        servico_atual = None
+
+    ult_concluido = historico[-1] if historico else None
+    ult_hora = (
+        ult_concluido.get("retorno")
+        or ult_concluido.get("fimExecucao")
+        or ult_concluido.get("inicioExecucao")
+    ) if ult_concluido else None
+
+    return {
+        "schemaVersion": document.get("schemaVersion", 2),
+        "teamKey": document.get("teamKey"),
+        "date": document.get("date"),
+        "updatedAt": document.get("updatedAt"),
+        "timezone": document.get("timezone", "America/Sao_Paulo"),
+        "version": document.get("version", 1),
+        "conexao": document.get("conexao") or {},
+        "jornada": {
+            "turno": turno,
+            "emIntervalo": bool(jornada.get("emIntervalo")),
+            "totalIntervalos": len(jornada.get("intervalos") or []),
+        },
+        "ordensServico": {
+            "atual": servico_atual,
+            "totalConcluidos": len(historico),
+            "historicoUpdatedAt": ult_hora,
+        },
+    }
+
     for field in TRACKED_FIELDS:
         old_value = previous.get(field)
         new_value = current.get(field)
@@ -156,19 +238,39 @@ def _decode_json_object(payload: bytes) -> dict[str, typing.Any]:
 
 
 def load_json(path: Path, fallback: typing.Any) -> typing.Any:
+    target = path
+    if not target.exists():
+        if target.name.endswith(".gz"):
+            fallback_target = target.with_name(target.name[:-3])
+            if fallback_target.exists():
+                target = fallback_target
+        else:
+            fallback_target = target.with_name(target.name + ".gz")
+            if fallback_target.exists():
+                target = fallback_target
+
     try:
-        with path.open("r", encoding="utf-8") as stream:
-            value = json.load(stream)
-            return value if isinstance(value, type(fallback)) else fallback
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        payload = target.read_bytes()
+        raw = gzip.decompress(payload) if payload.startswith(b"\x1f\x8b") else payload
+        value = json.loads(raw.decode("utf-8-sig"))
+        return value if isinstance(value, type(fallback)) else fallback
+    except (FileNotFoundError, json.JSONDecodeError, OSError, gzip.BadGzipFile):
         return fallback
 
 
-def write_json(path: Path, value: typing.Any) -> None:
+def write_json(path: Path, value: typing.Any, compress: bool | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as stream:
-        json.dump(value, stream, ensure_ascii=False, indent=2, default=str)
+    temporary = path.with_name(path.name + ".tmp")
+    should_compress = compress if compress is not None else path.name.endswith(".gz")
+
+    if should_compress:
+        raw_bytes = json.dumps(value, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+        compressed_bytes = gzip.compress(raw_bytes, compresslevel=6)
+        temporary.write_bytes(compressed_bytes)
+    else:
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2, default=str)
+
     temporary.replace(path)
 
 
@@ -186,10 +288,17 @@ def _safe_team_key(value: str) -> str:
 def _iso_local(value: typing.Any, day: str | None = None) -> str | None:
     if value in (None, "", "-"):
         return None
+    if isinstance(value, (int, float)) and value > 1000000000000:
+        return datetime.datetime.fromtimestamp(value / 1000, LOCAL_TZ).isoformat()
     raw = str(value).strip()
     if len(raw) == 5 and raw[2] == ":" and day:
         try:
             return datetime.datetime.fromisoformat(f"{day}T{raw}:00").replace(tzinfo=LOCAL_TZ).isoformat()
+        except ValueError:
+            return None
+    if len(raw) == 8 and raw[2] == ":" and raw[5] == ":" and day:
+        try:
+            return datetime.datetime.fromisoformat(f"{day}T{raw}").replace(tzinfo=LOCAL_TZ).isoformat()
         except ValueError:
             return None
     try:
@@ -256,6 +365,12 @@ def _formatar_horarios_servico(service: dict[str, typing.Any], base_day: str) ->
         if not raw_val or str(raw_val).strip() in ("", "-"):
             continue
 
+        if isinstance(raw_val, (int, float)) and raw_val > 1000000000000:
+            dt_val = datetime.datetime.fromtimestamp(raw_val / 1000, LOCAL_TZ)
+            prev_dt = dt_val
+            result[key] = dt_val.isoformat()
+            continue
+
         raw_str = str(raw_val).strip()
         dt_val: datetime.datetime | None = None
 
@@ -265,6 +380,15 @@ def _formatar_horarios_servico(service: dict[str, typing.Any], base_day: str) ->
                 if prev_dt and prev_dt.hour >= 21 and int(raw_str[:2]) < 6:
                     cur_day = cur_day + datetime.timedelta(days=1)
                     candidate = datetime.datetime.fromisoformat(f"{cur_day.isoformat()}T{raw_str}:00").replace(tzinfo=LOCAL_TZ)
+                dt_val = candidate
+            except ValueError:
+                dt_val = None
+        elif len(raw_str) == 8 and raw_str[2] == ":" and raw_str[5] == ":":
+            try:
+                candidate = datetime.datetime.fromisoformat(f"{cur_day.isoformat()}T{raw_str}").replace(tzinfo=LOCAL_TZ)
+                if prev_dt and prev_dt.hour >= 21 and int(raw_str[:2]) < 6:
+                    cur_day = cur_day + datetime.timedelta(days=1)
+                    candidate = datetime.datetime.fromisoformat(f"{cur_day.isoformat()}T{raw_str}").replace(tzinfo=LOCAL_TZ)
                 dt_val = candidate
             except ValueError:
                 dt_val = None
@@ -307,7 +431,6 @@ def _service_id(team_key: str, service: dict[str, typing.Any]) -> str:
         for value in (
             team_key,
             service.get("inicioIso") or service.get("inicioDeslocamento") or service.get("inicioExecucao"),
-            service.get("sequencia"),
         )
     )
     return f"{team_key}_{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
@@ -353,35 +476,55 @@ def compact_service(team_key: str, day: str, service: dict[str, typing.Any]) -> 
 
 
 def _compact_interval(day: str, interval: dict[str, typing.Any]) -> dict[str, typing.Any] | None:
-    start = _iso_local(interval.get("inicioIso"), day)
+    start = _iso_local(interval.get("inicioIso") or interval.get("inicio"), day)
     if not start and interval.get("inicio_ms"):
-        start = _iso_local(datetime.datetime.fromtimestamp(int(interval["inicio_ms"]) / 1000, datetime.timezone.utc).isoformat(), day)
+        start = _iso_local(int(interval["inicio_ms"]), day)
     if not start:
         return None
-    end = _iso_local(interval.get("fimIso"), day)
+    end = _iso_local(interval.get("fimIso") or interval.get("fim"), day)
     if not end and interval.get("fim_ms"):
-        end = _iso_local(datetime.datetime.fromtimestamp(int(interval["fim_ms"]) / 1000, datetime.timezone.utc).isoformat(), day)
-    return {"inicio": start, "fim": end}
+        end = _iso_local(int(interval["fim_ms"]), day)
+    duracao = None
+    if start and end:
+        try:
+            d_start = datetime.datetime.fromisoformat(start)
+            d_end = datetime.datetime.fromisoformat(end)
+            duracao = int((d_end - d_start).total_seconds() // 60)
+        except Exception:
+            duracao = None
+    return {"inicio": start, "fim": end, "duracaoMinutos": duracao}
 
 
 def _merge_service_records(team_key: str, records: list[dict[str, typing.Any]]) -> dict[str, dict[str, typing.Any]]:
     result = {}
     keys = {}
+    starts = {}
     for incoming in records:
         item = dict(incoming)
         sid = _service_id(team_key, item)
         start = item.get("inicioDeslocamento") or item.get("inicioExecucao")
         prot = str(item.get("protocolo") or "").strip()
-        key = (team_key, start, prot) if start and _eh_protocolo_valido(prot) else None
-        target = keys.get(key, sid) if key else sid
+        prot_valid = _eh_protocolo_valido(prot)
+        key = (team_key, start, prot) if start and prot_valid else None
+
+        target = None
+        if key and key in keys:
+            target = keys[key]
+        elif sid in result:
+            target = sid
+        elif start and (team_key, start) in starts:
+            target = starts[(team_key, start)]
+        else:
+            target = sid
+
         old = result.get(target, {})
         old_prot = str(old.get("protocolo") or "").strip()
         old_start = old.get("inicioDeslocamento") or old.get("inicioExecucao")
-        if old and ((old_prot and prot and old_prot != prot) or
-                    (old_start and start and old_start != start)):
+        if old and old_prot and prot_valid and old_prot != prot:
             suffix = hashlib.sha256(repr((sid, start, prot)).encode()).hexdigest()[:24]
             target = f"{team_key}_{suffix}"
             old = result.get(target, {})
+
         merged = dict(old)
         old_time = old.get("observadoEm")
         new_time = item.get("observadoEm")
@@ -402,6 +545,8 @@ def _merge_service_records(team_key: str, records: list[dict[str, typing.Any]]) 
         result[target] = merged
         if key:
             keys[key] = target
+        if start:
+            starts[(team_key, start)] = target
     return result
 
 
@@ -416,11 +561,20 @@ def merge_daily_document(
         raise ValueError("Historico pertence a outra equipe")
     if previous.get("date") and previous["date"] != day:
         raise ValueError("Historico pertence a outra data")
-    records = [dict(s) for s in previous.get("services", [])]
-    for field in ("ssExecutadas", "ssEmAndamento", "services"):
+
+    # Recupera serviços anteriores (compatível com v2 ordensServico.historico ou v1 services)
+    records = []
+    if isinstance(previous.get("ordensServico"), dict):
+        records = [dict(s) for s in previous["ordensServico"].get("historico", [])]
+        if previous["ordensServico"].get("atual"):
+            records.append(dict(previous["ordensServico"]["atual"]))
+    elif "services" in previous:
+        records = [dict(s) for s in previous.get("services", [])]
+
+    for field in ("ssExecutadas", "ssEmAndamento", "services", "bdoList"):
         for raw in current.get(field) or []:
             item = compact_service(team_key, day, raw)
-            item["observadoEm"] = current.get("updatedAtIso")
+            item["observadoEm"] = current.get("updatedAtIso") or current.get("updatedAt")
             for meta in ("fonteProtocolo", "validacaoProtocolo", "protocoloBruto"):
                 if raw.get(meta) is not None:
                     item[meta] = raw[meta]
@@ -432,9 +586,16 @@ def merge_daily_document(
             records.append(item)
     service_map = _merge_service_records(team_key, records)
 
+    # Intervalos anteriores e novos
+    prev_intervals = []
+    if isinstance(previous.get("jornada"), dict):
+        prev_intervals = previous["jornada"].get("intervalos") or []
+    elif isinstance(previous.get("turno"), dict):
+        prev_intervals = previous["turno"].get("intervalos") or []
+
     interval_map = {
         str(item.get("inicio")): dict(item)
-        for item in ((previous.get("turno") or {}).get("intervalos") or [])
+        for item in prev_intervals
         if isinstance(item, dict) and item.get("inicio")
     }
     raw_intervals = current.get("intervalos") or []
@@ -476,33 +637,82 @@ def merge_daily_document(
                     srv["fimExecucao"] = proximo_ini or srv.get("inicioExecucao") or srv.get("inicioDeslocamento")
                     srv["retorno"] = srv["fimExecucao"]
 
-    prev_version = int((previous.get("current") or {}).get("version") or 0)
+    # Fila de pendências (usada para registrar filaNaAbertura se o turno estiver abrindo)
+    fila_total = int(current.get("ssPendentesCount") or 0)
+    fila_emergencia = int(current.get("ssPendentesEmergenciaCount") or 0)
+    fila_comercial = int(current.get("ssPendentesComercialCount") or 0)
+
+    # Status e horários do turno
+    status_turno = "ABERTO" if (turno.get("aberto") or current.get("estadoConsolidado") == "ABERTO" or current_service) else ("FECHADO" if turno.get("classificacao") == "FECHADO" else "FECHADO")
+    ini_turno = _iso_local(turno.get("inicio_iso") or turno.get("inicioIso") or turno.get("inicio"), day)
+    fim_turno = _iso_local(turno.get("fim_iso") or turno.get("fimIso") or turno.get("fim"), day)
+    duracao_minutos = None
+    if ini_turno and fim_turno:
+        try:
+            d_ini = datetime.datetime.fromisoformat(ini_turno)
+            d_fim = datetime.datetime.fromisoformat(fim_turno)
+            duracao_minutos = int((d_fim - d_ini).total_seconds() // 60)
+        except Exception:
+            duracao_minutos = None
+
+    # Fila na abertura de turno
+    prev_fila_abertura = None
+    if isinstance(previous.get("jornada"), dict):
+        prev_fila_abertura = (previous["jornada"].get("turno") or {}).get("filaNaAbertura")
+    elif isinstance(previous.get("turno"), dict):
+        prev_fila_abertura = previous["turno"].get("filaNaAbertura")
+
+    if prev_fila_abertura is not None:
+        fila_na_abertura = prev_fila_abertura
+    elif status_turno == "ABERTO":
+        fila_na_abertura = {
+            "total": fila_total,
+            "emergencia": fila_emergencia,
+            "comercial": fila_comercial,
+        }
+    else:
+        fila_na_abertura = None
+
+    # Histórico de serviços concluídos / redirecionados
+    historico = [srv for srv in services if srv.get("statusAtual") in ("CONCLUSAO", "REDIRECIONADO", "CANCELADO")]
+
+    prev_version = int(previous.get("version") or (previous.get("current") or {}).get("version") or 0)
     prev_date = str(previous.get("date") or "")
     daily_version = 1 if prev_date != day else (prev_version + 1 if previous else 1)
 
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "teamKey": team_key,
         "date": day,
-        "updatedAt": current.get("updatedAtIso"),
+        "updatedAt": current.get("updatedAtIso") or current.get("updatedAt"),
         "timezone": str(LOCAL_TZ),
-        "current": {
-            "version": daily_version,
-            "statusConexao": current.get("statusConexao"),
-            "isOnline": current.get("isOnline"),
-            "veiculo": current.get("veiculo"),
-            "identificadorEquipamento": current.get("identificadorEquipamento"),
-            "origemResolucaoEquipe": current.get("origemResolucaoEquipe"),
-            "colaborador": current.get("colaborador"),
-            "estadoConsolidado": current.get("estadoConsolidado"),
-            "atividadeAtual": current_service,
+        "version": daily_version,
+        "conexao": {
+            "isOnline": bool(current.get("isOnline")),
+            "status": current.get("statusConexao") or "offline",
+            "veiculo": current.get("veiculo") or "",
+            "identificadorEquipamento": current.get("identificadorEquipamento") or "",
+            "colaborador": current.get("colaborador") or "",
+            "origemResolucao": current.get("origemResolucaoEquipe") or "",
         },
-        "turno": {
-            "inicio": _iso_local(turno.get("inicio_iso") or turno.get("inicioIso"), day),
-            "fim": _iso_local(turno.get("fim_iso") or turno.get("fimIso"), day),
+        "jornada": {
+            "turno": {
+                "status": status_turno,
+                "inicio": ini_turno,
+                "fim": fim_turno,
+                "duracaoMinutos": duracao_minutos,
+                "filaNaAbertura": fila_na_abertura,
+            },
+            "emIntervalo": bool(
+                ((current.get("intervalo") or {}).get("em_intervalo") and not (current.get("intervalo") or {}).get("fim_ms") and not (current.get("intervalo") or {}).get("fimIso"))
+                or current.get("estadoConsolidado") == "INTERVALO"
+            ) and current_service is None,
             "intervalos": sorted(interval_map.values(), key=lambda item: str(item.get("inicio") or "")),
         },
-        "services": services,
+        "ordensServico": {
+            "atual": current_service,
+            "historico": historico,
+        },
     }
 
 
@@ -642,6 +852,12 @@ class RotalogTeamFileRepository:
 
     def save_current(self, document: dict[str, typing.Any]) -> None:
         path = self.current_path(document.get("teamKey") or document.get("equipe"))
+        self.store.save_blob(path, document)
+
+    def save_daily(self, document: dict[str, typing.Any], day: str) -> None:
+        """Gravação única e direta no Storage da equipe consolidada no dia."""
+        team_key = _safe_team_key(document.get("teamKey") or document.get("equipe"))
+        path = self.daily_path(day, team_key)
         self.store.save_blob(path, document)
 
     def merge_and_save_daily(self, current: dict[str, typing.Any], day: str) -> dict[str, typing.Any]:

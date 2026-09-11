@@ -30,6 +30,7 @@ from coletor.storage import (
     RotalogTeamFileRepository,
     build_rotalog_document,
     changed_fields,
+    compactar_equipe_para_index,
     load_json,
     merge_daily_document,
     normalize_team_key,
@@ -86,7 +87,7 @@ class LocalRotalogRunner:
     def __init__(self, output_dir: Path, empresa: str, enable_firebase: bool = False):
         self.output_dir = output_dir
         self.empresa = empresa
-        self.index_path = output_dir / "rotalog" / "equipes" / "current" / "index.json"
+        self.index_path = output_dir / "rotalog" / "equipes" / "current" / "index.json.gz"
         self.log_path = output_dir / "rotalog" / "logs" / "execucoes.jsonl"
         self.enable_firebase = enable_firebase
         self.firebase_store = None
@@ -112,16 +113,18 @@ class LocalRotalogRunner:
             try:
                 remote_payload = self.firebase_store.load()
                 remote_snapshots = (
-                    remote_payload.get("snapshots")
-                    if isinstance(remote_payload.get("snapshots"), dict)
-                    else remote_payload
+                    remote_payload.get("equipes")
+                    or remote_payload.get("snapshots")
+                    if isinstance(remote_payload, dict)
+                    else {}
                 )
                 if isinstance(remote_snapshots, dict) and remote_snapshots:
                     previous = remote_snapshots
                     write_json(self.index_path, {
-                        "schemaVersion": 1,
+                        "schemaVersion": 2,
                         "company": self.empresa,
                         "lastCollectedAt": remote_payload.get("updatedAtIso") or datetime.now(TZ).isoformat(),
+                        "totalEquipes": len(previous),
                         "equipes": previous,
                     })
                     LOG.info("Cache local inicial hidratado com %d equipes do Storage", len(previous))
@@ -144,40 +147,53 @@ class LocalRotalogRunner:
                 document = build_rotalog_document(
                     team, self.empresa, team_key, timestamp, queue_counts(team)
                 )
+
+                daily_path = self.output_dir / "rotalog" / "equipes" / "daily" / day / f"{team_key}.json.gz"
+                merged_daily = merge_daily_document(load_json(daily_path, {}), document, day)
+
                 old = previous.get(team_key)
-                document["historyDay"] = day
-                document["version"] = 1 if not old or old.get("historyDay") != day else int(old.get("version") or 0) + 1
-
-                if old and not changed_fields(old, document) and old.get("historyDay") == day:
+                if old and not changed_fields(old, merged_daily) and old.get("date") == day:
                     ignored += 1
-                    document = {**old, "lastCollectedAt": timestamp}
+                    merged_daily["updatedAt"] = timestamp
                 else:
-                    document["lastCollectedAt"] = timestamp
-                    updates[team_key] = document
+                    updates[team_key] = merged_daily
 
-                    # 1. Grava no disco local
-                    current_path = self.output_dir / "rotalog" / "equipes" / "current" / f"{team_key}.json"
-                    write_json(current_path, document)
-                    daily_path = self.output_dir / "rotalog" / "equipes" / "daily" / day / f"{team_key}.json"
-                    merged_daily = merge_daily_document(load_json(daily_path, {}), document, day)
+                    # 1. Grava SEMPRE no disco local (fidelidade máxima da linha do tempo)
                     write_json(daily_path, merged_daily)
 
-                    # 2. Grava no Firebase Storage (GCS)
-                    if self.firebase_enabled and self.team_repo:
+                    # 2. Envia ao Firebase Storage apenas em eventos-chave (conclusão de serviço ou fechamento de turno)
+                    old_concluidos = (
+                        old.get("ordensServico", {}).get("totalConcluidos")
+                        if old and "totalConcluidos" in (old.get("ordensServico") or {})
+                        else len(old.get("ordensServico", {}).get("historico", [])) if old else 0
+                    )
+                    curr_concluidos = len(merged_daily.get("ordensServico", {}).get("historico", []))
+                    concluiu_servico = (old is None and curr_concluidos > 0) or (curr_concluidos > old_concluidos)
+
+                    old_turno = old.get("jornada", {}).get("turno", {}).get("status") if old else None
+                    curr_turno = merged_daily.get("jornada", {}).get("turno", {}).get("status")
+                    fechou_turno = (curr_turno == "FECHADO" and old_turno != "FECHADO")
+
+                    if self.firebase_enabled and self.team_repo and (concluiu_servico or fechou_turno):
                         try:
-                            self.team_repo.save_current(document)
-                            self.team_repo.merge_and_save_daily(document, day)
+                            self.team_repo.save_daily(merged_daily, day)
                         except Exception as exc:
                             LOG.error("Erro ao sincronizar equipe %s no Storage: %s", team_key, exc)
 
-                previous[team_key] = document
+                previous[team_key] = merged_daily
 
-            # Grava o índice consolidado local
+            index_equipes = {
+                team_k: compactar_equipe_para_index(doc)
+                for team_k, doc in previous.items()
+            }
+
+            # Grava o índice consolidado local (formato tempo real / torre de controle)
             write_json(self.index_path, {
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "company": self.empresa,
                 "lastCollectedAt": timestamp,
-                "equipes": previous,
+                "totalEquipes": len(index_equipes),
+                "equipes": index_equipes,
             })
 
             # Grava o índice consolidado (index.json.gz) no Firebase Storage
@@ -185,9 +201,12 @@ class LocalRotalogRunner:
             if self.firebase_enabled and self.firebase_store:
                 try:
                     self.firebase_store.save({
-                        "version": 2,
+                        "schemaVersion": 2,
+                        "company": self.empresa,
                         "updatedAtIso": timestamp,
-                        "snapshots": previous,
+                        "totalEquipes": len(index_equipes),
+                        "equipes": index_equipes,
+                        "snapshots": index_equipes,
                     })
                     firebase_uploaded = True
                 except Exception as exc:
@@ -248,13 +267,17 @@ def main() -> int:
     parser.add_argument("--interval-seconds", type=int, default=120, help="Intervalo entre coletas (segundos)")
     parser.add_argument("--empresa", default=os.getenv("DDS_EMPRESA_PADRAO", "ChicoEletro"))
     parser.add_argument("--firebase", action="store_true", help="Ativa sincronização automática com Firebase Storage")
+    parser.add_argument("--no-firebase", action="store_true", help="Força desativação do Firebase Storage (apenas local)")
     parser.add_argument("--once", action="store_true", help="Executa somente uma vez e finaliza")
     args = parser.parse_args()
 
     if args.interval_seconds < 30:
         parser.error("--interval-seconds deve ser no mínimo 30")
 
-    enable_firebase = args.firebase or os.getenv("ROTALOG_UPLOAD_FIREBASE", "false").strip().lower() in ("true", "1", "yes")
+    if args.no_firebase:
+        enable_firebase = False
+    else:
+        enable_firebase = args.firebase or os.getenv("ROTALOG_UPLOAD_FIREBASE", "false").strip().lower() in ("true", "1", "yes")
 
     runner = LocalRotalogRunner(Path(args.output_dir).resolve(), args.empresa, enable_firebase=enable_firebase)
     while True:

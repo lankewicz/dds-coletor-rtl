@@ -207,7 +207,7 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     _line(screen, 12, "HISTORICO RECENTE", width, curses.A_UNDERLINE)
     _line(screen, 13, f"Ciclos: {len(history)}  |  sucesso: {len(successful)}  |  erros: {errors}  |  media: {_format_duration(average)}", width)
     _line(screen, 14, f"Equipes atualizadas: {total_updates}  |  ignoradas: {total_ignored}", width)
-    _line(screen, 16, "Arquivos: equipes/current/index.json  |  equipes/daily/AAAA-MM-DD  |  logs/execucoes.jsonl", width)
+    _line(screen, 16, "Arquivos: equipes/current/index.json.gz  |  equipes/daily/AAAA-MM-DD/*.json.gz  |  logs/execucoes.jsonl", width)
 
     if is_viewer:
         _line(screen, height - 2, "Teclas: q = fechar visualizador (o servico continuara rodando normalmente)", width, curses.A_REVERSE)
@@ -245,6 +245,7 @@ def main() -> int:
     parser.add_argument("--interval-seconds", type=int, default=120)
     parser.add_argument("--empresa", default=os.getenv("DDS_EMPRESA_PADRAO", "ChicoEletro"))
     parser.add_argument("--firebase", action="store_true", help="Ativa sincronização automática com Firebase Storage")
+    parser.add_argument("--no-firebase", action="store_true", help="Força desativação do Firebase Storage (apenas local)")
     parser.add_argument("--view", action="store_true", help="Abre como visualizador passivo do serviço systemd (sem raspar)")
     args = parser.parse_args()
 
@@ -252,7 +253,10 @@ def main() -> int:
         parser.error("--interval-seconds deve ser no mínimo 30")
 
     output_dir = Path(args.output_dir).resolve()
-    enable_firebase = args.firebase or os.getenv("ROTALOG_UPLOAD_FIREBASE", "false").strip().lower() in ("true", "1", "yes")
+    if args.no_firebase:
+        enable_firebase = False
+    else:
+        enable_firebase = args.firebase or os.getenv("ROTALOG_UPLOAD_FIREBASE", "false").strip().lower() in ("true", "1", "yes")
 
     if args.view:
         runner = None

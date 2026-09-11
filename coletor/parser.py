@@ -246,111 +246,88 @@ def consolidar_turno_por_contexto(
     if not markers and not all_services:
         return result
 
-    if tem_atividade_andamento:
-        inicio_t = None
-        if markers:
-            inicio_t = int(markers[-1]["start"])
-        if not inicio_t:
-            inicio_t = services_today[0] if services_today else (all_services[-1] if all_services else None)
+    markers_today = [m for m in markers if int(m["start"]) >= inicio_dia_ms]
+    first_marker_today = markers_today[0] if markers_today else None
+    last_marker_today = markers_today[-1] if markers_today else None
 
+    # 1. Determina o horário de início do turno
+    inicio_ms = None
+    if first_marker_today:
+        inicio_ms = int(first_marker_today["start"])
+    elif services_today:
+        inicio_ms = services_today[0]
+    elif markers:
+        inicio_ms = int(markers[0]["start"])
+    elif all_services:
+        inicio_ms = all_services[0]
+
+    # 2. Se a equipe tem atividade em andamento, o turno está ABERTO
+    if tem_atividade_andamento:
         result.update({
             "aberto": True,
-            "inicio_ms": inicio_t,
-            "inicio_iso": _convert_ms_to_iso(inicio_t) if inicio_t else None,
+            "inicio_ms": inicio_ms,
+            "inicio_iso": _convert_ms_to_iso(inicio_ms) if inicio_ms else None,
+            "fim_ms": None,
+            "fim_iso": None,
             "classificacao": "ABERTO",
         })
         return result
 
-    fim_turno_ms = retorno_ultimo_servico_ms if retorno_ultimo_servico_ms else (all_services[-1] if all_services else None)
+    fim_servico_ms = retorno_ultimo_servico_ms if retorno_ultimo_servico_ms else (services_today[-1] if services_today else (all_services[-1] if all_services else None))
 
-    if markers and fim_turno_ms:
-        last_t = int(markers[-1]["start"])
-        if last_t > fim_turno_ms:
-            if (now_ms - last_t) < 2 * 3600 * 1000:
-                result.update({
-                    "aberto": True,
-                    "inicio_ms": last_t,
-                    "inicio_iso": _convert_ms_to_iso(last_t),
-                    "fim_ms": None,
-                    "fim_iso": None,
-                    "classificacao": "ABERTO",
-                })
-                return result
+    # 3. Verifica se há marcador T de Fechamento de Turno
+    # Um marcador T é considerado fechamento se ocorreu após os serviços executados
+    # e pelo menos 1 hora após a abertura do turno
+    tem_fechamento_t = False
+    fim_fechamento_ms = None
 
-    if all_services and fim_turno_ms:
-        tempo_sem_servico_ms = now_ms - fim_turno_ms
-        duas_horas_ms = 2 * 3600 * 1000
+    if last_marker_today and first_marker_today:
+        t_last = int(last_marker_today["start"])
+        t_first = int(first_marker_today["start"])
+        if t_last - t_first >= 3600 * 1000:
+            if not fim_servico_ms or t_last >= (fim_servico_ms - 5 * 60 * 1000):
+                tem_fechamento_t = True
+                fim_fechamento_ms = t_last
 
-        inicio_ms = None
-        if markers:
-            for m in reversed(markers):
-                t_val = int(m["start"])
-                if t_val <= all_services[-1]:
-                    inicio_ms = t_val
-                    break
-        if not inicio_ms:
-            inicio_ms = services_today[0] if services_today else all_services[0]
+    if tem_fechamento_t:
+        result.update({
+            "aberto": False,
+            "inicio_ms": inicio_ms,
+            "inicio_iso": _convert_ms_to_iso(inicio_ms) if inicio_ms else None,
+            "fim_ms": fim_fechamento_ms,
+            "fim_iso": _convert_ms_to_iso(fim_fechamento_ms) if fim_fechamento_ms else None,
+            "classificacao": "FECHADO",
+        })
+        return result
 
+    # 4. Se não há marcador de fechamento: verificar inatividade prolongada
+    if fim_servico_ms:
+        tempo_sem_servico_ms = now_ms - fim_servico_ms
         hora_atual_local = now.hour
-        dt_fim_servico = datetime.datetime.fromtimestamp(fim_turno_ms / 1000, LOCAL_TZ) if fim_turno_ms else None
-        dia_atual = now.date()
-        services_today_exist = bool(services_today)
-        markers_today_exist = bool(markers and any(
-            datetime.datetime.fromtimestamp(int(m["start"]) / 1000, LOCAL_TZ).date() == dia_atual
-            for m in markers if m.get("start")
-        ))
-        sem_atividade_hoje = (not services_today_exist and not markers_today_exist)
 
-        era_plantao_madrugada = False
-        if dt_fim_servico:
-            if dt_fim_servico.date() < dia_atual or (dt_fim_servico.date() == dia_atual and dt_fim_servico.hour < 8):
-                era_plantao_madrugada = True
+        fechar_diurno_20h = (hora_atual_local >= 20 and tempo_sem_servico_ms >= 2 * 3600 * 1000)
+        fechar_inatividade_longa = (tempo_sem_servico_ms >= int(3.5 * 3600 * 1000) and hora_atual_local >= 19)
 
-        tem_marcador_fim = bool(markers and int(markers[-1]["start"]) >= fim_turno_ms)
-        fim_fechamento_ms = int(markers[-1]["start"]) if (tem_marcador_fim and int(markers[-1]["start"]) > fim_turno_ms) else fim_turno_ms
-
-        fechar_plantao_08h = (hora_atual_local >= 8 and era_plantao_madrugada and tempo_sem_servico_ms >= duas_horas_ms)
-        fechar_diurno_20h = (hora_atual_local >= 20 and tempo_sem_servico_ms >= duas_horas_ms)
-        fechar_inatividade_longa = (tempo_sem_servico_ms >= int(2.5 * 3600 * 1000))
-
-        deve_fechar = (
-            tem_marcador_fim
-            or sem_atividade_hoje
-            or fechar_plantao_08h
-            or fechar_diurno_20h
-            or fechar_inatividade_longa
-        )
-
-        if deve_fechar:
+        if fechar_diurno_20h or fechar_inatividade_longa:
             result.update({
                 "aberto": False,
                 "inicio_ms": inicio_ms,
-                "inicio_iso": _convert_ms_to_iso(inicio_ms),
-                "fim_ms": fim_fechamento_ms,
-                "fim_iso": _convert_ms_to_iso(fim_fechamento_ms),
+                "inicio_iso": _convert_ms_to_iso(inicio_ms) if inicio_ms else None,
+                "fim_ms": fim_servico_ms,
+                "fim_iso": _convert_ms_to_iso(fim_servico_ms) if fim_servico_ms else None,
                 "classificacao": "FECHADO",
             })
             return result
-        else:
-            result.update({
-                "aberto": True,
-                "inicio_ms": inicio_ms,
-                "inicio_iso": _convert_ms_to_iso(inicio_ms),
-                "fim_ms": None,
-                "fim_iso": None,
-                "classificacao": "ABERTO",
-            })
-            return result
 
-    if markers:
-        last_t = int(markers[-1]["start"])
+    # 5. Caso contrário, se o turno foi aberto hoje e não foi fechado, permanece ABERTO!
+    if inicio_ms:
         result.update({
-            "aberto": False,
-            "inicio_ms": last_t,
-            "inicio_iso": _convert_ms_to_iso(last_t),
-            "fim_ms": last_t,
-            "fim_iso": _convert_ms_to_iso(last_t),
-            "classificacao": "FECHADO",
+            "aberto": True,
+            "inicio_ms": inicio_ms,
+            "inicio_iso": _convert_ms_to_iso(inicio_ms),
+            "fim_ms": None,
+            "fim_iso": None,
+            "classificacao": "ABERTO",
         })
         return result
 
@@ -433,16 +410,14 @@ def consolidar_equipes_duplicadas(equipes: list[dict[str, typing.Any]]) -> list[
 def _servico_precisa_detalhes(srv: dict[str, typing.Any]) -> bool:
     if not _eh_protocolo_valido(srv.get("protocolo")):
         return True
+    if srv.get("latitude") is None:
+        return True
+    if not srv.get("inicioDeslocamento") and not srv.get("inicioExecucao") and not srv.get("inicioIso"):
+        return True
     status = srv.get("status") or srv.get("statusAtual")
-    fields = ["inicioDeslocamento"]
-    if status in {"EXECUCAO", "CONCLUSAO"}:
-        fields.append("inicioExecucao")
-    if status == "CONCLUSAO":
-        fields.append("termino")
-        fields.append("retorno")
-    return (any(not srv.get(f) for f in fields)
-            or any(f in srv.get("camposEstimados", []) for f in fields)
-            or srv.get("detalhesStatus") != status)
+    if status == "CONCLUSAO" and not (srv.get("termino") or srv.get("retorno") or srv.get("fimIso")):
+        return True
+    return False
 
 
 def _enriquecer_com_snapshot_anterior(
@@ -459,54 +434,71 @@ def _enriquecer_com_snapshot_anterior(
         "ssId",
         "categoria",
         "sequencia",
+        "tipo",
         "latitude",
         "longitude",
         "geolocalizacao",
         "inicioDeslocamento",
         "inicioExecucao",
-        "retorno",
     )
     for eq in equipes:
         equipe_codigo = str(eq.get("equipe_codigo") or "").strip().upper()
         team_key = re.sub(r"[^A-Z0-9_-]+", "", equipe_codigo)
         anterior = snapshots.get(team_key) or snapshots.get(equipe_codigo) or {}
-        servicos_anteriores = (
-            (anterior.get("ssExecutadas") or [])
-            + (anterior.get("ssEmAndamento") or [])
-        )
+
+        # Compatível com Schema v2 (ordensServico) e Schema v1 (ssExecutadas/ssEmAndamento)
+        os_section = anterior.get("ordensServico") or {}
+        servicos_anteriores = list(anterior.get("ssExecutadas") or []) + list(anterior.get("ssEmAndamento") or [])
+        if os_section.get("historico"):
+            servicos_anteriores.extend(os_section["historico"])
+        if os_section.get("atual"):
+            servicos_anteriores.append(os_section["atual"])
+
+        if not servicos_anteriores:
+            continue
+
         for srv in (eq.get("ss_executadas") or []) + (eq.get("ss_em_andamento") or []):
-            inicio = str(srv.get("inicioIso") or "")
-            tipo = str(srv.get("tipo") or "").strip().upper()
-            if not inicio or not tipo:
+            inicio_srv = str(srv.get("inicioIso") or srv.get("inicioDeslocamento") or srv.get("inicioExecucao") or "")[:16]
+            tipo_srv = str(srv.get("tipo") or "").strip().upper()
+            if not inicio_srv:
                 continue
-            candidatos = [
-                item
-                for item in servicos_anteriores
-                if str(item.get("inicioIso") or "") == inicio
-                and str(item.get("tipo") or "").strip().upper() == tipo
-                and _eh_protocolo_valido(item.get("protocolo"))
-            ]
-            if len(candidatos) != 1:
+
+            candidatos = []
+            for item in servicos_anteriores:
+                inicio_item = str(item.get("inicioDeslocamento") or item.get("inicioIso") or item.get("inicioExecucao") or "")[:16]
+                if not inicio_item or inicio_item != inicio_srv:
+                    continue
+                if not _eh_protocolo_valido(item.get("protocolo")):
+                    continue
+                tipo_item = str(item.get("tipo") or "").strip().upper()
+                if not tipo_srv or not tipo_item or tipo_srv in tipo_item or tipo_item in tipo_srv:
+                    candidatos.append(item)
+
+            if not candidatos:
                 continue
+
             anterior_srv = candidatos[0]
             if (_eh_protocolo_valido(srv.get("protocolo"))
-                    and srv["protocolo"] != anterior_srv["protocolo"]):
+                    and srv["protocolo"] != anterior_srv.get("protocolo")):
                 continue
+
             for campo in campos:
                 valor = anterior_srv.get(campo)
                 missing = srv.get(campo) in (None, "")
-                estimated = (campo in srv.get("camposEstimados", [])
-                             and campo not in anterior_srv.get("camposEstimados", [])
-                             and bool(anterior_srv.get("detalhesStatus")))
-                missing = missing or estimated
-                if campo in {"protocolo", "protocoloBruto", "ssId"}:
-                    missing = not _eh_protocolo_valido(srv.get(campo))
-                if missing and valor not in (None, ""):
+                estimated = campo in srv.get("camposEstimados", [])
+                if campo == "tipo" and valor and srv.get("tipo"):
+                    if str(srv["tipo"]).strip().upper() in str(valor).strip().upper():
+                        missing = True
+                if (missing or estimated) and valor not in (None, ""):
                     srv[campo] = valor
-                    if estimated and campo in srv.get("camposEstimados", []):
+                    if campo in srv.get("camposEstimados", []):
                         srv["camposEstimados"].remove(campo)
-            if anterior_srv.get("detalhesStatus") and anterior_srv.get("detalhesStatus") == srv.get("status"):
-                srv["detalhesStatus"] = anterior_srv["detalhesStatus"]
+
+            for campo in ("termino", "retorno"):
+                if srv.get(campo) in (None, "") and anterior_srv.get(campo) not in (None, ""):
+                    srv[campo] = anterior_srv.get(campo)
+
+            srv["detalhesStatus"] = srv.get("status")
             srv["fonteProtocolo"] = anterior_srv.get("fonteProtocolo") or "SNAPSHOT_ANTERIOR"
             srv["validacaoProtocolo"] = anterior_srv.get("validacaoProtocolo") or "EQUIPE_INICIO_TIPO_UNICOS"
             resolvidos += 1
@@ -530,6 +522,10 @@ def _forcar_cliques_timeline_tempo_real(
             or "tempoRealPendente" in item.get("className", "")
         )
     ]
+    # Prioriza o serviço ativo atual (deslocamento/execução) antes de executados
+    service_items.sort(
+        key=lambda it: 0 if ("EmExecucao" in it.get("className", "") or "EmDeslocamento" in it.get("className", "")) else 1
+    )
 
     if not service_items or not view_state:
         return {}
@@ -553,7 +549,7 @@ def _forcar_cliques_timeline_tempo_real(
             group = item.get("group", "")
             is_executado = "tempoRealExecutado" in cls
 
-            cache_key = (start_ms, end_ms, group, item.get("content"), idx)
+            cache_key = (start_ms, end_ms, group, item.get("content"))
             if is_executado and cache_key in _CLIQUE_EVENTOS_CACHE:
                 cached = dict(_CLIQUE_EVENTOS_CACHE[cache_key])
                 cached["eventIdx"] = idx
@@ -571,7 +567,7 @@ def _forcar_cliques_timeline_tempo_real(
         end_ms = item.get("end")
         group = item.get("group", "")
         is_executado = "tempoRealExecutado" in cls
-        cache_key = (start_ms, end_ms, group, item.get("content"), idx) if is_executado else None
+        cache_key = (start_ms, end_ms, group, item.get("content")) if is_executado else None
 
         payload = {
             "javax.faces.partial.ajax": "true",
@@ -631,12 +627,40 @@ def _forcar_cliques_timeline_tempo_real(
                     }
                     equipe_popup = re.search(r"Equipe[\s:-]*(E[A-Z0-9]{3,7})\b", p_clean, re.IGNORECASE)
                     equipe_item = parse_group_string(group).get("equipe_codigo", "")
-                    if not equipe_popup or equipe_popup.group(1).upper() != equipe_item.upper():
+                    if equipe_popup and equipe_item:
+                        if equipe_popup.group(1).upper() != equipe_item.upper():
+                            return idx, None, None, False
+
+                    # Validação de compatibilidade de horários
+                    start_hora = _convert_ms_to_hora(start_ms)
+                    end_hora = _convert_ms_to_hora(end_ms) if isinstance(end_ms, int) else None
+                    desl_hora = data.get("inicioDeslocamento")
+                    exec_hora = data.get("inicioExecucao")
+                    term_hora = data.get("termino")
+                    ret_hora = data.get("retorno")
+
+                    def _min_hora(h: str | None) -> int | None:
+                        if not h or ":" not in h:
+                            return None
+                        try:
+                            pts = h.split(":")
+                            return int(pts[0]) * 60 + int(pts[1])
+                        except Exception:
+                            return None
+
+                    def _horas_proximas(h1: str | None, h2: str | None, tol: int = 3) -> bool:
+                        m1 = _min_hora(h1)
+                        m2 = _min_hora(h2)
+                        return m1 is not None and m2 is not None and abs(m1 - m2) <= tol
+
+                    hora_valida = (
+                        _horas_proximas(start_hora, desl_hora)
+                        or _horas_proximas(start_hora, exec_hora)
+                        or (end_hora and (_horas_proximas(end_hora, term_hora) or _horas_proximas(end_hora, ret_hora)))
+                    )
+                    if (desl_hora or exec_hora or term_hora) and not hora_valida:
                         return idx, None, None, False
-                    if data.get("tipo") != item.get("content"):
-                        return idx, None, None, False
-                    if data.get("inicioExecucao") != _convert_ms_to_hora(start_ms):
-                        return idx, None, None, False
+
                     return idx, data, cache_key, is_executado
         except Exception:
             pass
@@ -774,9 +798,10 @@ def extrair_dados_tempo_real(
                 existing_interval.update({key: value for key, value in interval_record.items() if value is not None})
             else:
                 eq_dict["intervalos"].append(interval_record)
+            is_active_interval = interval_record["fim_ms"] is None
             inicio_atual = eq_dict["intervalo"].get("inicio_ms")
             if not isinstance(inicio_atual, int) or item["start"] >= inicio_atual:
-                eq_dict["intervalo"].update({"em_intervalo": True, **interval_record})
+                eq_dict["intervalo"].update({"em_intervalo": is_active_interval, **interval_record})
 
         # 3. SSs Executadas (BDO)
         elif "Executado" in cls:
@@ -802,6 +827,11 @@ def extrair_dados_tempo_real(
                 "latitude": None,
                 "longitude": None,
                 "geolocalizacao": None,
+                "inicio_ms": item["start"],
+                "fim_ms": item["end"] if isinstance(item["end"], int) else None,
+                "start": item["start"],
+                "end": item["end"],
+                "end_ms": item["end"] if isinstance(item["end"], int) else None,
                 "inicioIso": _convert_ms_to_iso(item["start"]),
                 "fimIso": _convert_ms_to_iso(item["end"]) if isinstance(item["end"], int) else None,
                 "transitions": [
@@ -836,6 +866,8 @@ def extrair_dados_tempo_real(
                 "latitude": None,
                 "longitude": None,
                 "geolocalizacao": None,
+                "inicio_ms": item["start"],
+                "start": item["start"],
                 "inicioIso": _convert_ms_to_iso(item["start"]),
                 "inicioHora": hora_inicio,
                 "transitions": [
