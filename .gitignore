@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+*.json
+!requirements.txt
+serviceAccountKey.json
+firebase_config.json
+dados-local/

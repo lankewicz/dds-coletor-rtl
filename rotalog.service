@@ -1,0 +1,36 @@
+[Unit]
+Description=DDS Coletor Rotalog - Daemon de Raspagem e Sincronizacao (Orange Pi)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=orangepi
+Group=orangepi
+
+# Diretorio de instalacao no Orange Pi
+WorkingDirectory=/home/orangepi/dds-coletor-rtl
+
+# Variaveis de ambiente carregadas do .env local
+EnvironmentFile=/home/orangepi/dds-coletor-rtl/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=ROTALOG_UPLOAD_FIREBASE=true
+
+# Executavel python do virtualenv leve (.venv)
+ExecStart=/home/orangepi/dds-coletor-rtl/.venv/bin/python main.py --firebase --interval-seconds 120 --output-dir /home/orangepi/dds-coletor-rtl/dados-local
+
+# Politica de reinicio automatico resiliente a quedas de rede e reboots
+Restart=always
+RestartSec=10
+
+# Protecao de memoria e prioridade de I/O
+Nice=-5
+MemoryMax=256M
+LimitNOFILE=65535
+
+# Logs direcionados para o systemd journal (journalctl -u rotalog -f)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
