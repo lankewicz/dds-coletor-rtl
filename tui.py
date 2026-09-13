@@ -34,7 +34,7 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
-from main import LocalRotalogRunner
+from main import LocalRotalogRunner, executar_fechamento_mes, executar_historico
 
 TZ = ZoneInfo(os.getenv("DDS_TIMEZONE", "America/Sao_Paulo"))
 
@@ -47,6 +47,7 @@ class TuiState:
         self.stop = threading.Event()
         self.run_now = threading.Event()
         self.is_running = False
+        self.historico_running = False
         self.last_result: dict | None = None
         self.history: list[dict] = []
         self.next_run: datetime | None = None
@@ -210,9 +211,9 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     _line(screen, 16, "Arquivos: equipes/current/index.json.gz  |  equipes/daily/AAAA-MM-DD/*.json.gz  |  logs/execucoes.jsonl", width)
 
     if is_viewer:
-        _line(screen, height - 2, "Teclas: q = fechar visualizador (o servico continuara rodando normalmente)", width, curses.A_REVERSE)
+        _line(screen, height - 2, "Teclas: h = historico (ontem)   m = fechar mes anterior   q = fechar", width, curses.A_REVERSE)
     else:
-        _line(screen, height - 2, "Teclas: r = executar agora   q = encerrar execucao", width, curses.A_REVERSE)
+        _line(screen, height - 2, "Teclas: r = executar agora   h = historico (ontem)   m = fechar mes anterior   q = sair", width, curses.A_REVERSE)
 
     screen.refresh()
 
@@ -235,6 +236,67 @@ def _curses_main(screen, runner: LocalRotalogRunner | None, state: TuiState, out
                 break
             if key in (ord("r"), ord("R")) and not state.viewer_mode:
                 state.run_now.set()
+            if key in (ord("h"), ord("H")):
+                def _do_historico():
+                    with state.lock:
+                        if state.historico_running:
+                            return
+                        state.historico_running = True
+                        state.status_message = "COLETANDO HISTORICO DO ROTALOG (ONTEM)..."
+                    try:
+                        emp = runner.empresa if runner else os.getenv("DDS_EMPRESA_PADRAO", "ChicoEletro")
+                        fb = runner.enable_firebase if runner else False
+                        ret_code = executar_historico(
+                            target_date_str="ontem",
+                            output_dir=output_dir,
+                            empresa=emp,
+                            enable_firebase=fb,
+                        )
+                        with state.lock:
+                            state.status_message = (
+                                "HISTORICO CONCLUIDO COM SUCESSO"
+                                if ret_code == 0
+                                else "FALHA NA COLETA DO HISTORICO"
+                            )
+                    except Exception as err:
+                        with state.lock:
+                            state.status_message = f"ERRO HISTORICO: {err}"
+                    finally:
+                        with state.lock:
+                            state.historico_running = False
+
+                threading.Thread(target=_do_historico, daemon=True).start()
+
+            if key in (ord("m"), ord("M")):
+                def _do_fechamento_mes():
+                    with state.lock:
+                        if state.historico_running:
+                            return
+                        state.historico_running = True
+                        state.status_message = "VARRENDO MES ANTERIOR (FECHAMENTO DE KM)..."
+                    try:
+                        emp = runner.empresa if runner else os.getenv("DDS_EMPRESA_PADRAO", "ChicoEletro")
+                        fb = runner.enable_firebase if runner else False
+                        ret_code = executar_fechamento_mes(
+                            mes_str="anterior",
+                            output_dir=output_dir,
+                            empresa=emp,
+                            enable_firebase=fb,
+                        )
+                        with state.lock:
+                            state.status_message = (
+                                "FECHAMENTO DO MES ANTERIOR CONCLUIDO COM SUCESSO"
+                                if ret_code == 0
+                                else "FALHA NO FECHAMENTO DO MES ANTERIOR"
+                            )
+                    except Exception as err:
+                        with state.lock:
+                            state.status_message = f"ERRO FECHAMENTO MES: {err}"
+                    finally:
+                        with state.lock:
+                            state.historico_running = False
+
+                threading.Thread(target=_do_fechamento_mes, daemon=True).start()
     finally:
         state.stop.set()
 

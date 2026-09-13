@@ -66,6 +66,7 @@ dds-coletor-rtl/
 ├── coletor/
 │   ├── __init__.py
 │   ├── client.py           # Sessão autenticada no RTLWeb (/paginas/j_security_check)
+│   ├── historico.py        # Raspagem do histórico diário de equipes e eventos (Zero Pandas)
 │   ├── parser.py           # Parsing da timeline, agrupamento de turnos e detecção de OS
 │   └── storage.py          # load_json/write_json nativos para .json.gz, diffing e GCS
 ├── dados-local/            # Armazenamento local (ignorado pelo git)
@@ -142,6 +143,36 @@ python tui.py --firebase --interval-seconds 120
 
 # Modo passivo (apenas visualiza o serviço systemd sem interferir no ciclo)
 python tui.py --view
+```
+### Coleta de Quilometragem Diária e Mensal (Arquivo Único / Custo Mínimo)
+
+Em vez de atualizar cada equipe individualmente (o que geraria centenas de acessos ao Firebase Storage), o sistema consolida todos os serviços e quilometragens em um **ÚNICO arquivo diário** compactado em GZIP filtrado pelos contratos monitorados (`4600026988` e `4600025149`):
+
+* **Estrutura do Arquivo Diário**:
+  * `dados/{empresa}/rotalog/quilometragem/diario/AAAA-MM-DD.json.gz` (~9 KB)
+  * Indexado por **`protocolos`**: `protocolo -> { "equipe": "E3K95", "kmInformado": 14.0, "kmAutorizadoFinal": 14.0 }`.
+  * Indexado por **`totaisPorEquipe`**: `equipe -> { "kmInformado": 247.0, "kmAutorizadoFinal": 204.24, "contrato": "4600026988" }`.
+  * **Consumo no Firebase**: Apenas **1 gravação por dia** (30 gravações no mês inteiro!).
+
+```bash
+# 1. Coleta diária (ontem D-1 por padrão) gerando o arquivo único do dia:
+python main.py --historico --firebase
+
+# 2. Coleta de uma data específica:
+python main.py --historico 2026-09-12 --firebase
+```
+
+### Fechamento Mensal e Varredura do Mês Anterior (Notas de Cobrança)
+
+Ao longo do mês, a fiscalização da Copel homologa pareceres de glosas. No **1º dia de cada mês**, o coletor executa automaticamente uma varredura do mês anterior e consolida um **ÚNICO arquivo mensal de fechamento**:
+
+* `dados/{empresa}/rotalog/quilometragem/mensal/AAAA-MM.json.gz`
+* Contém todos os protocolos homologados e a medição final consolidada por equipe para geração das notas de cobrança.
+
+```bash
+# Execução manual sob demanda:
+python main.py --mes-anterior --firebase
+python main.py --mes 2026-08 --firebase
 ```
 
 ---

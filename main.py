@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -23,6 +23,12 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
+from coletor.historico import (
+    executar_coleta_historico_dia,
+    parse_target_date,
+    varrer_mes,
+    varrer_mes_anterior,
+)
 from coletor.parser import extrair_dados_tempo_real
 from coletor.storage import (
     RotalogExecutionLog,
@@ -94,6 +100,8 @@ class LocalRotalogRunner:
         self.team_repo = None
         self.exec_log = None
 
+        self.last_monthly_sweep_day: str | None = None
+
         if self.enable_firebase:
             self.firebase_store, self.team_repo, self.exec_log = _init_firebase_storage()
 
@@ -104,6 +112,23 @@ class LocalRotalogRunner:
     def run_once(self) -> dict:
         started_clock = time.perf_counter()
         started_at = datetime.now(TZ)
+
+        # Automação: No 1º dia de cada mês, executa a varredura do mês anterior para fechar quilometragens
+        today_iso = started_at.date().isoformat()
+        if started_at.day == 1 and self.last_monthly_sweep_day != today_iso:
+            try:
+                LOG.info("Dia 1º detectado: iniciando varredura do mês anterior para fechamento de faturamento...")
+                res_mes = varrer_mes_anterior(
+                    output_dir=self.output_dir,
+                    empresa=self.empresa,
+                    enable_firebase=self.firebase_enabled,
+                    firebase_store=self.firebase_store,
+                )
+                LOG.info("Varredura mensal concluída com sucesso: %s", res_mes.get("month"))
+                self.last_monthly_sweep_day = today_iso
+            except Exception as exc:
+                LOG.error("Erro na varredura mensal automática: %s", exc)
+
         previous = load_json(self.index_path, {}).get("equipes", {})
         if not isinstance(previous, dict):
             previous = {}
@@ -261,6 +286,113 @@ class LocalRotalogRunner:
         return result
 
 
+def executar_historico(
+    target_date_str: str | None = None,
+    data_fim_str: str | None = None,
+    output_dir: Path | str = "dados-local",
+    empresa: str = "ChicoEletro",
+    enable_firebase: bool = False,
+) -> int:
+    """Função separada para raspagem e arquivamento do histórico do ROTALOG.
+
+    Pode ser executada sob demanda via chave CLI (--historico) ou importada por outros módulos.
+    """
+    out_path = Path(output_dir).resolve()
+    firebase_store = None
+    if enable_firebase:
+        firebase_store, _, _ = _init_firebase_storage()
+
+    try:
+        dt_inicio = parse_target_date(target_date_str)
+        dt_fim = parse_target_date(data_fim_str) if data_fim_str else dt_inicio
+    except Exception as exc:
+        LOG.error("Erro ao interpretar data para coleta do histórico: %s", exc)
+        return 1
+
+    if dt_inicio > dt_fim:
+        LOG.error("Data inicial (%s) posterior à data final (%s)", dt_inicio, dt_fim)
+        return 1
+
+    LOG.info(
+        "Iniciando coleta de histórico separada: %s até %s (Empresa: %s, Firebase: %s)",
+        dt_inicio.isoformat(),
+        dt_fim.isoformat(),
+        empresa,
+        enable_firebase,
+    )
+
+    current = dt_inicio
+    total_sucesso = 0
+    total_dias = (dt_fim - dt_inicio).days + 1
+
+    while current <= dt_fim:
+        try:
+            res = executar_coleta_historico_dia(
+                target_date=current,
+                output_dir=out_path,
+                empresa=empresa,
+                enable_firebase=enable_firebase,
+                firebase_store=firebase_store,
+            )
+            print(json.dumps(res, ensure_ascii=False), flush=True)
+            if res.get("status") == "success":
+                total_sucesso += 1
+        except Exception as exc:
+            LOG.exception("Falha ao coletar histórico da data %s: %s", current.isoformat(), exc)
+        current += timedelta(days=1)
+
+    LOG.info("Coleta de histórico finalizada. Dias processados com sucesso: %d/%d", total_sucesso, total_dias)
+    return 0 if total_sucesso == total_dias else 1
+
+
+def executar_fechamento_mes(
+    mes_str: str | None = None,
+    output_dir: Path | str = "dados-local",
+    empresa: str = "ChicoEletro",
+    enable_firebase: bool = False,
+) -> int:
+    """Função separada para varredura completa de um mês (fechamento/notas de cobrança).
+    
+    Atualiza as quilometragens homologadas de todas as equipes no mês e consolida resumo_quilometragem.json.gz.
+    """
+    out_path = Path(output_dir).resolve()
+    firebase_store = None
+    if enable_firebase:
+        firebase_store, _, _ = _init_firebase_storage()
+
+    try:
+        if mes_str and mes_str.lower() not in ("anterior", "last", "true"):
+            if "/" in mes_str:
+                parts = mes_str.strip().split("/")
+                mes_num, ano_num = int(parts[0]), int(parts[1])
+            elif "-" in mes_str:
+                parts = mes_str.strip().split("-")
+                ano_num, mes_num = int(parts[0]), int(parts[1])
+            else:
+                raise ValueError(f"Formato de mês inválido: '{mes_str}'. Use AAAA-MM ou MM/AAAA.")
+            res = varrer_mes(
+                ano=ano_num,
+                mes=mes_num,
+                output_dir=out_path,
+                empresa=empresa,
+                enable_firebase=enable_firebase,
+                firebase_store=firebase_store,
+            )
+        else:
+            res = varrer_mes_anterior(
+                output_dir=out_path,
+                empresa=empresa,
+                enable_firebase=enable_firebase,
+                firebase_store=firebase_store,
+            )
+
+        print(json.dumps(res, ensure_ascii=False), flush=True)
+        return 0 if res.get("status") == "success" else 1
+    except Exception as exc:
+        LOG.exception("Erro durante a varredura mensal: %s", exc)
+        return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", default="dados-local", help="Diretório local para JSONs")
@@ -269,15 +401,56 @@ def main() -> int:
     parser.add_argument("--firebase", action="store_true", help="Ativa sincronização automática com Firebase Storage")
     parser.add_argument("--no-firebase", action="store_true", help="Força desativação do Firebase Storage (apenas local)")
     parser.add_argument("--once", action="store_true", help="Executa somente uma vez e finaliza")
+    parser.add_argument(
+        "--historico",
+        nargs="?",
+        const="ontem",
+        default=None,
+        help="Chave para rodar a coleta do histórico separadamente (ontem/D-1 por padrão, ou informe AAAA-MM-DD / DD/MM/AAAA)",
+    )
+    parser.add_argument(
+        "--historico-fim",
+        default=None,
+        help="Data final caso queira raspar um intervalo de dias no histórico",
+    )
+    parser.add_argument(
+        "--mes-anterior",
+        action="store_true",
+        help="Chave para rodar a varredura retroativa completa do mês anterior e consolidar faturamento/quilometragens",
+    )
+    parser.add_argument(
+        "--mes",
+        default=None,
+        help="Chave para rodar a varredura de um mês específico (formato AAAA-MM ou MM/AAAA)",
+    )
     args = parser.parse_args()
-
-    if args.interval_seconds < 30:
-        parser.error("--interval-seconds deve ser no mínimo 30")
 
     if args.no_firebase:
         enable_firebase = False
     else:
         enable_firebase = args.firebase or os.getenv("ROTALOG_UPLOAD_FIREBASE", "false").strip().lower() in ("true", "1", "yes")
+
+    # Chave para rodar a varredura do mês (fechamento de faturamento)
+    if args.mes_anterior or args.mes:
+        return executar_fechamento_mes(
+            mes_str=args.mes or "anterior",
+            output_dir=args.output_dir,
+            empresa=args.empresa,
+            enable_firebase=enable_firebase,
+        )
+
+    # Chave para rodar a coleta de histórico diário separadamente
+    if args.historico is not None:
+        return executar_historico(
+            target_date_str=args.historico,
+            data_fim_str=args.historico_fim,
+            output_dir=args.output_dir,
+            empresa=args.empresa,
+            enable_firebase=enable_firebase,
+        )
+
+    if args.interval_seconds < 30:
+        parser.error("--interval-seconds deve ser no mínimo 30")
 
     runner = LocalRotalogRunner(Path(args.output_dir).resolve(), args.empresa, enable_firebase=enable_firebase)
     while True:
@@ -291,3 +464,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
