@@ -234,6 +234,67 @@ def changed_fields(
     return changes
 
 
+def _summarize_history_correction(
+    previous: dict[str, typing.Any] | None,
+    current: dict[str, typing.Any],
+) -> str:
+    """Identifica sinteticamente qual ajuste foi realizado nas OS do histórico."""
+    if not previous:
+        return "Correção de OS"
+    prev_os = previous.get("ordensServico") or {}
+    curr_os = current.get("ordensServico") or {}
+    prev_history = prev_os.get("historico") or []
+    curr_history = curr_os.get("historico") or []
+
+    prev_map = {
+        srv.get("serviceId", str(i)): srv
+        for i, srv in enumerate(prev_history)
+        if isinstance(srv, dict)
+    }
+
+    has_protocol = False
+    has_time = False
+    has_gps = False
+    has_type = False
+    has_queue = False
+
+    for i, curr_srv in enumerate(curr_history):
+        if not isinstance(curr_srv, dict):
+            continue
+        sid = curr_srv.get("serviceId", str(i))
+        prev_srv = prev_map.get(sid)
+        if not prev_srv and i < len(prev_history) and isinstance(prev_history[i], dict):
+            prev_srv = prev_history[i]
+        if not prev_srv:
+            continue
+
+        if prev_srv.get("protocolo") != curr_srv.get("protocolo") and curr_srv.get("protocolo"):
+            has_protocol = True
+        for t_field in ("inicioDeslocamento", "inicioExecucao", "fimExecucao", "retorno"):
+            if prev_srv.get(t_field) != curr_srv.get(t_field):
+                has_time = True
+        if (prev_srv.get("latitude") != curr_srv.get("latitude")
+                or prev_srv.get("longitude") != curr_srv.get("longitude")):
+            if curr_srv.get("latitude") is not None:
+                has_gps = True
+        if prev_srv.get("tipo") != curr_srv.get("tipo") and curr_srv.get("tipo"):
+            has_type = True
+        if prev_srv.get("filaNaConclusao") != curr_srv.get("filaNaConclusao"):
+            has_queue = True
+
+    if has_protocol:
+        return "OS (+Protocolo)"
+    if has_time:
+        return "OS (Horário)"
+    if has_gps:
+        return "OS (+GPS)"
+    if has_type:
+        return "OS (Tipo)"
+    if has_queue:
+        return "OS (Fila)"
+    return "Correção de OS"
+
+
 def summarize_team_transition(
     previous: dict[str, typing.Any] | None,
     current: dict[str, typing.Any],
@@ -244,7 +305,7 @@ def summarize_team_transition(
     if "servico_concluido" in reasons:
         return "Execução --> Conclusão"
     if "correcao_servico_concluido" in reasons:
-        return "Correção de OS"
+        return _summarize_history_correction(previous, current)
     if "turno_aberto" in reasons:
         return "Início de Turno"
     if "turno_fechado" in reasons:
@@ -287,6 +348,11 @@ def summarize_team_transition(
 
     if curr_concluidos > prev_concluidos:
         return "Execução --> Conclusão"
+
+    prev_history = prev_os.get("historico") or []
+    curr_history = curr_os.get("historico") or []
+    if prev_history and curr_history and _operational_value(prev_history) != _operational_value(curr_history):
+        return _summarize_history_correction(previous, current)
 
     status_map = {
         "DESLOCAMENTO": "Deslocamento",
@@ -705,6 +771,8 @@ def _merge_service_records(team_key: str, records: list[dict[str, typing.Any]]) 
         stale = bool(old_time and new_time and
                      datetime.datetime.fromisoformat(new_time) < datetime.datetime.fromisoformat(old_time))
         for field, value in item.items():
+            if field == "filaNaConclusao" and merged.get("filaNaConclusao") is not None:
+                continue
             if value is not None and value != "" and (not stale or merged.get(field) in (None, "")):
                 merged[field] = value
         if old.get("statusAtual") == "CONCLUSAO" and item.get("statusAtual") in ("EXECUCAO", "DESLOCAMENTO"):
@@ -745,6 +813,12 @@ def merge_daily_document(
     elif "services" in previous:
         records = [dict(s) for s in previous.get("services", [])]
 
+    existing_concluded_ids = {
+        _service_id(team_key, s)
+        for s in records
+        if isinstance(s, dict) and s.get("statusAtual") == "CONCLUSAO" and s.get("filaNaConclusao") is not None
+    }
+
     for field in ("ssExecutadas", "ssEmAndamento", "services", "bdoList"):
         for raw in current.get(field) or []:
             item = compact_service(team_key, day, raw)
@@ -753,10 +827,12 @@ def merge_daily_document(
                 if raw.get(meta) is not None:
                     item[meta] = raw[meta]
             if item.get("statusAtual") == "CONCLUSAO" and "filaNaConclusao" not in item:
-                item["filaNaConclusao"] = {
-                    "emergencia": int(current.get("ssPendentesEmergenciaCount") or 0),
-                    "comercial": int(current.get("ssPendentesComercialCount") or 0),
-                }
+                sid_check = _service_id(team_key, item)
+                if sid_check not in existing_concluded_ids:
+                    item["filaNaConclusao"] = {
+                        "emergencia": int(current.get("ssPendentesEmergenciaCount") or 0),
+                        "comercial": int(current.get("ssPendentesComercialCount") or 0),
+                    }
             records.append(item)
     service_map = _merge_service_records(team_key, records)
 

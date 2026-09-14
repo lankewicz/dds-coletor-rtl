@@ -71,6 +71,61 @@ class TeamTransitionsTests(unittest.TestCase):
             summarize_team_transition(doc_v2_exec, doc_v2_exec, sync_reasons=["correcao_servico_concluido"]),
             "Correção de OS",
         )
+
+        doc_prev_hist = {
+            "ordensServico": {
+                "historico": [{
+                    "serviceId": "1",
+                    "protocolo": None,
+                    "fimExecucao": "10:00",
+                    "latitude": None,
+                }],
+            },
+        }
+        doc_curr_proto = {
+            "ordensServico": {
+                "historico": [{
+                    "serviceId": "1",
+                    "protocolo": "50986126",
+                    "fimExecucao": "10:00",
+                    "latitude": None,
+                }],
+            },
+        }
+        doc_curr_time = {
+            "ordensServico": {
+                "historico": [{
+                    "serviceId": "1",
+                    "protocolo": None,
+                    "fimExecucao": "10:15",
+                    "latitude": None,
+                }],
+            },
+        }
+        doc_curr_gps = {
+            "ordensServico": {
+                "historico": [{
+                    "serviceId": "1",
+                    "protocolo": None,
+                    "fimExecucao": "10:00",
+                    "latitude": -25.4,
+                    "longitude": -53.1,
+                }],
+            },
+        }
+
+        self.assertEqual(
+            summarize_team_transition(doc_prev_hist, doc_curr_proto, sync_reasons=["correcao_servico_concluido"]),
+            "OS (+Protocolo)",
+        )
+        self.assertEqual(
+            summarize_team_transition(doc_prev_hist, doc_curr_time, sync_reasons=["correcao_servico_concluido"]),
+            "OS (Horário)",
+        )
+        self.assertEqual(
+            summarize_team_transition(doc_prev_hist, doc_curr_gps, sync_reasons=["correcao_servico_concluido"]),
+            "OS (+GPS)",
+        )
         self.assertEqual(
             summarize_team_transition(None, doc_v2_exec, sync_reasons=["turno_aberto"]),
             "Início de Turno",

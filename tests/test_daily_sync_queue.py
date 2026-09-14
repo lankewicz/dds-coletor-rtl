@@ -69,7 +69,7 @@ class DailySyncQueueTests(unittest.TestCase):
             {"uploaded": 0, "failed": 0, "pending": 1},
         )
 
-    def test_event_policy_covers_open_completion_close_and_correction(self):
+    def test_event_policy_covers_open_completion_and_close_leaving_corrections_local(self):
         opened = self.document
         self.assertEqual(self.runner._daily_sync_reasons({}, opened), ["turno_aberto"])
 
@@ -80,11 +80,12 @@ class DailySyncQueueTests(unittest.TestCase):
             ["servico_concluido"],
         )
 
+        # Ajustes e correções de OS permanecem locais (sem fila para nuvem)
         corrected = copy.deepcopy(completed)
         corrected["ordensServico"]["historico"][0]["fimExecucao"] = "10:15"
         self.assertEqual(
             self.runner._daily_sync_reasons(completed, corrected),
-            ["correcao_servico_concluido"],
+            [],
         )
 
         closed = copy.deepcopy(corrected)

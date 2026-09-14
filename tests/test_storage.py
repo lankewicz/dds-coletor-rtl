@@ -79,6 +79,46 @@ class StorageRegressionTests(unittest.TestCase):
             write_json(path, {})
             self.assertEqual(load_json_with_status(path, {})[1], "ok")
 
+    def test_fila_na_conclusao_is_immutable_snapshot(self):
+        from coletor.storage import merge_daily_document
+        day = "2026-09-14"
+        service_raw = {
+            "protocolo": "50986126",
+            "tipo": "CHAVE",
+            "categoria": "EMERGENCIA",
+            "status": "CONCLUSAO",
+            "inicioExecucao": "2026-09-14T08:00:00-03:00",
+            "fimExecucao": "2026-09-14T09:00:00-03:00",
+        }
+
+        # Primeiro scrape: serviço acaba de ser concluído quando a fila estava em 2 e 5
+        scrape_1 = {
+            "equipe": "E3733",
+            "empresa": "ChicoEletro",
+            "ssExecutadas": [service_raw],
+            "ssPendentesEmergenciaCount": 2,
+            "ssPendentesComercialCount": 5,
+        }
+        merged_1 = merge_daily_document(None, scrape_1, day)
+        concluded_1 = merged_1["ordensServico"]["historico"][0]
+        self.assertEqual(concluded_1["filaNaConclusao"], {"emergencia": 2, "comercial": 5})
+
+        # Segundo scrape mais tarde: fila da empresa agora mudou para 8 e 12
+        scrape_2 = {
+            "equipe": "E3733",
+            "empresa": "ChicoEletro",
+            "ssExecutadas": [service_raw],
+            "ssPendentesEmergenciaCount": 8,
+            "ssPendentesComercialCount": 12,
+        }
+        merged_2 = merge_daily_document(merged_1, scrape_2, day)
+        concluded_2 = merged_2["ordensServico"]["historico"][0]
+
+        # A foto da fila no momento da conclusão DEVE PERMANECER INTACTA (2 e 5)
+        self.assertEqual(concluded_2["filaNaConclusao"], {"emergencia": 2, "comercial": 5})
+        # Nenhum campo operacional deve ter sido alterado
+        self.assertEqual(changed_fields(merged_1, merged_2), {})
+
 
 if __name__ == "__main__":
     unittest.main()

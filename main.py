@@ -235,8 +235,6 @@ class LocalRotalogRunner:
         curr_history = (current.get("ordensServico") or {}).get("historico") or []
         if len(curr_history) > len(prev_history):
             reasons.append("servico_concluido")
-        elif previous and "ordensServico.historico" in changed_fields(previous, current):
-            reasons.append("correcao_servico_concluido")
         return reasons
 
     def _load_daily_sync_queue(self) -> dict:
