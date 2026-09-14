@@ -34,24 +34,48 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
-from main import LocalRotalogRunner, executar_fechamento_mes, executar_historico
+from coletor.logs import JsonlTailReader
+from main import (
+    LocalRotalogRunner,
+    executar_fechamento_mes,
+    executar_historico,
+    get_adaptive_interval_seconds,
+)
 
 TZ = ZoneInfo(os.getenv("DDS_TIMEZONE", "America/Sao_Paulo"))
 
 
 class TuiState:
-    def __init__(self, interval_seconds: int, viewer_mode: bool = False):
+    def __init__(
+        self,
+        interval_seconds: int | None = None,
+        peak_interval: int = 180,
+        offpeak_interval: int = 600,
+        viewer_mode: bool = False,
+    ):
         self.interval_seconds = interval_seconds
+        self.peak_interval = peak_interval
+        self.offpeak_interval = offpeak_interval
         self.viewer_mode = viewer_mode
         self.lock = threading.Lock()
         self.stop = threading.Event()
         self.run_now = threading.Event()
         self.is_running = False
+        self.is_stale = False
         self.historico_running = False
         self.last_result: dict | None = None
         self.history: list[dict] = []
         self.next_run: datetime | None = None
         self.status_message = "Inicializando..."
+
+    def get_interval(self, now: datetime | None = None) -> int:
+        if self.interval_seconds is not None:
+            return self.interval_seconds
+        return get_adaptive_interval_seconds(
+            now=now,
+            peak_interval=self.peak_interval,
+            offpeak_interval=self.offpeak_interval,
+        )
 
 
 def _format_duration(seconds: float | None) -> str:
@@ -65,6 +89,19 @@ def _format_duration(seconds: float | None) -> str:
     if mins:
         return f"{mins}m {secs:02d}s"
     return f"{secs}s"
+
+
+def _format_bytes(num_bytes: int | float | None) -> str:
+    if not num_bytes or num_bytes <= 0:
+        return "0 B"
+    num = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if num < 1024.0 or unit == "GB":
+            if unit == "B":
+                return f"{int(num)} B"
+            return f"{num:.1f} {unit}"
+        num /= 1024.0
+    return f"{num:.1f} GB"
 
 
 def _worker(runner: LocalRotalogRunner, state: TuiState) -> None:
@@ -82,10 +119,11 @@ def _worker(runner: LocalRotalogRunner, state: TuiState) -> None:
             state.history.append(result)
             state.history = state.history[-50:]
             now = datetime.now(TZ)
-            state.next_run = now + timedelta(seconds=state.interval_seconds)
+            interval = state.get_interval(now)
+            state.next_run = now + timedelta(seconds=interval)
             state.status_message = "AGUARDANDO PROXIMO CICLO"
 
-        end_wait = time.time() + state.interval_seconds
+        end_wait = time.time() + interval
         while time.time() < end_wait and not state.stop.is_set():
             if state.run_now.is_set():
                 state.run_now.clear()
@@ -93,39 +131,70 @@ def _worker(runner: LocalRotalogRunner, state: TuiState) -> None:
             time.sleep(0.2)
 
 
+def _update_viewer_state_timing(state: TuiState) -> None:
+    if not state.last_result:
+        state.is_stale = False
+        state.status_message = "AGUARDANDO REGISTROS EM execucoes.jsonl..."
+        return
+
+    fin_str = state.last_result.get("finishedAt")
+    if not fin_str:
+        return
+
+    try:
+        fin_dt = datetime.fromisoformat(fin_str)
+        if fin_dt.tzinfo is None:
+            fin_dt = fin_dt.replace(tzinfo=TZ)
+        now = datetime.now(TZ)
+        current_interval = state.get_interval(now)
+        state.next_run = fin_dt + timedelta(seconds=current_interval)
+
+        elapsed = (now - fin_dt).total_seconds()
+        stale_threshold = max(current_interval * 2.5, 300.0)
+
+        if elapsed > stale_threshold:
+            state.is_stale = True
+            state.status_message = f"ALERTA: SERVICO INATIVO / SEM REGISTROS (ultimo ciclo ha {_format_duration(elapsed)})"
+        else:
+            state.is_stale = False
+            state.status_message = "SERVICO SYSTEMD ATIVO (MODO VISUALIZADOR)"
+    except Exception:
+        pass
+
+
 def _viewer_worker(state: TuiState, output_dir: Path) -> None:
     log_file = output_dir / "rotalog" / "logs" / "execucoes.jsonl"
-    last_mtime = 0.0
+    reader = JsonlTailReader(log_file, max_history=50)
+
+    # Carga inicial rápida da cauda em bloco reverso O(1)
+    initial_entries = reader.read_initial()
+    if initial_entries:
+        with state.lock:
+            state.history = initial_entries[-50:]
+            state.last_result = initial_entries[-1]
+            _update_viewer_state_timing(state)
 
     while not state.stop.is_set():
         try:
-            if log_file.is_file():
-                current_mtime = log_file.stat().st_mtime
-                if current_mtime != last_mtime:
-                    last_mtime = current_mtime
-                    entries = []
-                    with log_file.open("r", encoding="utf-8") as stream:
-                        for line in stream:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                entries.append(json.loads(line))
-                            except json.JSONDecodeError:
-                                pass
-
-                    if entries:
-                        with state.lock:
-                            state.history = entries[-50:]
-                            state.last_result = entries[-1]
-                            fin_str = state.last_result.get("finishedAt")
-                            if fin_str:
-                                try:
-                                    fin_dt = datetime.fromisoformat(fin_str)
-                                    state.next_run = fin_dt + timedelta(seconds=state.interval_seconds)
-                                except Exception:
-                                    pass
-                            state.status_message = "SERVICO SYSTEMD ATIVO (MODO VISUALIZADOR)"
+            new_entries, rotated = reader.read_incremental()
+            if rotated:
+                # Arquivo rotacionado (novo dia ou truncado): recarrega a nova cauda
+                with state.lock:
+                    state.history = new_entries[-50:]
+                    if state.history:
+                        state.last_result = state.history[-1]
+                    _update_viewer_state_timing(state)
+            elif new_entries:
+                with state.lock:
+                    state.history.extend(new_entries)
+                    state.history = state.history[-50:]
+                    state.last_result = state.history[-1]
+                    _update_viewer_state_timing(state)
+            else:
+                # Nenhuma linha nova, mas atualiza o status de serviço inativo se estourar o tempo
+                with state.lock:
+                    if state.last_result:
+                        _update_viewer_state_timing(state)
         except Exception:
             pass
 
@@ -145,6 +214,20 @@ def _line(screen, y: int, text: str, width: int, attr: int = 0) -> None:
         pass
 
 
+def _format_columns(items: list[str], width: int, col_width: int = 35) -> list[str]:
+    """Formata lista de strings em colunas de tamanho fixo separadas por ' | '."""
+    if not items:
+        return []
+    sep = " | "
+    num_cols = max(1, (width - 1) // (col_width + len(sep)))
+    lines = []
+    for i in range(0, len(items), num_cols):
+        chunk = items[i : i + num_cols]
+        formatted_row = sep.join(item.ljust(col_width)[:col_width] for item in chunk)
+        lines.append(formatted_row)
+    return lines
+
+
 def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     height, width = screen.getmaxyx()
     if height < 16 or width < 70:
@@ -156,6 +239,7 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     with state.lock:
         data = {
             "is_running": state.is_running,
+            "is_stale": state.is_stale,
             "last_result": state.last_result,
             "history": list(state.history),
             "next_run": state.next_run,
@@ -169,19 +253,26 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     errors = sum(1 for item in history if item.get("status") != "success")
     durations = [float(item["durationSeconds"]) for item in successful if "durationSeconds" in item]
     average = sum(durations) / len(durations) if durations else None
-    total_updates = sum(int(item.get("updatedTeams", 0)) for item in successful)
-    total_ignored = sum(int(item.get("ignoredTeams", 0)) for item in successful)
+    total_bytes_up = sum(int(item.get("bytesUploaded") or 0) for item in successful)
+    total_bytes_down = sum(int(item.get("bytesDownloaded") or 0) for item in successful)
 
     screen.erase()
     is_viewer = data["viewer_mode"]
     title_mode = "[VISUALIZADOR PASSIVO - SYSTEMD]" if is_viewer else "[EXECUCAO DIRETA]"
     _line(screen, 0, f"=== DDS COLETOR ROTALOG {title_mode} ===", width, curses.A_BOLD)
     empresa_str = runner.empresa if runner else os.getenv("DDS_EMPRESA_PADRAO", "ChicoEletro")
-    _line(screen, 1, f"Empresa: {empresa_str}  |  Intervalo: {state.interval_seconds}s  |  Hora: {now:%H:%M:%S}", width)
+    cur_interval = state.get_interval(now)
+    is_peak = 7 <= now.hour < 20
+    tag_intervalo = f"{cur_interval}s [PICO 07-20h]" if is_peak else f"{cur_interval}s [NOTURNO 20-07h]"
+    if state.interval_seconds is not None:
+        tag_intervalo = f"{state.interval_seconds}s [FIXO]"
+    _line(screen, 1, f"Empresa: {empresa_str}  |  Intervalo: {tag_intervalo}  |  Hora: {now:%H:%M:%S}", width)
     _line(screen, 2, "-" * (width - 1), width)
 
     if data["is_running"]:
         _line(screen, 4, f"STATUS: {data['status_message']}", width, curses.A_REVERSE)
+    elif data.get("is_stale"):
+        _line(screen, 4, f"STATUS: {data['status_message']}", width, curses.A_STANDOUT | curses.A_BOLD)
     else:
         next_run = data["next_run"]
         if next_run:
@@ -202,16 +293,76 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
         _line(screen, 7, f"Resultado: {last.get('status', '-').upper()}  |  inicio: {str(last.get('startedAt', '-'))[11:19]}  |  fim: {str(last.get('finishedAt', '-'))[11:19]}", width)
         _line(screen, 8, f"Tempo total: {last.get('durationSeconds', '-')}s  |  raspagem: {last.get('scrapeDurationSeconds', '-')}s", width)
         _line(screen, 9, f"Equipes: {last.get('totalTeams', '-')}  |  atualizadas: {last.get('updatedTeams', '-')}  |  ignoradas: {last.get('ignoredTeams', '-')}{upload_flag}", width)
-        _line(screen, 10, f"Historicos: enviados: {last.get('dailySyncUploaded', 0)}  |  pendentes: {last.get('dailySyncPending', 0)}  |  falhas: {last.get('dailySyncFailed', 0)}", width)
+        last_up = int(last.get("bytesUploaded") or 0)
+        last_down = int(last.get("bytesDownloaded") or 0)
+        bytes_tag = f"  |  trafego: {_format_bytes(last_up)} env / {_format_bytes(last_down)} lidos" if (last_up or last_down) else ""
+        _line(screen, 10, f"Historicos: enviados: {last.get('dailySyncUploaded', 0)}  |  pendentes: {last.get('dailySyncPending', 0)}  |  falhas: {last.get('dailySyncFailed', 0)}{bytes_tag}", width)
         if last.get("error"):
             _line(screen, 11, f"Erro: {last['error']}", width, curses.A_BOLD)
     else:
         _line(screen, 7, "Aguardando registros do servico em execucoes.jsonl...", width)
 
-    _line(screen, 12, "HISTORICO RECENTE", width, curses.A_UNDERLINE)
-    _line(screen, 13, f"Ciclos: {len(history)}  |  sucesso: {len(successful)}  |  erros: {errors}  |  media: {_format_duration(average)}", width)
-    _line(screen, 14, f"Equipes atualizadas: {total_updates}  |  ignoradas: {total_ignored}", width)
-    _line(screen, 16, "Arquivos: equipes/current/index.json.gz  |  equipes/daily/AAAA-MM-DD/*.json.gz  |  logs/execucoes.jsonl", width)
+    cur_y = 12
+    max_event_y = height - 6
+
+    if last:
+        events = last.get("events") or {}
+        local_events = events.get("local") or []
+        cloud_events = events.get("cloud") or []
+
+        if local_events or cloud_events:
+            # 1. Seção LOCAL (atualizadas apenas localmente)
+            if local_events and cur_y < max_event_y:
+                _line(screen, cur_y, f"LOCAL ({len(local_events)} equipes com transicao apenas local)", width, curses.A_BOLD)
+                cur_y += 1
+                local_strs = [f"{e['team']}: {e['action']}" for e in local_events]
+                local_rows = _format_columns(local_strs, width, col_width=35)
+
+                reserved_for_cloud = min(len(cloud_events) + 2, 4) if cloud_events else 0
+                allowed_local_rows = max(1, max_event_y - cur_y - reserved_for_cloud)
+
+                for row in local_rows[:allowed_local_rows]:
+                    if cur_y >= max_event_y:
+                        break
+                    _line(screen, cur_y, row, width)
+                    cur_y += 1
+
+                if len(local_rows) > allowed_local_rows and cur_y < max_event_y:
+                    items_per_row = max(1, (width - 1) // 38)
+                    remaining_local = len(local_events) - (allowed_local_rows * items_per_row)
+                    if remaining_local > 0:
+                        _line(screen, cur_y, f"... e mais {remaining_local} equipes atualizadas localmente", width)
+                        cur_y += 1
+
+            # 2. Seção NUVEM (eventos enviados ao Firebase)
+            if cloud_events and cur_y < max_event_y:
+                if local_events and cur_y < max_event_y:
+                    cur_y += 1
+                _line(screen, cur_y, f"NUVEM ({len(cloud_events)} eventos sincronizados no Firebase)", width, curses.A_BOLD)
+                cur_y += 1
+                cloud_strs = [f"{e['team']}: {e['action']}" for e in cloud_events]
+                cloud_rows = _format_columns(cloud_strs, width, col_width=35)
+                allowed_cloud_rows = max(1, max_event_y - cur_y)
+
+                for row in cloud_rows[:allowed_cloud_rows]:
+                    if cur_y >= max_event_y:
+                        break
+                    _line(screen, cur_y, row, width)
+                    cur_y += 1
+
+                if len(cloud_rows) > allowed_cloud_rows and cur_y < max_event_y:
+                    items_per_row = max(1, (width - 1) // 38)
+                    remaining_cloud = len(cloud_events) - (allowed_cloud_rows * items_per_row)
+                    if remaining_cloud > 0:
+                        _line(screen, cur_y, f"... e mais {remaining_cloud} eventos na nuvem", width)
+                        cur_y += 1
+
+    # HISTORICO RECENTE ancorado na parte inferior
+    hist_y = max(cur_y + 1, height - 5)
+    _line(screen, hist_y, "HISTORICO RECENTE", width, curses.A_UNDERLINE)
+    nuvem_bytes_str = f"nuvem: {_format_bytes(total_bytes_up)} env / {_format_bytes(total_bytes_down)} lidos"
+    _line(screen, hist_y + 1, f"Ciclos: {len(history)}  |  sucesso: {len(successful)}  |  erros: {errors}  |  media: {_format_duration(average)}  |  {nuvem_bytes_str}", width)
+    _line(screen, hist_y + 2, "Arquivos: equipes/current/index.json.gz  |  logs/execucoes.jsonl (rotacao diaria .jsonl.gz)", width)
 
     if is_viewer:
         _line(screen, height - 2, "Teclas: h = historico (ontem)   m = fechar mes anterior   q = fechar", width, curses.A_REVERSE)
@@ -307,15 +458,19 @@ def _curses_main(screen, runner: LocalRotalogRunner | None, state: TuiState, out
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", default="dados-local")
-    parser.add_argument("--interval-seconds", type=int, default=120)
+    parser.add_argument("--interval-seconds", type=int, default=None, help="Intervalo fixo em segundos (desativa adaptação horária)")
+    parser.add_argument("--peak-interval", type=int, default=180, help="Intervalo de pico em segundos (07:00 às 20:00, padrão: 180s)")
+    parser.add_argument("--offpeak-interval", type=int, default=600, help="Intervalo noturno em segundos (20:00 às 07:00, padrão: 600s)")
     parser.add_argument("--empresa", default=os.getenv("DDS_EMPRESA_PADRAO", "ChicoEletro"))
     parser.add_argument("--firebase", action="store_true", help="Ativa sincronização automática com Firebase Storage")
     parser.add_argument("--no-firebase", action="store_true", help="Força desativação do Firebase Storage (apenas local)")
     parser.add_argument("--view", action="store_true", help="Abre como visualizador passivo do serviço systemd (sem raspar)")
     args = parser.parse_args()
 
-    if args.interval_seconds < 30:
+    if args.interval_seconds is not None and args.interval_seconds < 30:
         parser.error("--interval-seconds deve ser no mínimo 30")
+    if args.peak_interval < 30 or args.offpeak_interval < 30:
+        parser.error("--peak-interval e --offpeak-interval devem ser no mínimo 30")
 
     output_dir = Path(args.output_dir).resolve()
     if args.no_firebase:
@@ -325,10 +480,20 @@ def main() -> int:
 
     if args.view:
         runner = None
-        state = TuiState(args.interval_seconds, viewer_mode=True)
+        state = TuiState(
+            interval_seconds=args.interval_seconds,
+            peak_interval=args.peak_interval,
+            offpeak_interval=args.offpeak_interval,
+            viewer_mode=True,
+        )
     else:
         runner = LocalRotalogRunner(output_dir, args.empresa, enable_firebase=enable_firebase)
-        state = TuiState(args.interval_seconds, viewer_mode=False)
+        state = TuiState(
+            interval_seconds=args.interval_seconds,
+            peak_interval=args.peak_interval,
+            offpeak_interval=args.offpeak_interval,
+            viewer_mode=False,
+        )
 
     if curses is None:
         print(

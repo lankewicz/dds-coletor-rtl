@@ -16,8 +16,8 @@ EnvironmentFile=/home/orangepi/dds-coletor-rtl/.env
 Environment=PYTHONUNBUFFERED=1
 Environment=ROTALOG_UPLOAD_FIREBASE=true
 
-# Executavel python do virtualenv leve (.venv)
-ExecStart=/home/orangepi/dds-coletor-rtl/.venv/bin/python main.py --firebase --interval-seconds 120 --output-dir /home/orangepi/dds-coletor-rtl/dados-local
+# Executavel python do virtualenv leve (.venv) - grade adaptativa: 3min pico (07-20h) / 10min noite (20-07h)
+ExecStart=/home/orangepi/dds-coletor-rtl/.venv/bin/python main.py --firebase --output-dir /home/orangepi/dds-coletor-rtl/dados-local
 
 # Politica de reinicio automatico resiliente a quedas de rede e reboots
 Restart=always

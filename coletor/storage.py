@@ -188,7 +188,7 @@ def changed_fields(
     if "ordensServico" in current or "jornada" in current:
         prev_conexao = previous.get("conexao") or {}
         curr_conexao = current.get("conexao") or {}
-        for k in ("isOnline", "status", "veiculo", "colaborador"):
+        for k in ("isOnline", "veiculo", "colaborador"):
             if prev_conexao.get(k) != curr_conexao.get(k):
                 changes[f"conexao.{k}"] = {"anterior": prev_conexao.get(k), "novo": curr_conexao.get(k)}
 
@@ -232,6 +232,115 @@ def changed_fields(
         if _operational_value(old_value) != _operational_value(new_value):
             changes[field] = {"anterior": old_value, "novo": new_value}
     return changes
+
+
+def summarize_team_transition(
+    previous: dict[str, typing.Any] | None,
+    current: dict[str, typing.Any],
+    sync_reasons: list[str] | None = None,
+) -> str:
+    """Gera um resumo legível e específico da transição operacional da equipe."""
+    reasons = set(sync_reasons or [])
+    if "servico_concluido" in reasons:
+        return "Execução --> Conclusão"
+    if "correcao_servico_concluido" in reasons:
+        return "Correção de OS"
+    if "turno_aberto" in reasons:
+        return "Início de Turno"
+    if "turno_fechado" in reasons:
+        return "Fim de Turno"
+
+    if previous is None:
+        return "Início"
+
+    prev_jornada = previous.get("jornada") or {}
+    curr_jornada = current.get("jornada") or {}
+
+    prev_turno = prev_jornada.get("turno") or {}
+    curr_turno = curr_jornada.get("turno") or {}
+    prev_turno_status = str(prev_turno.get("status") or "").upper()
+    curr_turno_status = str(curr_turno.get("status") or "").upper()
+
+    if curr_turno_status == "ABERTO" and prev_turno_status != "ABERTO":
+        return "Início de Turno"
+    if curr_turno_status == "FECHADO" and prev_turno_status != "FECHADO":
+        return "Fim de Turno"
+
+    # Intervalo
+    prev_intervalo = bool(prev_jornada.get("emIntervalo"))
+    curr_intervalo = bool(curr_jornada.get("emIntervalo"))
+    if not prev_intervalo and curr_intervalo:
+        return "Início de Intervalo"
+    if prev_intervalo and not curr_intervalo:
+        return "Fim de Intervalo"
+
+    # Ordens de Serviço
+    prev_os = previous.get("ordensServico") or {}
+    curr_os = current.get("ordensServico") or {}
+
+    prev_concluidos = prev_os.get("totalConcluidos")
+    if prev_concluidos is None:
+        prev_concluidos = len(prev_os.get("historico") or [])
+    curr_concluidos = curr_os.get("totalConcluidos")
+    if curr_concluidos is None:
+        curr_concluidos = len(curr_os.get("historico") or [])
+
+    if curr_concluidos > prev_concluidos:
+        return "Execução --> Conclusão"
+
+    status_map = {
+        "DESLOCAMENTO": "Deslocamento",
+        "EXECUCAO": "Execução",
+        "CONCLUIDO": "Conclusão",
+        "CONCLUSAO": "Conclusão",
+        None: "Livre",
+        "": "Livre",
+    }
+    prev_atual = prev_os.get("atual") or {}
+    curr_atual = curr_os.get("atual") or {}
+
+    # Suporta tanto statusAtual (padrão v2) quanto status (legado)
+    prev_status_raw = None
+    if isinstance(prev_atual, dict):
+        prev_status_raw = prev_atual.get("statusAtual") or prev_atual.get("status")
+    curr_status_raw = None
+    if isinstance(curr_atual, dict):
+        curr_status_raw = curr_atual.get("statusAtual") or curr_atual.get("status")
+
+    if prev_status_raw != curr_status_raw:
+        p_label = status_map.get(prev_status_raw, str(prev_status_raw).capitalize() if prev_status_raw else "Livre")
+        c_label = status_map.get(curr_status_raw, str(curr_status_raw).capitalize() if curr_status_raw else "Livre")
+        return f"{p_label} --> {c_label}"
+
+    prev_prot = prev_atual.get("protocolo") if isinstance(prev_atual, dict) else None
+    curr_prot = curr_atual.get("protocolo") if isinstance(curr_atual, dict) else None
+    if prev_prot != curr_prot and curr_prot:
+        c_label = status_map.get(curr_status_raw, "OS")
+        return f"Nova OS ({c_label})"
+
+    prev_conn = previous.get("conexao") or {}
+    curr_conn = current.get("conexao") or {}
+    if prev_conn.get("isOnline") != curr_conn.get("isOnline"):
+        return "Online" if curr_conn.get("isOnline") else "Offline"
+
+    if prev_conn.get("veiculo") != curr_conn.get("veiculo") and curr_conn.get("veiculo"):
+        return f"Veículo ({curr_conn.get('veiculo')})"
+
+    if prev_conn.get("colaborador") != curr_conn.get("colaborador") and curr_conn.get("colaborador"):
+        return "Equipe Alterada"
+
+    if curr_status_raw:
+        c_label = status_map.get(curr_status_raw, str(curr_status_raw).capitalize())
+        if isinstance(prev_atual, dict) and isinstance(curr_atual, dict):
+            if (prev_atual.get("latitude") != curr_atual.get("latitude")
+                    or prev_atual.get("longitude") != curr_atual.get("longitude")):
+                return f"GPS ({c_label})"
+        return f"Em {c_label}"
+
+    if curr_turno_status == "ABERTO":
+        return "Livre"
+
+    return "Atualizado"
 
 
 def compactar_equipe_para_index(document: dict[str, typing.Any]) -> dict[str, typing.Any]:
@@ -809,10 +918,23 @@ class RotalogGcsSnapshotStore:
         self._client_factory = client_factory
         self._client = None
         self._lock = threading.RLock()
+        self.bytes_uploaded = 0
+        self.bytes_downloaded = 0
+        self.cycle_bytes_uploaded = 0
+        self.cycle_bytes_downloaded = 0
 
     @property
     def enabled(self) -> bool:
         return bool(self.bucket_name and self.blob_name)
+
+    def reset_cycle_bytes(self) -> tuple[int, int]:
+        """Retorna (bytes_enviados, bytes_lidos) no ciclo atual e zera os contadores do ciclo."""
+        with self._lock:
+            up = self.cycle_bytes_uploaded
+            down = self.cycle_bytes_downloaded
+            self.cycle_bytes_uploaded = 0
+            self.cycle_bytes_downloaded = 0
+            return up, down
 
     def _blob_named(self, blob_name: str):
         if not self.enabled:
@@ -836,6 +958,9 @@ class RotalogGcsSnapshotStore:
                     compressed = blob.download_as_bytes(raw_download=True)
                 except TypeError:
                     compressed = blob.download_as_bytes()
+                if compressed:
+                    self.bytes_downloaded += len(compressed)
+                    self.cycle_bytes_downloaded += len(compressed)
                 return _decode_json_object(compressed)
             except Exception as exc:
                 if getattr(exc, "code", None) == 404:
@@ -854,6 +979,9 @@ class RotalogGcsSnapshotStore:
                     compressed = blob.download_as_bytes(raw_download=True)
                 except TypeError:
                     compressed = blob.download_as_bytes()
+                if compressed:
+                    self.bytes_downloaded += len(compressed)
+                    self.cycle_bytes_downloaded += len(compressed)
                 return _decode_json_object(compressed)
             except Exception as exc:
                 if getattr(exc, "code", None) == 404:
@@ -871,10 +999,13 @@ class RotalogGcsSnapshotStore:
             ).encode("utf-8")
             blob = self._blob_named(blob_name)
             blob.content_encoding = "gzip"
+            compressed = gzip.compress(raw, compresslevel=6)
             blob.upload_from_string(
-                gzip.compress(raw, compresslevel=6),
+                compressed,
                 content_type="application/json",
             )
+            self.bytes_uploaded += len(compressed)
+            self.cycle_bytes_uploaded += len(compressed)
 
     def update_blob(self, blob_name: str, transform: typing.Callable[[dict], dict]) -> dict[str, typing.Any]:
         """Compare-and-swap atômico para evitar conflitos concorrentes de gravação."""
@@ -887,6 +1018,10 @@ class RotalogGcsSnapshotStore:
                     raw_bytes = blob.download_as_bytes(raw_download=True, if_generation_match=generation)
                 except TypeError:
                     raw_bytes = blob.download_as_bytes(if_generation_match=generation)
+                if raw_bytes:
+                    with self._lock:
+                        self.bytes_downloaded += len(raw_bytes)
+                        self.cycle_bytes_downloaded += len(raw_bytes)
                 previous = _decode_json_object(raw_bytes)
             except Exception as exc:
                 if getattr(exc, "code", None) == 404:
@@ -899,11 +1034,15 @@ class RotalogGcsSnapshotStore:
             raw = json.dumps(merged, ensure_ascii=False, default=_json_cache_default).encode("utf-8")
             try:
                 blob.content_encoding = "gzip"
+                compressed = gzip.compress(raw)
                 blob.upload_from_string(
-                    gzip.compress(raw),
+                    compressed,
                     content_type="application/json",
                     if_generation_match=generation,
                 )
+                with self._lock:
+                    self.bytes_uploaded += len(compressed)
+                    self.cycle_bytes_uploaded += len(compressed)
                 return merged
             except Exception as exc:
                 if getattr(exc, "code", None) != 412:

@@ -75,21 +75,25 @@ dds-coletor-rtl/
 │   ├── __init__.py
 │   ├── client.py           # Sessão autenticada no RTLWeb (/paginas/j_security_check)
 │   ├── historico.py        # Raspagem do histórico diário de equipes e eventos (Zero Pandas)
+│   ├── logs.py             # Rotação diária com compressão gzip e leitor incremental JsonlTailReader
 │   ├── parser.py           # Parsing da timeline, agrupamento de turnos e detecção de OS
 │   └── storage.py          # load_json/write_json nativos para .json.gz, diffing e GCS
 ├── dados-local/            # Armazenamento local (ignorado pelo git)
 │   └── rotalog/
-│       └── equipes/
-│           ├── current/
-│           │   └── index.json.gz              # Torre de controle unificada (~9.1 KB)
-│           └── daily/
-│               └── AAAA-MM-DD/
-│                   ├── E3C03.json.gz          # Histórico detalhado da equipe no dia
-│                   └── E3389.json.gz
+│       ├── equipes/
+│       │   ├── current/
+│       │   │   └── index.json.gz              # Torre de controle unificada (~9.1 KB)
+│       │   └── daily/
+│       │       └── AAAA-MM-DD/
+│       │           ├── E3C03.json.gz          # Histórico detalhado da equipe no dia
+│       │           └── E3389.json.gz
+│       └── logs/
+│           ├── execucoes.jsonl                # Log ativo do dia corrente
+│           └── execucoes-AAAA-MM-DD.jsonl.gz  # Logs anteriores arquivados em GZIP
 ├── .env.example            # Modelo de variáveis de ambiente
 ├── .gitignore              # Proteção de credenciais e dados locais
 ├── main.py                 # Daemon de coleta contínua
-├── tui.py                  # Interface interativa de terminal (Curses)
+├── tui.py                  # Interface interativa de terminal (Curses) com leitura incremental
 ├── requirements.txt        # Apenas 4 dependências essenciais
 └── rotalog.service         # Unit systemd para execução contínua no Orange Pi
 ```
@@ -141,15 +145,19 @@ python main.py --once
 
 ### Execução Contínua no Terminal
 ```bash
+# Execução com grade horária adaptativa (3 min no pico 07h-20h / 10 min no noturno 20h-07h):
+python main.py --firebase
+
+# Ou forçando um intervalo fixo em segundos (ex: 120 segundos):
 python main.py --firebase --interval-seconds 120
 ```
 
 ### Painel Interativo de Terminal (TUI)
 ```bash
-# Modo ativo (executa a raspagem com tela gráfica no terminal)
-python tui.py --firebase --interval-seconds 120
+# Modo ativo (executa a raspagem com tela gráfica no terminal e grade adaptativa):
+python tui.py --firebase
 
-# Modo passivo (apenas visualiza o serviço systemd sem interferir no ciclo)
+# Modo passivo (apenas visualiza o serviço systemd sem interferir no ciclo):
 python tui.py --view
 ```
 ### Coleta de Quilometragem Diária e Mensal (Arquivo Único / Custo Mínimo)

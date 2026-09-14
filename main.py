@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
+from coletor.logs import record_execution_log
 from coletor.historico import (
     executar_coleta_historico_dia,
     parse_target_date,
@@ -45,6 +46,7 @@ from coletor.storage import (
     normalize_team_key,
     queue_counts,
     rotalog_gcs_paths,
+    summarize_team_transition,
     write_json,
 )
 
@@ -321,6 +323,8 @@ class LocalRotalogRunner:
             "dailySyncPending": daily_sync["pending"],
             "dailySyncUploaded": daily_sync["uploaded"],
             "dailySyncFailed": daily_sync["failed"],
+            "bytesUploaded": 0,
+            "bytesDownloaded": 0,
         }
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with self.log_path.open("a", encoding="utf-8") as stream:
@@ -331,6 +335,8 @@ class LocalRotalogRunner:
         started_clock = time.perf_counter()
         started_at = datetime.now(TZ)
         daily_sync = {"uploaded": 0, "failed": 0, "pending": 0}
+        if self.firebase_store and hasattr(self.firebase_store, "reset_cycle_bytes"):
+            self.firebase_store.reset_cycle_bytes()
 
         # Automação: No 1º dia de cada mês, executa a varredura do mês anterior para fechar quilometragens
         today_iso = started_at.date().isoformat()
@@ -413,6 +419,8 @@ class LocalRotalogRunner:
             day = scraped_at.date().isoformat()
             updates = {}
             ignored = 0
+            local_events = []
+            cloud_events = []
 
             for team in teams:
                 code = str(team.get("equipe_codigo") or "").strip().upper()
@@ -438,11 +446,23 @@ class LocalRotalogRunner:
                     write_json(daily_path, merged_daily)
 
                     # 2. Persiste o evento antes do upload. Intervalos permanecem na torre.
+                    sync_reasons = self._daily_sync_reasons(previous_daily, merged_daily)
                     self._enqueue_daily_sync(
                         day,
                         team_key,
-                        self._daily_sync_reasons(previous_daily, merged_daily),
+                        sync_reasons,
                     )
+
+                    transition = summarize_team_transition(
+                        previous_daily,
+                        merged_daily,
+                        sync_reasons=sync_reasons,
+                    )
+                    event_item = {"team": team_key, "action": transition}
+                    if sync_reasons:
+                        cloud_events.append(event_item)
+                    else:
+                        local_events.append(event_item)
 
                 previous[team_key] = merged_daily
 
@@ -498,6 +518,12 @@ class LocalRotalogRunner:
                 except Exception as exc:
                     LOG.warning("Erro ao gravar log diário de execução no Storage: %s", exc)
 
+            bytes_uploaded, bytes_downloaded = 0, 0
+            if self.firebase_store and hasattr(self.firebase_store, "reset_cycle_bytes"):
+                res = self.firebase_store.reset_cycle_bytes()
+                if isinstance(res, (tuple, list)) and len(res) == 2:
+                    bytes_uploaded, bytes_downloaded = int(res[0]), int(res[1])
+
             result = {
                 "status": "success",
                 "startedAt": started_at.isoformat(),
@@ -512,6 +538,12 @@ class LocalRotalogRunner:
                 "dailySyncPending": daily_sync["pending"],
                 "dailySyncUploaded": daily_sync["uploaded"],
                 "dailySyncFailed": daily_sync["failed"],
+                "bytesUploaded": bytes_uploaded,
+                "bytesDownloaded": bytes_downloaded,
+                "events": {
+                    "local": local_events,
+                    "cloud": cloud_events,
+                },
             }
         except Exception as exc:
             try:
@@ -529,12 +561,16 @@ class LocalRotalogRunner:
                 "dailySyncPending": daily_sync["pending"],
                 "dailySyncUploaded": daily_sync["uploaded"],
                 "dailySyncFailed": daily_sync["failed"],
+                "bytesUploaded": 0,
+                "bytesDownloaded": 0,
+                "events": {
+                    "local": [],
+                    "cloud": [],
+                },
             }
             LOG.exception("Falha no ciclo de coleta")
 
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.log_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(result, ensure_ascii=False) + "\n")
+        record_execution_log(self.log_path, result)
         return result
 
 
@@ -645,10 +681,29 @@ def executar_fechamento_mes(
         return 1
 
 
+def get_adaptive_interval_seconds(
+    now: datetime.datetime | None = None,
+    peak_interval: int = 180,
+    offpeak_interval: int = 600,
+    peak_start_hour: int = 7,
+    peak_end_hour: int = 20,
+) -> int:
+    """Calcula o intervalo de coleta adaptativo baseado na janela horária operacional:
+    - 07:00 às 20:00: 3 minutos (180s) [pico operacional de equipes em campo]
+    - 20:00 às 07:00: 10 minutos (600s) [fora de pico / plantão noturno]
+    """
+    target = now or datetime.datetime.now(TZ)
+    if peak_start_hour <= target.hour < peak_end_hour:
+        return peak_interval
+    return offpeak_interval
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", default="dados-local", help="Diretório local para JSONs")
-    parser.add_argument("--interval-seconds", type=int, default=120, help="Intervalo entre coletas (segundos)")
+    parser.add_argument("--interval-seconds", type=int, default=None, help="Intervalo fixo em segundos (desativa adaptação horária)")
+    parser.add_argument("--peak-interval", type=int, default=180, help="Intervalo de pico em segundos (07:00 às 20:00, padrão: 180s)")
+    parser.add_argument("--offpeak-interval", type=int, default=600, help="Intervalo noturno em segundos (20:00 às 07:00, padrão: 600s)")
     parser.add_argument("--empresa", default=os.getenv("DDS_EMPRESA_PADRAO", "ChicoEletro"))
     parser.add_argument("--firebase", action="store_true", help="Ativa sincronização automática com Firebase Storage")
     parser.add_argument("--no-firebase", action="store_true", help="Força desativação do Firebase Storage (apenas local)")
@@ -701,8 +756,10 @@ def main() -> int:
             enable_firebase=enable_firebase,
         )
 
-    if args.interval_seconds < 30:
+    if args.interval_seconds is not None and args.interval_seconds < 30:
         parser.error("--interval-seconds deve ser no mínimo 30")
+    if args.peak_interval < 30 or args.offpeak_interval < 30:
+        parser.error("--peak-interval e --offpeak-interval devem ser no mínimo 30")
 
     runner = LocalRotalogRunner(Path(args.output_dir).resolve(), args.empresa, enable_firebase=enable_firebase)
     while True:
@@ -711,7 +768,16 @@ def main() -> int:
         if args.once:
             return 0 if result["status"] == "success" else 1
         elapsed = float(result.get("durationSeconds", 0))
-        time.sleep(max(1, args.interval_seconds - elapsed))
+
+        if args.interval_seconds is not None:
+            cycle_interval = args.interval_seconds
+        else:
+            cycle_interval = get_adaptive_interval_seconds(
+                peak_interval=args.peak_interval,
+                offpeak_interval=args.offpeak_interval,
+            )
+
+        time.sleep(max(1, cycle_interval - elapsed))
 
 
 if __name__ == "__main__":
