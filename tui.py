@@ -197,11 +197,14 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     _line(screen, 6, "ULTIMA EXECUCAO", width, curses.A_UNDERLINE)
     if last:
         upload_flag = "  |  nuvem: OK" if last.get("firebaseUploaded") else "  |  nuvem: LOCAL/PENDENTE"
+        if last.get("firebaseSyncStatus") == "unchanged":
+            upload_flag = "  |  torre: SEM ALTERACAO"
         _line(screen, 7, f"Resultado: {last.get('status', '-').upper()}  |  inicio: {str(last.get('startedAt', '-'))[11:19]}  |  fim: {str(last.get('finishedAt', '-'))[11:19]}", width)
         _line(screen, 8, f"Tempo total: {last.get('durationSeconds', '-')}s  |  raspagem: {last.get('scrapeDurationSeconds', '-')}s", width)
         _line(screen, 9, f"Equipes: {last.get('totalTeams', '-')}  |  atualizadas: {last.get('updatedTeams', '-')}  |  ignoradas: {last.get('ignoredTeams', '-')}{upload_flag}", width)
+        _line(screen, 10, f"Historicos: enviados: {last.get('dailySyncUploaded', 0)}  |  pendentes: {last.get('dailySyncPending', 0)}  |  falhas: {last.get('dailySyncFailed', 0)}", width)
         if last.get("error"):
-            _line(screen, 10, f"Erro: {last['error']}", width, curses.A_BOLD)
+            _line(screen, 11, f"Erro: {last['error']}", width, curses.A_BOLD)
     else:
         _line(screen, 7, "Aguardando registros do servico em execucoes.jsonl...", width)
 

@@ -13,6 +13,7 @@ import re
 import threading
 import time
 import typing
+import unicodedata
 import uuid
 from zoneinfo import ZoneInfo
 
@@ -41,6 +42,57 @@ TRACKED_FIELDS = (
 def normalize_team_key(team_code: str) -> str:
     """Normaliza o código da equipe como chave única (ex: 'E3733' -> 'E3733')."""
     return re.sub(r"[^A-Z0-9_-]+", "", str(team_code or "").strip().upper())
+
+
+def company_key(value: str) -> str:
+    """Gera a chave estável usada para isolar os dados de uma empresa."""
+    normalized = unicodedata.normalize("NFKD", str(value or "").strip())
+    key = re.sub(
+        r"[^a-z0-9]+",
+        "-",
+        normalized.encode("ascii", "ignore").decode("ascii").lower(),
+    ).strip("-")
+    return key or "default"
+
+
+def rotalog_gcs_paths(
+    empresa: str,
+    *,
+    root_prefix: str | None = None,
+    index_blob: str | None = None,
+) -> dict[str, str]:
+    """Deriva todos os destinos ROTALOG de uma única raiz validada por empresa."""
+    empresa_key = company_key(empresa)
+    suffix = "/equipes/current/index.json.gz"
+
+    configured_root = str(root_prefix or "").strip().strip("/")
+    if configured_root:
+        configured_root = configured_root.replace("{empresa}", empresa_key).replace("{company}", empresa_key)
+
+    configured_index = str(index_blob or "").strip().strip("/")
+    if configured_index:
+        configured_index = configured_index.replace("{empresa}", empresa_key).replace("{company}", empresa_key)
+        if not configured_index.lower().endswith(suffix):
+            raise ValueError(f"ROTALOG_GCS_CACHE_BLOB deve terminar com {suffix}")
+        inferred_root = configured_index[:-len(suffix)].strip("/")
+        if configured_root and configured_root.lower() != inferred_root.lower():
+            raise ValueError("ROTALOG_GCS_ROOT_PREFIX e ROTALOG_GCS_CACHE_BLOB apontam para raízes diferentes")
+        configured_root = inferred_root
+
+    root = configured_root or f"dados/{empresa_key}/rotalog"
+    if empresa_key not in {segment.lower() for segment in root.split("/")}:
+        raise ValueError(
+            f"Raiz GCS '{root}' não contém a chave da empresa '{empresa_key}'; sincronização bloqueada"
+        )
+
+    return {
+        "companyKey": empresa_key,
+        "root": root,
+        "index": f"{root}/equipes/current/index.json.gz",
+        "teams": f"{root}/equipes",
+        "logs": f"{root}/logs",
+        "kilometers": f"{root}/quilometragem",
+    }
 
 
 def queue_counts(team: dict[str, typing.Any]) -> dict[str, int]:
@@ -147,12 +199,12 @@ def changed_fields(
 
         prev_turno = prev_jornada.get("turno") or {}
         curr_turno = curr_jornada.get("turno") or {}
-        for k in ("status", "fim"):
+        for k in ("status", "inicio", "fim"):
             if prev_turno.get(k) != curr_turno.get(k):
                 changes[f"jornada.turno.{k}"] = {"anterior": prev_turno.get(k), "novo": curr_turno.get(k)}
 
-        if len(prev_jornada.get("intervalos") or []) != len(curr_jornada.get("intervalos") or []):
-            changes["jornada.intervalos"] = {"anterior": len(prev_jornada.get("intervalos") or []), "novo": len(curr_jornada.get("intervalos") or [])}
+        if _operational_value(prev_jornada.get("intervalos")) != _operational_value(curr_jornada.get("intervalos")):
+            changes["jornada.intervalos"] = {"anterior": prev_jornada.get("intervalos"), "novo": curr_jornada.get("intervalos")}
 
         prev_os = previous.get("ordensServico") or {}
         curr_os = current.get("ordensServico") or {}
@@ -168,8 +220,18 @@ def changed_fields(
 
         if prev_concluidos != curr_concluidos:
             changes["ordensServico.historico"] = {"anterior": prev_concluidos, "novo": curr_concluidos}
+        elif "historico" in prev_os and "historico" in curr_os:
+            if _operational_value(prev_os["historico"]) != _operational_value(curr_os["historico"]):
+                changes["ordensServico.historico"] = {"anterior": prev_os["historico"], "novo": curr_os["historico"]}
 
         return changes
+
+    for field in TRACKED_FIELDS:
+        old_value = previous.get(field)
+        new_value = current.get(field)
+        if _operational_value(old_value) != _operational_value(new_value):
+            changes[field] = {"anterior": old_value, "novo": new_value}
+    return changes
 
 
 def compactar_equipe_para_index(document: dict[str, typing.Any]) -> dict[str, typing.Any]:
@@ -208,22 +270,14 @@ def compactar_equipe_para_index(document: dict[str, typing.Any]) -> dict[str, ty
         "jornada": {
             "turno": turno,
             "emIntervalo": bool(jornada.get("emIntervalo")),
-            "totalIntervalos": len(jornada.get("intervalos") or []),
+            "totalIntervalos": len(jornada.get("intervalos") or []) if "intervalos" in jornada else jornada.get("totalIntervalos", 0),
         },
         "ordensServico": {
             "atual": servico_atual,
-            "totalConcluidos": len(historico),
-            "historicoUpdatedAt": ult_hora,
+            "totalConcluidos": len(historico) if "historico" in os_section else os_section.get("totalConcluidos", 0),
+            "historicoUpdatedAt": ult_hora if "historico" in os_section else os_section.get("historicoUpdatedAt"),
         },
     }
-
-    for field in TRACKED_FIELDS:
-        old_value = previous.get(field)
-        new_value = current.get(field)
-        if _operational_value(old_value) != _operational_value(new_value):
-            changes[field] = {"anterior": old_value, "novo": new_value}
-    return changes
-
 
 def _json_cache_default(value: typing.Any) -> typing.Any:
     if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
@@ -237,7 +291,8 @@ def _decode_json_object(payload: bytes) -> dict[str, typing.Any]:
     return loaded if isinstance(loaded, dict) else {}
 
 
-def load_json(path: Path, fallback: typing.Any) -> typing.Any:
+def load_json_with_status(path: Path, fallback: typing.Any) -> tuple[typing.Any, str]:
+    """Lê um JSON e distingue arquivo ausente de conteúdo local corrompido."""
     target = path
     if not target.exists():
         if target.name.endswith(".gz"):
@@ -249,13 +304,23 @@ def load_json(path: Path, fallback: typing.Any) -> typing.Any:
             if fallback_target.exists():
                 target = fallback_target
 
+    if not target.exists():
+        return fallback, "missing"
+
     try:
         payload = target.read_bytes()
         raw = gzip.decompress(payload) if payload.startswith(b"\x1f\x8b") else payload
         value = json.loads(raw.decode("utf-8-sig"))
-        return value if isinstance(value, type(fallback)) else fallback
-    except (FileNotFoundError, json.JSONDecodeError, OSError, gzip.BadGzipFile):
-        return fallback
+        if not isinstance(value, type(fallback)):
+            return fallback, "corrupt"
+        return value, "ok"
+    except (json.JSONDecodeError, OSError, EOFError, UnicodeDecodeError):
+        return fallback, "corrupt"
+
+
+def load_json(path: Path, fallback: typing.Any) -> typing.Any:
+    value, _ = load_json_with_status(path, fallback)
+    return value
 
 
 def write_json(path: Path, value: typing.Any, compress: bool | None = None) -> None:
@@ -682,6 +747,10 @@ def merge_daily_document(
 
     return {
         "schemaVersion": 2,
+        "company": current.get("empresa") or previous.get("company") or previous.get("empresa"),
+        "companyKey": company_key(
+            current.get("empresa") or previous.get("company") or previous.get("empresa")
+        ),
         "teamKey": team_key,
         "date": day,
         "updatedAt": current.get("updatedAtIso") or current.get("updatedAt"),
@@ -728,10 +797,15 @@ class RotalogGcsSnapshotStore:
         bucket_name: str,
         blob_name: str,
         *,
+        root_prefix: str | None = None,
         client_factory: typing.Callable[[], typing.Any] | None = None,
     ):
         self.bucket_name = bucket_name.strip()
         self.blob_name = blob_name.strip().lstrip("/")
+        self.root_prefix = str(root_prefix or "").strip().strip("/")
+        index_suffix = "/equipes/current/index.json.gz"
+        if not self.root_prefix and self.blob_name.lower().endswith(index_suffix):
+            self.root_prefix = self.blob_name[:-len(index_suffix)].strip("/")
         self._client_factory = client_factory
         self._client = None
         self._lock = threading.RLock()
@@ -838,7 +912,7 @@ class RotalogGcsSnapshotStore:
 
 
 class RotalogTeamFileRepository:
-    def __init__(self, store: RotalogGcsSnapshotStore, root_prefix: str = "dados/chicoeletro/rotalog/equipes"):
+    def __init__(self, store: RotalogGcsSnapshotStore, root_prefix: str):
         self.store = store
         self.root_prefix = root_prefix.strip().strip("/")
         self._lock = threading.RLock()
@@ -874,7 +948,7 @@ class RotalogTeamFileRepository:
 
 
 class RotalogExecutionLog:
-    def __init__(self, store: RotalogGcsSnapshotStore, root_prefix: str = "dados/chicoeletro/rotalog/logs"):
+    def __init__(self, store: RotalogGcsSnapshotStore, root_prefix: str):
         self.store = store
         self.root_prefix = root_prefix.strip().strip("/")
 

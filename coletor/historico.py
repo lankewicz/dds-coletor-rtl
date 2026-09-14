@@ -18,7 +18,6 @@ from pathlib import Path
 import re
 import sys
 import typing
-import unicodedata
 import warnings
 from zoneinfo import ZoneInfo
 
@@ -29,7 +28,7 @@ warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 from coletor.client import CrawlerRotalog
 from coletor.parser import formatar_protocolo_copel
-from coletor.storage import normalize_team_key
+from coletor.storage import company_key, normalize_team_key
 
 LOG = logging.getLogger("coletor-historico")
 TZ = ZoneInfo(os.getenv("DDS_TIMEZONE", "America/Sao_Paulo"))
@@ -39,15 +38,6 @@ URL_LISTAGEM_EVENTOS = f"{URL_BASE}/paginas/listagemEventos"
 
 # Contratos monitorados para controle de produção / faturamento
 CONTRATOS_ALVO: tuple[str, ...] = ("4600026988", "4600025149")
-
-
-def company_key(value: str) -> str:
-    """Gera chave normalizada da empresa em minúsculas (ex: 'ChicoEletro' -> 'chicoeletro')."""
-    normalized = unicodedata.normalize("NFKD", str(value or "").strip())
-    key = re.sub(r"[^a-z0-9]+", "-", normalized.encode("ascii", "ignore").decode("ascii").lower()).strip("-")
-    if not key:
-        return "default"
-    return key
 
 
 def parse_float_br(val: typing.Any) -> float:
@@ -326,7 +316,6 @@ def executar_coleta_historico_dia(
     """Raspa a listagem de eventos e gera um ÚNICO arquivo diário de quilometragem."""
     day_iso = target_date.isoformat()
     day_br = target_date.strftime("%d/%m/%Y")
-    emp_key = company_key(empresa)
     started_at = datetime.datetime.now(TZ)
 
     LOG.info("=== Coleta Diária de Quilometragem: data %s (Empresa: %s) ===", day_iso, empresa)
@@ -347,7 +336,7 @@ def executar_coleta_historico_dia(
     firebase_synced = False
     if enable_firebase and firebase_store and firebase_store.enabled:
         try:
-            remote_blob = f"dados/{emp_key}/rotalog/quilometragem/diario/{day_iso}.json.gz"
+            remote_blob = f"{firebase_store.root_prefix}/quilometragem/diario/{day_iso}.json.gz"
             firebase_store.save_blob(remote_blob, payload_km)
             firebase_synced = True
             LOG.info("Arquivo único de quilometragem sincronizado no Firebase: %s", remote_blob)
@@ -396,7 +385,6 @@ def varrer_mes(
     """Varre todos os eventos do mês e gera um ÚNICO arquivo consolidado mensal de faturamento."""
     started_at = datetime.datetime.now(TZ)
     mes_str = f"{ano:04d}-{mes:02d}"
-    emp_key = company_key(empresa)
     ultimo_dia = calendar.monthrange(ano, mes)[1]
     dt_inicio = datetime.date(ano, mes, 1)
     dt_fim = datetime.date(ano, mes, ultimo_dia)
@@ -429,7 +417,7 @@ def varrer_mes(
     firebase_synced = False
     if enable_firebase and firebase_store and firebase_store.enabled:
         try:
-            remote_monthly_blob = f"dados/{emp_key}/rotalog/quilometragem/mensal/{mes_str}.json.gz"
+            remote_monthly_blob = f"{firebase_store.root_prefix}/quilometragem/mensal/{mes_str}.json.gz"
             firebase_store.save_blob(remote_monthly_blob, payload_mensal)
             firebase_synced = True
             LOG.info("Arquivo único mensal sincronizado no Firebase: %s", remote_monthly_blob)

@@ -53,13 +53,21 @@ Projetado especificamente para rodar em hardware de baixo consumo como o **Orang
 3. **Política de Gravação Inteligente (Custo Zero no Firebase)**:
    - **Disco Local (`dados-local`)**: Grava todas as etapas (deslocamento, execução, intervalo, etc.) com fidelidade cirúrgica.
    - **Firebase Storage**:
-     - `index.json.gz`: Atualizado a cada ciclo para manter o mapa ao vivo.
-     - `daily/<data>/<equipe>.json.gz`: Enviado **apenas quando a equipe conclui um serviço** ou quando **fecha o turno**.
+     - `index.json.gz`: Enviado apenas quando os dados operacionais mudam. Horário de coleta e versão interna não provocam envio.
+     - `daily/<data>/<equipe>.json.gz`: Enviado na **abertura do turno**, quando a equipe **conclui um serviço**, quando **fecha o turno** e quando um serviço concluído recebe uma correção posterior.
    - **Economia**: O volume mensal para 115 equipes fica em **~40.000 gravações**, ficando **100% coberto pela cota gratuita de 50.000 gravações do Google Cloud Storage (Custo: R$ 0,00)**.
 
 ---
 
 ## 3. Estrutura de Arquivos
+
+A confirmação do último índice enviado fica em `current/firebase-sync.json`, vinculada ao bucket e ao caminho remoto. Sem confirmação local, o primeiro ciclo envia o índice; ciclos sem mudanças dispensam o upload, inclusive após reiniciar. Falhas são tentadas novamente nos ciclos seguintes com os dados mais recentes. O índice local continua sendo atualizado em cada coleta. No Firebase, `updatedAtIso` indica a última publicação, não a última coleta. Os logs de auditoria remotos continuam seguindo a política anterior.
+
+Se o índice ou o histórico diário de uma equipe estiver corrompido, o coletor tenta recuperar a cópia correspondente do Firebase. A cópia diária só é aceita quando equipe, data e estrutura são compatíveis. Depois da validação, o arquivo defeituoso recebe o sufixo `.corrupt-<identificador>` e permanece ao lado do arquivo reconstruído para diagnóstico. Se não existir uma cópia remota válida, o ciclo registra erro e preserva o arquivo original; ele não cria um histórico vazio sobre dados corrompidos. Arquivo ausente em um dia novo continua sendo tratado como início normal, sem recuperação remota.
+
+Os uploads dos históricos de equipe passam pela fila persistente `rotalog/sync/<empresa>/pending-daily.json.gz`. Uma pendência é gravada antes da tentativa de envio e removida apenas depois da confirmação do Firebase. Falhas mantêm o número de tentativas, o último erro e o horário da tentativa. O ciclo seguinte retoma a fila, inclusive após reiniciar, e envia a versão local mais recente de cada combinação de data e equipe. Eventos repetidos para a mesma equipe no mesmo dia são consolidados em um único upload pendente. Intervalos continuam disponíveis na torre de controle e não provocam upload do histórico diário.
+
+Todos os destinos remotos são derivados de `ROTALOG_GCS_ROOT_PREFIX`, substituindo `{empresa}` pela chave normalizada de `--empresa`. Índice, equipes, logs e quilometragem permanecem sob essa mesma raiz. A configuração antiga `ROTALOG_GCS_CACHE_BLOB` continua aceita quando aponta para a empresa selecionada; configurações divergentes são bloqueadas antes de qualquer upload. Para executar duas empresas no mesmo equipamento, informe um `--output-dir` diferente para cada uma. O coletor detecta índices e arquivos diários identificados como pertencentes a outra empresa e interrompe o ciclo sem misturar os dados.
 
 ```text
 dds-coletor-rtl/
@@ -113,7 +121,7 @@ Preencha os valores:
 ROTALOG_USUARIO=seu_usuario_copel
 ROTALOG_SENHA=sua_senha_copel
 DDS_BUCKET_NAME=dds-treinamentos.firebasestorage.app
-ROTALOG_GCS_CACHE_BLOB=dados/chicoeletro/rotalog/equipes/current/index.json.gz
+ROTALOG_GCS_ROOT_PREFIX=dados/{empresa}/rotalog
 DDS_EMPRESA_PADRAO=ChicoEletro
 DDS_TIMEZONE=America/Sao_Paulo
 ROTALOG_UPLOAD_FIREBASE=true

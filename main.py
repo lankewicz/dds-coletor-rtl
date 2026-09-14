@@ -9,6 +9,7 @@ Use --once para um teste único; sem essa opção o processo permanece em ciclo 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -36,11 +37,14 @@ from coletor.storage import (
     RotalogTeamFileRepository,
     build_rotalog_document,
     changed_fields,
+    company_key,
     compactar_equipe_para_index,
     load_json,
+    load_json_with_status,
     merge_daily_document,
     normalize_team_key,
     queue_counts,
+    rotalog_gcs_paths,
     write_json,
 )
 
@@ -53,7 +57,7 @@ logging.basicConfig(
 LOG = logging.getLogger("coletor-rotalog")
 
 
-def _init_firebase_storage():
+def _init_firebase_storage(empresa: str):
     """Inicializa os repositórios GCS caso as credenciais estejam disponíveis."""
     try:
         from google.cloud import storage
@@ -75,14 +79,21 @@ def _init_firebase_storage():
         else:
             LOG.info("Storage inicializado com credenciais padrão do ambiente (ADC)")
 
-        bucket_name = os.getenv("DDS_BUCKET_NAME", "dds-treinamentos.firebasestorage.app")
-        blob_name = os.getenv(
-            "ROTALOG_GCS_CACHE_BLOB",
-            "dados/chicoeletro/rotalog/equipes/current/index.json.gz",
+        paths = rotalog_gcs_paths(
+            empresa,
+            root_prefix=os.getenv("ROTALOG_GCS_ROOT_PREFIX"),
+            index_blob=os.getenv("ROTALOG_GCS_CACHE_BLOB"),
         )
-        store = RotalogGcsSnapshotStore(bucket_name, blob_name, client_factory=client_factory)
-        team_repo = RotalogTeamFileRepository(store)
-        exec_log = RotalogExecutionLog(store)
+        bucket_name = os.getenv("DDS_BUCKET_NAME", "dds-treinamentos.firebasestorage.app")
+        store = RotalogGcsSnapshotStore(
+            bucket_name,
+            paths["index"],
+            root_prefix=paths["root"],
+            client_factory=client_factory,
+        )
+        team_repo = RotalogTeamFileRepository(store, paths["teams"])
+        exec_log = RotalogExecutionLog(store, paths["logs"])
+        LOG.info("Destinos ROTALOG isolados para %s em %s", paths["companyKey"], paths["root"])
         return store, team_repo, exec_log
     except Exception as exc:
         LOG.warning("Não foi possível inicializar conexão com Firebase Storage: %s", exc)
@@ -95,6 +106,11 @@ class LocalRotalogRunner:
         self.empresa = empresa
         self.index_path = output_dir / "rotalog" / "equipes" / "current" / "index.json.gz"
         self.log_path = output_dir / "rotalog" / "logs" / "execucoes.jsonl"
+        self.index_sync_path = self.index_path.with_name("firebase-sync.json")
+        self.company_key = company_key(empresa)
+        self.daily_sync_queue_path = (
+            output_dir / "rotalog" / "sync" / self.company_key / "pending-daily.json.gz"
+        )
         self.enable_firebase = enable_firebase
         self.firebase_store = None
         self.team_repo = None
@@ -103,15 +119,218 @@ class LocalRotalogRunner:
         self.last_monthly_sweep_day: str | None = None
 
         if self.enable_firebase:
-            self.firebase_store, self.team_repo, self.exec_log = _init_firebase_storage()
+            self.firebase_store, self.team_repo, self.exec_log = _init_firebase_storage(self.empresa)
 
     @property
     def firebase_enabled(self) -> bool:
         return bool(self.firebase_store and self.firebase_store.enabled)
 
+    def _sync_index(self, equipes: dict, timestamp: str) -> str:
+        """Confirma em disco somente o conteúdo enviado com sucesso ao destino atual."""
+        if not self.firebase_enabled:
+            return "disabled"
+
+        def operational(value):
+            if isinstance(value, dict):
+                return {key: operational(item) for key, item in value.items()
+                        if key not in {"observadoEm", "eventIdx"}}
+            if isinstance(value, list):
+                return [operational(item) for item in value]
+            return value
+
+        comparable = {
+            key: operational({field: value for field, value in doc.items()
+                              if field not in {"updatedAt", "updatedAtIso", "version"}})
+            for key, doc in equipes.items()
+        }
+        content = {"schemaVersion": 2, "company": self.empresa, "equipes": comparable}
+        digest = hashlib.sha256(json.dumps(
+            content, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str,
+        ).encode("utf-8")).hexdigest()
+        confirmation = {
+            "bucket": self.firebase_store.bucket_name,
+            "blob": self.firebase_store.blob_name,
+            "sha256": digest,
+        }
+        if load_json(self.index_sync_path, {}) == confirmation:
+            return "unchanged"
+        self.firebase_store.save({
+            "schemaVersion": 2,
+            "company": self.empresa,
+            "updatedAtIso": timestamp,
+            "totalEquipes": len(equipes),
+            "equipes": equipes,
+            "snapshots": equipes,
+        })
+        write_json(self.index_sync_path, confirmation)
+        return "uploaded"
+
+    @staticmethod
+    def _quarantine_corrupt_file(path: Path) -> Path:
+        quarantine = path.with_name(f"{path.name}.corrupt-{time.time_ns()}")
+        path.replace(quarantine)
+        return quarantine
+
+    def _valid_daily_recovery(self, document: dict, day: str, team_key: str) -> bool:
+        recovered_company = str(document.get("companyKey") or "").strip().lower()
+        if not recovered_company and document.get("company"):
+            recovered_company = company_key(document["company"])
+        return bool(
+            document
+            and normalize_team_key(document.get("teamKey") or document.get("equipe")) == team_key
+            and document.get("date") == day
+            and (not recovered_company or recovered_company == self.company_key)
+            and isinstance(document.get("jornada"), dict)
+            and isinstance(document.get("ordensServico"), dict)
+        )
+
+    def _load_daily_with_recovery(self, path: Path, day: str, team_key: str) -> dict:
+        local, status = load_json_with_status(path, {})
+        if status != "corrupt":
+            local_company = str(local.get("companyKey") or "").strip().lower() if local else ""
+            if not local_company and local and local.get("company"):
+                local_company = company_key(local["company"])
+            if local_company and local_company != self.company_key:
+                raise RuntimeError(
+                    f"Arquivo diário pertence à empresa '{local_company}', mas o coletor está configurado para "
+                    f"'{self.company_key}'; use outro --output-dir"
+                )
+            return local
+        if not self.firebase_enabled or not self.team_repo:
+            raise RuntimeError(
+                f"Histórico local corrompido para {team_key} em {day}; Firebase indisponível para recuperação"
+            )
+
+        remote_path = self.team_repo.daily_path(day, team_key)
+        remote = self.firebase_store.load_blob(remote_path)
+        if not self._valid_daily_recovery(remote, day, team_key):
+            raise RuntimeError(
+                f"Histórico local corrompido para {team_key} em {day}; cópia válida não encontrada no Firebase"
+            )
+
+        quarantine = self._quarantine_corrupt_file(path)
+        write_json(path, remote)
+        LOG.warning(
+            "Histórico de %s recuperado do Firebase; arquivo corrompido preservado em %s",
+            team_key,
+            quarantine,
+        )
+        return remote
+
+    @staticmethod
+    def _daily_sync_reasons(previous: dict, current: dict) -> list[str]:
+        reasons = []
+        prev_turno = ((previous.get("jornada") or {}).get("turno") or {})
+        curr_turno = ((current.get("jornada") or {}).get("turno") or {})
+        prev_status = str(prev_turno.get("status") or "").upper()
+        curr_status = str(curr_turno.get("status") or "").upper()
+        if curr_status == "ABERTO" and prev_status != "ABERTO":
+            reasons.append("turno_aberto")
+        if curr_status == "FECHADO" and prev_status != "FECHADO":
+            reasons.append("turno_fechado")
+
+        prev_history = (previous.get("ordensServico") or {}).get("historico") or []
+        curr_history = (current.get("ordensServico") or {}).get("historico") or []
+        if len(curr_history) > len(prev_history):
+            reasons.append("servico_concluido")
+        elif previous and "ordensServico.historico" in changed_fields(previous, current):
+            reasons.append("correcao_servico_concluido")
+        return reasons
+
+    def _load_daily_sync_queue(self) -> dict:
+        payload, status = load_json_with_status(self.daily_sync_queue_path, {})
+        if status == "corrupt":
+            raise RuntimeError(f"Fila de sincronização corrompida: {self.daily_sync_queue_path}")
+        items = payload.get("items", {}) if isinstance(payload, dict) else {}
+        if not isinstance(items, dict):
+            raise RuntimeError(f"Fila de sincronização inválida: {self.daily_sync_queue_path}")
+        return {"schemaVersion": 1, "items": items}
+
+    def _save_daily_sync_queue(self, queue: dict) -> None:
+        queue["schemaVersion"] = 1
+        queue["updatedAt"] = datetime.now(TZ).isoformat()
+        write_json(self.daily_sync_queue_path, queue)
+
+    def _enqueue_daily_sync(self, day: str, team_key: str, reasons: list[str]) -> None:
+        if not self.enable_firebase or not reasons:
+            return
+        queue = self._load_daily_sync_queue()
+        item_key = f"{day}/{team_key}"
+        existing = queue["items"].get(item_key, {})
+        queue["items"][item_key] = {
+            "day": day,
+            "teamKey": team_key,
+            "reasons": sorted(set((existing.get("reasons") or []) + reasons)),
+            "queuedAt": existing.get("queuedAt") or datetime.now(TZ).isoformat(),
+            "attempts": int(existing.get("attempts") or 0),
+            "lastAttemptAt": existing.get("lastAttemptAt"),
+            "lastError": existing.get("lastError"),
+        }
+        # A pendência deve existir em disco antes de qualquer tentativa de upload.
+        self._save_daily_sync_queue(queue)
+
+    def _flush_daily_sync_queue(self) -> dict[str, int]:
+        queue = self._load_daily_sync_queue()
+        stats = {"uploaded": 0, "failed": 0, "pending": len(queue["items"])}
+        if not queue["items"] or not self.firebase_enabled or not self.team_repo:
+            return stats
+
+        for item_key, item in list(queue["items"].items()):
+            day = str(item.get("day") or "")
+            team_key = normalize_team_key(item.get("teamKey") or "")
+            attempted_at = datetime.now(TZ).isoformat()
+            try:
+                if not day or not team_key:
+                    raise ValueError("Pendência sem data ou equipe válida")
+                daily_path = self.output_dir / "rotalog" / "equipes" / "daily" / day / f"{team_key}.json.gz"
+                document = self._load_daily_with_recovery(daily_path, day, team_key)
+                if not self._valid_daily_recovery(document, day, team_key):
+                    raise RuntimeError("Arquivo diário local ausente ou inválido")
+                self.team_repo.save_daily(document, day)
+            except Exception as exc:
+                item["attempts"] = int(item.get("attempts") or 0) + 1
+                item["lastAttemptAt"] = attempted_at
+                item["lastError"] = str(exc)
+                queue["items"][item_key] = item
+                stats["failed"] += 1
+                self._save_daily_sync_queue(queue)
+                LOG.error("Pendência diária %s mantida após falha de sincronização: %s", item_key, exc)
+            else:
+                del queue["items"][item_key]
+                stats["uploaded"] += 1
+                self._save_daily_sync_queue(queue)
+                LOG.info("Histórico diário sincronizado e removido da fila: %s", item_key)
+
+        stats["pending"] = len(queue["items"])
+        return stats
+
+    def _local_failure_result(self, started_at: datetime, started_clock: float, message: str) -> dict:
+        daily_sync = {"uploaded": 0, "failed": 0, "pending": 0}
+        try:
+            daily_sync = self._flush_daily_sync_queue()
+        except Exception as sync_exc:
+            LOG.error("Não foi possível processar a fila diária: %s", sync_exc)
+        result = {
+            "status": "error",
+            "startedAt": started_at.isoformat(),
+            "finishedAt": datetime.now(TZ).isoformat(),
+            "durationSeconds": round(time.perf_counter() - started_clock, 3),
+            "error": message,
+            "firebaseUploaded": False,
+            "firebaseSyncStatus": "pending" if self.firebase_enabled else "disabled",
+            "dailySyncPending": daily_sync["pending"],
+            "dailySyncUploaded": daily_sync["uploaded"],
+            "dailySyncFailed": daily_sync["failed"],
+        }
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.log_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(result, ensure_ascii=False) + "\n")
+        return result
+
     def run_once(self) -> dict:
         started_clock = time.perf_counter()
         started_at = datetime.now(TZ)
+        daily_sync = {"uploaded": 0, "failed": 0, "pending": 0}
 
         # Automação: No 1º dia de cada mês, executa a varredura do mês anterior para fechar quilometragens
         today_iso = started_at.date().isoformat()
@@ -129,7 +348,38 @@ class LocalRotalogRunner:
             except Exception as exc:
                 LOG.error("Erro na varredura mensal automática: %s", exc)
 
-        previous = load_json(self.index_path, {}).get("equipes", {})
+        local_index, index_status = load_json_with_status(self.index_path, {})
+        local_company = str(local_index.get("company") or "").strip() if local_index else ""
+        if index_status == "ok" and local_company and company_key(local_company) != self.company_key:
+            message = (
+                f"O --output-dir contém o índice da empresa '{company_key(local_company)}', mas o coletor "
+                f"está configurado para '{self.company_key}'; use um diretório local separado"
+            )
+            LOG.error(message)
+            return self._local_failure_result(started_at, started_clock, message)
+        if index_status == "corrupt":
+            if not self.firebase_enabled:
+                message = "Índice local corrompido; Firebase indisponível para recuperação"
+                LOG.error(message)
+                return self._local_failure_result(started_at, started_clock, message)
+            remote_payload = self.firebase_store.load()
+            remote_equipes = remote_payload.get("equipes") if isinstance(remote_payload, dict) else None
+            if not isinstance(remote_equipes, dict) or not remote_equipes:
+                message = "Índice local corrompido; cópia válida não encontrada no Firebase"
+                LOG.error(message)
+                return self._local_failure_result(started_at, started_clock, message)
+            quarantine = self._quarantine_corrupt_file(self.index_path)
+            local_index = {
+                "schemaVersion": 2,
+                "company": self.empresa,
+                "lastCollectedAt": remote_payload.get("updatedAtIso"),
+                "totalEquipes": len(remote_equipes),
+                "equipes": remote_equipes,
+            }
+            write_json(self.index_path, local_index)
+            LOG.warning("Índice local recuperado do Firebase; arquivo corrompido preservado em %s", quarantine)
+
+        previous = local_index.get("equipes", {})
         if not isinstance(previous, dict):
             previous = {}
 
@@ -174,10 +424,11 @@ class LocalRotalogRunner:
                 )
 
                 daily_path = self.output_dir / "rotalog" / "equipes" / "daily" / day / f"{team_key}.json.gz"
-                merged_daily = merge_daily_document(load_json(daily_path, {}), document, day)
+                previous_daily = self._load_daily_with_recovery(daily_path, day, team_key)
+                merged_daily = merge_daily_document(previous_daily, document, day)
 
-                old = previous.get(team_key)
-                if old and not changed_fields(old, merged_daily) and old.get("date") == day:
+                changes = changed_fields(previous_daily, merged_daily) if previous_daily else {"novo": {}}
+                if previous_daily and not changes and previous_daily.get("date") == day:
                     ignored += 1
                     merged_daily["updatedAt"] = timestamp
                 else:
@@ -186,24 +437,12 @@ class LocalRotalogRunner:
                     # 1. Grava SEMPRE no disco local (fidelidade máxima da linha do tempo)
                     write_json(daily_path, merged_daily)
 
-                    # 2. Envia ao Firebase Storage apenas em eventos-chave (conclusão de serviço ou fechamento de turno)
-                    old_concluidos = (
-                        old.get("ordensServico", {}).get("totalConcluidos")
-                        if old and "totalConcluidos" in (old.get("ordensServico") or {})
-                        else len(old.get("ordensServico", {}).get("historico", [])) if old else 0
+                    # 2. Persiste o evento antes do upload. Intervalos permanecem na torre.
+                    self._enqueue_daily_sync(
+                        day,
+                        team_key,
+                        self._daily_sync_reasons(previous_daily, merged_daily),
                     )
-                    curr_concluidos = len(merged_daily.get("ordensServico", {}).get("historico", []))
-                    concluiu_servico = (old is None and curr_concluidos > 0) or (curr_concluidos > old_concluidos)
-
-                    old_turno = old.get("jornada", {}).get("turno", {}).get("status") if old else None
-                    curr_turno = merged_daily.get("jornada", {}).get("turno", {}).get("status")
-                    fechou_turno = (curr_turno == "FECHADO" and old_turno != "FECHADO")
-
-                    if self.firebase_enabled and self.team_repo and (concluiu_servico or fechou_turno):
-                        try:
-                            self.team_repo.save_daily(merged_daily, day)
-                        except Exception as exc:
-                            LOG.error("Erro ao sincronizar equipe %s no Storage: %s", team_key, exc)
 
                 previous[team_key] = merged_daily
 
@@ -221,20 +460,18 @@ class LocalRotalogRunner:
                 "equipes": index_equipes,
             })
 
+            # Envia pendências antigas e novas usando sempre a versão local mais recente.
+            daily_sync = self._flush_daily_sync_queue()
+
             # Grava o índice consolidado (index.json.gz) no Firebase Storage
             firebase_uploaded = False
+            firebase_sync_status = "disabled"
             if self.firebase_enabled and self.firebase_store:
                 try:
-                    self.firebase_store.save({
-                        "schemaVersion": 2,
-                        "company": self.empresa,
-                        "updatedAtIso": timestamp,
-                        "totalEquipes": len(index_equipes),
-                        "equipes": index_equipes,
-                        "snapshots": index_equipes,
-                    })
-                    firebase_uploaded = True
+                    firebase_sync_status = self._sync_index(index_equipes, timestamp)
+                    firebase_uploaded = firebase_sync_status == "uploaded"
                 except Exception as exc:
+                    firebase_sync_status = "pending"
                     LOG.error("Erro ao salvar snapshot consolidado no Firebase Storage: %s", exc)
 
             finished_at = datetime.now(TZ)
@@ -253,6 +490,9 @@ class LocalRotalogRunner:
                             "updatedTeams": len(updates),
                             "ignoredTeams": ignored,
                             "scrapeDurationSeconds": round((scraped_at - started_at).total_seconds(), 3),
+                            "dailySyncPending": daily_sync["pending"],
+                            "dailySyncUploaded": daily_sync["uploaded"],
+                            "dailySyncFailed": daily_sync["failed"],
                         },
                     )
                 except Exception as exc:
@@ -268,8 +508,16 @@ class LocalRotalogRunner:
                 "updatedTeams": len(updates),
                 "ignoredTeams": ignored,
                 "firebaseUploaded": firebase_uploaded,
+                "firebaseSyncStatus": firebase_sync_status,
+                "dailySyncPending": daily_sync["pending"],
+                "dailySyncUploaded": daily_sync["uploaded"],
+                "dailySyncFailed": daily_sync["failed"],
             }
         except Exception as exc:
+            try:
+                daily_sync = self._flush_daily_sync_queue()
+            except Exception as sync_exc:
+                LOG.error("Não foi possível processar a fila diária: %s", sync_exc)
             result = {
                 "status": "error",
                 "startedAt": started_at.isoformat(),
@@ -277,8 +525,12 @@ class LocalRotalogRunner:
                 "durationSeconds": round(time.perf_counter() - started_clock, 3),
                 "error": str(exc),
                 "firebaseUploaded": False,
+                "firebaseSyncStatus": "pending" if self.firebase_enabled else "disabled",
+                "dailySyncPending": daily_sync["pending"],
+                "dailySyncUploaded": daily_sync["uploaded"],
+                "dailySyncFailed": daily_sync["failed"],
             }
-            LOG.exception("Falha na raspagem")
+            LOG.exception("Falha no ciclo de coleta")
 
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with self.log_path.open("a", encoding="utf-8") as stream:
@@ -300,7 +552,7 @@ def executar_historico(
     out_path = Path(output_dir).resolve()
     firebase_store = None
     if enable_firebase:
-        firebase_store, _, _ = _init_firebase_storage()
+        firebase_store, _, _ = _init_firebase_storage(empresa)
 
     try:
         dt_inicio = parse_target_date(target_date_str)
@@ -358,7 +610,7 @@ def executar_fechamento_mes(
     out_path = Path(output_dir).resolve()
     firebase_store = None
     if enable_firebase:
-        firebase_store, _, _ = _init_firebase_storage()
+        firebase_store, _, _ = _init_firebase_storage(empresa)
 
     try:
         if mes_str and mes_str.lower() not in ("anterior", "last", "true"):
@@ -464,4 +716,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
