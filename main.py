@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
 from coletor.logs import record_execution_log
+from coletor.led import ProcessingLed, list_system_leds
 from coletor.equipes import canonicalize_team_snapshots, normalize_team_key
 from coletor.historico import (
     atualizar_status_terminal,
@@ -124,6 +125,7 @@ class LocalRotalogRunner:
         self.exec_log = None
 
         self.last_monthly_sweep_day: str | None = None
+        self.processing_led = ProcessingLed()
 
         if self.enable_firebase:
             self.firebase_store, self.team_repo, self.exec_log = _init_firebase_storage(self.empresa)
@@ -359,6 +361,14 @@ class LocalRotalogRunner:
         return result
 
     def run_once(self) -> dict:
+        """Executa um ciclo mantendo o LED vermelho até a última gravação local."""
+        self.processing_led.processing()
+        try:
+            return self._run_once()
+        finally:
+            self.processing_led.idle()
+
+    def _run_once(self) -> dict:
         started_clock = time.perf_counter()
         started_at = datetime.now(TZ)
         daily_sync = {"uploaded": 0, "failed": 0, "pending": 0}
@@ -777,6 +787,11 @@ def main() -> int:
     parser.add_argument("--no-firebase", action="store_true", help="Força desativação do Firebase Storage (apenas local)")
     parser.add_argument("--once", action="store_true", help="Executa somente uma vez e finaliza")
     parser.add_argument(
+        "--list-leds",
+        action="store_true",
+        help="Lista LEDs disponíveis em /sys/class/leds e finaliza",
+    )
+    parser.add_argument(
         "--historico",
         nargs="?",
         const="ontem",
@@ -799,6 +814,10 @@ def main() -> int:
         help="Chave para rodar a varredura de um mês específico (formato AAAA-MM ou MM/AAAA)",
     )
     args = parser.parse_args()
+
+    if args.list_leds:
+        print(json.dumps(list_system_leds(), ensure_ascii=False, indent=2))
+        return 0
 
     if args.no_firebase:
         enable_firebase = False
