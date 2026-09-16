@@ -107,7 +107,9 @@ class CompanyIsolationTests(unittest.TestCase):
         scraper.raspar_periodo.return_value = []
         with tempfile.TemporaryDirectory() as directory, patch(
             "coletor.historico.RotalogEventosScraper", return_value=scraper
-        ):
+        ), patch("coletor.historico.RotalogEquipesScraper") as equipes_factory:
+            equipes_factory.return_value.raspar_dia.return_value = []
+            equipes_factory.return_value.raspar_periodo.return_value = []
             executar_coleta_historico_dia(
                 datetime.date(2026, 9, 14),
                 Path(directory),

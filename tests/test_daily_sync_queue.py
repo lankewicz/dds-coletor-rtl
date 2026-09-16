@@ -92,6 +92,17 @@ class DailySyncQueueTests(unittest.TestCase):
         closed["jornada"]["turno"]["status"] = "FECHADO"
         self.assertEqual(self.runner._daily_sync_reasons(corrected, closed), ["turno_fechado"])
 
+    def test_corrupt_sync_queue_is_quarantined_and_reinitialized(self):
+        queue_file = self.runner.daily_sync_queue_path
+        queue_file.parent.mkdir(parents=True, exist_ok=True)
+        queue_file.write_bytes(b"corrupted-non-gzip-content-or-truncated")
+
+        loaded = self.runner._load_daily_sync_queue()
+        self.assertEqual(loaded, {"schemaVersion": 1, "items": {}})
+        self.assertFalse(queue_file.exists())
+        corrupt_files = list(queue_file.parent.glob("pending-daily.json.gz.corrupt-*"))
+        self.assertEqual(len(corrupt_files), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

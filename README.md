@@ -40,6 +40,12 @@ Projetado especificamente para rodar em hardware de baixo consumo como o **Orang
 
 ## 2. Destaques da Arquitetura
 
+Identidade de equipe: quando o ROTALOG cria grupos adicionais pelo AUTOTRACK, sufixos numéricos como
+`E3T01(2)` e `E3T01(3)` são consolidados em `E3T01`. Turno, serviços, intervalos, quilometragem,
+arquivos locais, índice e caminhos na nuvem usam sempre a equipe base.
+As regras de identidade, validação, migração de snapshots e resolução por tablet ou integrantes ficam
+centralizadas em `coletor/equipes.py`.
+
 1. **Compactação Nativa GZIP (`.json.gz`)**:
    - Todo o tráfego de rede e armazenamento em disco utiliza `.json.gz`.
    - O `index.json.gz` consolidado (todas as 100+ equipes) caiu de **785 KB para apenas 9.1 KB** (**~99% de economia**).
@@ -190,6 +196,40 @@ Ao longo do mês, a fiscalização da Copel homologa pareceres de glosas. No **1
 python main.py --mes-anterior --firebase
 python main.py --mes 2026-08 --firebase
 ```
+
+### 6. Relatórios Diário e Mensal (Fontes Distintas e Paginação Completa)
+
+O coletor possui duas fontes oficiais distintas no portal RTLWeb da Copel, cada uma com paginação PrimeFaces em múltiplas páginas tratada automaticamente:
+
+#### Relatório Diário (`/paginas/listagemEventos`)
+* **Fonte**: Tela **Listagem de Eventos** (`https://www.copel.com/rtlweb/paginas/listagemEventos`).
+* **Conteúdo**: Detalhamento operacional e auditoria de cada serviço executado no dia (protocolo, equipe, horários de início/retorno do deslocamento, início/fim da execução, KM informado com limitador e KM autorizado final).
+* **Paginação**: Varre todas as páginas da tabela PrimeFaces (`form:tbListagemEventos`) até obter 100% dos eventos.
+* **Saída local**: 
+  - `dados-local/rotalog/quilometragem/diario/AAAA-MM-DD.json.gz` (dados estruturados)
+  - `dados-local/rotalog/quilometragem/diario/AAAA-MM-DD-relatorio.html` (relatório imprimível / PDF)
+
+```bash
+# Execução diária manual para uma data específica:
+python main.py --historico 2026-09-14 --no-firebase
+```
+
+#### Relatório Mensal (`/paginas/equipes`)
+* **Fonte**: Tela **Equipes** (`https://www.copel.com/rtlweb/paginas/equipes`).
+* **Conteúdo**: Fechamento oficial e homologado das equipes para faturamento e notas de cobrança. Apresenta por contrato e equipe: serviços executados, KM informada, glosada crítica, glosada por parecer, autorizada inicial, recuperados por parecer, autorizada final, aguardando justificativa, em análise, alertas e diferença percentual.
+* **Paginação**: Consulta o período do mês e navega por todas as páginas PrimeFaces (`form:tbEquipes`) via AJAX, consolidando todos os registros de fechamento.
+* **Saída local**:
+  - `dados-local/rotalog/quilometragem/mensal/AAAA-MM.json.gz`
+  - `dados-local/rotalog/quilometragem/mensal/AAAA-MM-relatorio.html`
+
+```bash
+# Execução mensal manual:
+python main.py --mes 08/2026 --no-firebase
+python main.py --mes 2026-08 --firebase
+python main.py --mes-anterior --firebase
+```
+
+Abra o arquivo HTML gerado no navegador. Ambos os relatórios contam com visual limpo, subtotais por contrato (`4600026988` e `4600025149`), total geral e botão **Imprimir / Salvar PDF**.
 
 ---
 

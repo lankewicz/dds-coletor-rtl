@@ -25,8 +25,13 @@ ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
 from coletor.logs import record_execution_log
+from coletor.equipes import canonicalize_team_snapshots, normalize_team_key
 from coletor.historico import (
+    atualizar_status_terminal,
     executar_coleta_historico_dia,
+    formatar_numero_br,
+    formatar_resumo_diario_terminal,
+    formatar_resumo_mensal_terminal,
     parse_target_date,
     varrer_mes,
     varrer_mes_anterior,
@@ -43,7 +48,6 @@ from coletor.storage import (
     load_json,
     load_json_with_status,
     merge_daily_document,
-    normalize_team_key,
     queue_counts,
     rotalog_gcs_paths,
     summarize_team_transition,
@@ -51,11 +55,12 @@ from coletor.storage import (
 )
 
 TZ = ZoneInfo(os.getenv("DDS_TIMEZONE", "America/Sao_Paulo"))
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
+if not logging.root.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
 LOG = logging.getLogger("coletor-rotalog")
 
 
@@ -169,8 +174,20 @@ class LocalRotalogRunner:
 
     @staticmethod
     def _quarantine_corrupt_file(path: Path) -> Path:
-        quarantine = path.with_name(f"{path.name}.corrupt-{time.time_ns()}")
-        path.replace(quarantine)
+        target = path
+        if not target.exists():
+            if target.name.endswith(".gz"):
+                fallback = target.with_name(target.name[:-3])
+                if fallback.exists():
+                    target = fallback
+            else:
+                fallback = target.with_name(target.name + ".gz")
+                if fallback.exists():
+                    target = fallback
+        if not target.exists():
+            return path
+        quarantine = target.with_name(f"{target.name}.corrupt-{time.time_ns()}")
+        target.replace(quarantine)
         return quarantine
 
     def _valid_daily_recovery(self, document: dict, day: str, team_key: str) -> bool:
@@ -240,10 +257,22 @@ class LocalRotalogRunner:
     def _load_daily_sync_queue(self) -> dict:
         payload, status = load_json_with_status(self.daily_sync_queue_path, {})
         if status == "corrupt":
-            raise RuntimeError(f"Fila de sincronização corrompida: {self.daily_sync_queue_path}")
+            quarantine = self._quarantine_corrupt_file(self.daily_sync_queue_path)
+            LOG.warning(
+                "Fila de sincronização corrompida em %s; arquivo movido para quarentena %s e fila reinicializada",
+                self.daily_sync_queue_path,
+                quarantine,
+            )
+            return {"schemaVersion": 1, "items": {}}
         items = payload.get("items", {}) if isinstance(payload, dict) else {}
         if not isinstance(items, dict):
-            raise RuntimeError(f"Fila de sincronização inválida: {self.daily_sync_queue_path}")
+            quarantine = self._quarantine_corrupt_file(self.daily_sync_queue_path)
+            LOG.warning(
+                "Fila de sincronização inválida em %s; arquivo movido para quarentena %s e fila reinicializada",
+                self.daily_sync_queue_path,
+                quarantine,
+            )
+            return {"schemaVersion": 1, "items": {}}
         return {"schemaVersion": 1, "items": items}
 
     def _save_daily_sync_queue(self, queue: dict) -> None:
@@ -410,6 +439,8 @@ class LocalRotalogRunner:
             except Exception as exc:
                 LOG.warning("Não foi possível pré-carregar cache inicial do Storage: %s", exc)
 
+        previous = canonicalize_team_snapshots(previous)
+
         try:
             teams = extrair_dados_tempo_real(snapshots_anteriores=previous)
             scraped_at = datetime.now(TZ)
@@ -421,10 +452,9 @@ class LocalRotalogRunner:
             cloud_events = []
 
             for team in teams:
-                code = str(team.get("equipe_codigo") or "").strip().upper()
-                if not code:
+                team_key = normalize_team_key(team.get("equipe_codigo"))
+                if not team_key:
                     continue
-                team_key = normalize_team_key(code)
                 document = build_rotalog_document(
                     team, self.empresa, team_key, timestamp, queue_counts(team)
                 )
@@ -599,19 +629,20 @@ def executar_historico(
         LOG.error("Data inicial (%s) posterior à data final (%s)", dt_inicio, dt_fim)
         return 1
 
-    LOG.info(
-        "Iniciando coleta de histórico separada: %s até %s (Empresa: %s, Firebase: %s)",
-        dt_inicio.isoformat(),
-        dt_fim.isoformat(),
-        empresa,
-        enable_firebase,
-    )
+    # Silencia mensagens rotineiras de logging na tela para não quebrar a linha de progresso
+    logging.getLogger("coletor-historico").setLevel(logging.WARNING)
+    logging.getLogger("coletor-rotalog").setLevel(logging.WARNING)
 
     current = dt_inicio
     total_sucesso = 0
     total_dias = (dt_fim - dt_inicio).days + 1
+    total_servicos_acum = 0
+    total_km_inf_acum = 0.0
+    total_km_aut_acum = 0.0
+    ultimo_res: dict[str, typing.Any] = {}
 
     while current <= dt_fim:
+        dia_br = current.strftime("%d/%m/%Y")
         try:
             res = executar_coleta_historico_dia(
                 target_date=current,
@@ -619,15 +650,45 @@ def executar_historico(
                 empresa=empresa,
                 enable_firebase=enable_firebase,
                 firebase_store=firebase_store,
+                atualizar_terminal=(total_dias == 1),
             )
-            print(json.dumps(res, ensure_ascii=False), flush=True)
+            ultimo_res = res
             if res.get("status") == "success":
                 total_sucesso += 1
+                total_servicos_acum += res.get("totalServicos", 0)
+                total_km_inf_acum += res.get("totalKmInformado", 0.0)
+                total_km_aut_acum += res.get("totalKmAutorizadoFinal", 0.0)
+
+            if total_dias > 1:
+                atualizar_status_terminal(
+                    f"[{dia_br}] Dia {total_sucesso}/{total_dias} | "
+                    f"Serviços: {formatar_numero_br(total_servicos_acum, 0)} | "
+                    f"KM Inf: {formatar_numero_br(total_km_inf_acum, 2)} | "
+                    f"KM Aut: {formatar_numero_br(total_km_aut_acum, 2)}"
+                )
         except Exception as exc:
-            LOG.exception("Falha ao coletar histórico da data %s: %s", current.isoformat(), exc)
+            LOG.error("Falha ao coletar histórico da data %s: %s", current.isoformat(), exc)
         current += timedelta(days=1)
 
-    LOG.info("Coleta de histórico finalizada. Dias processados com sucesso: %d/%d", total_sucesso, total_dias)
+    if total_dias > 1:
+        atualizar_status_terminal("Coleta de histórico concluída.", final=True)
+        res_consolidado = {
+            "date": f"{dt_inicio.isoformat()} a {dt_fim.isoformat()}",
+            "durationSeconds": "-",
+            "totalEquipes": ultimo_res.get("totalEquipes", 0),
+            "totalServicos": total_servicos_acum,
+            "totalKmInformado": round(total_km_inf_acum, 2),
+            "totalKmAutorizadoFinal": round(total_km_aut_acum, 2),
+            "totalKmRecuperadoParecer": 0.0,
+            "localArquivoKm": f"dados-local/rotalog/quilometragem/diario/ ({total_sucesso} arquivos)",
+            "localRelatorioHtml": f"dados-local/rotalog/quilometragem/diario/ ({total_sucesso} relatórios)",
+            "firebaseSynced": enable_firebase,
+        }
+        print(formatar_resumo_diario_terminal(res_consolidado), flush=True)
+    else:
+        atualizar_status_terminal("", final=True)
+        print(formatar_resumo_diario_terminal(ultimo_res), flush=True)
+
     return 0 if total_sucesso == total_dias else 1
 
 
@@ -636,15 +697,20 @@ def executar_fechamento_mes(
     output_dir: Path | str = "dados-local",
     empresa: str = "ChicoEletro",
     enable_firebase: bool = False,
+    progresso=None,
 ) -> int:
     """Função separada para varredura completa de um mês (fechamento/notas de cobrança).
     
-    Atualiza as quilometragens homologadas de todas as equipes no mês e consolida resumo_quilometragem.json.gz.
+    Coleta dados diários e mensais, gerando JSONs e relatórios HTML diários e mensal.
     """
     out_path = Path(output_dir).resolve()
     firebase_store = None
     if enable_firebase:
         firebase_store, _, _ = _init_firebase_storage(empresa)
+
+    # Silencia mensagens rotineiras de logging na tela para não quebrar a linha de progresso
+    logging.getLogger("coletor-historico").setLevel(logging.WARNING)
+    logging.getLogger("coletor-rotalog").setLevel(logging.WARNING)
 
     try:
         if mes_str and mes_str.lower() not in ("anterior", "last", "true"):
@@ -659,20 +725,24 @@ def executar_fechamento_mes(
             res = varrer_mes(
                 ano=ano_num,
                 mes=mes_num,
+                progresso=progresso,
                 output_dir=out_path,
                 empresa=empresa,
                 enable_firebase=enable_firebase,
                 firebase_store=firebase_store,
+                coletar_diarios=True,
             )
         else:
             res = varrer_mes_anterior(
+                progresso=progresso,
                 output_dir=out_path,
                 empresa=empresa,
                 enable_firebase=enable_firebase,
                 firebase_store=firebase_store,
+                coletar_diarios=True,
             )
 
-        print(json.dumps(res, ensure_ascii=False), flush=True)
+        print(formatar_resumo_mensal_terminal(res), flush=True)
         return 0 if res.get("status") == "success" else 1
     except Exception as exc:
         LOG.exception("Erro durante a varredura mensal: %s", exc)

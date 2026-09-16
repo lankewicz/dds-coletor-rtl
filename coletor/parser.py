@@ -20,18 +20,21 @@ from bs4 import BeautifulSoup
 import requests
 
 from .client import CrawlerRotalog, URL_BASE, URL_TEMPO_REAL
+from .equipes import normalize_team_key, resolve_team_group, valid_team_key
+
+# Nome mantido para compatibilidade com chamadas existentes.
+resolver_equipe_group = resolve_team_group
 
 LOCAL_TZ = ZoneInfo(os.getenv("DDS_TIMEZONE", "America/Sao_Paulo"))
 logger = logging.getLogger(__name__)
 
-REGIONAL_PREFIXES = ("CA", "CB", "LO", "MA", "PG")
 _CLIQUE_EVENTOS_CACHE: dict[tuple[int, int | None, str], dict[str, typing.Any]] = {}
 _CLIQUE_CACHE_LOCK = threading.RLock()
 
 
 def equipe_codigo_valido(value: str | None) -> bool:
     """Rejeita cabeçalhos/placeholders como ``veiculo?`` da timeline."""
-    return bool(re.fullmatch(r"E[A-Z0-9]{3,7}", str(value or "").strip().upper()))
+    return valid_team_key(value)
 
 
 def limpar_protocolo(protocolo_raw: str | None) -> str:
@@ -100,10 +103,10 @@ def parse_group_string(group_raw: str) -> dict[str, str]:
     group_clean = group_raw.strip()
 
     status_conexao = ""
-    m_status = re.search(r"\((.*?)\)$", group_clean)
-    if m_status:
+    m_status = re.search(r"\(([^()]*)\)$", group_clean)
+    if m_status and not m_status.group(1).strip().isdigit():
         status_conexao = m_status.group(1).strip()
-        group_clean = re.sub(r"\s*\((.*?)\)$", "", group_clean).strip()
+        group_clean = re.sub(r"\s*\([^()]*\)$", "", group_clean).strip()
 
     partes = group_clean.split(" ", 1)
     cod_veic = partes[0] if partes else group_clean
@@ -124,89 +127,6 @@ def parse_group_string(group_raw: str) -> dict[str, str]:
         "status_conexao": status_conexao,
         "is_online": "online" in status_conexao.lower(),
     }
-
-
-def _extract_numeric_tablet_id(raw_id: str) -> str:
-    """Extrai a parte numérica do tablet ignorando o prefixo da regional (CA, CB, LO, MA, PG)."""
-    if not raw_id:
-        return ""
-    clean = str(raw_id).strip().upper().replace(" ", "")
-    for prefix in REGIONAL_PREFIXES:
-        if clean.startswith(prefix) and len(clean) > len(prefix):
-            return clean[len(prefix):]
-    return clean
-
-
-def resolver_equipe_group(
-    meta: dict[str, str],
-    identificador_para_equipe: dict[str, str] | None = None,
-) -> dict[str, str]:
-    """Resolve grupos veiculo?-E..., veiculo?-CA... e veiculo?-MA... por tablet ou integrantes."""
-    resolved = dict(meta)
-    equipe_original = str(meta.get("equipe_codigo") or "").strip().upper()
-    identificador = str(meta.get("veiculo") or "").strip().upper().replace(" ", "")
-    colaborador = str(meta.get("colaborador") or "").strip().upper()
-
-    resolved["equipe_codigo_original"] = equipe_original
-    resolved["identificador_equipamento"] = identificador
-    resolved["origem_resolucao"] = "PREFIXO_EQUIPE"
-
-    if equipe_codigo_valido(equipe_original):
-        resolved["equipe_codigo"] = equipe_original
-        return resolved
-    if equipe_codigo_valido(identificador):
-        resolved["equipe_codigo"] = identificador
-        resolved["origem_resolucao"] = "VEICULO_COM_PREFIXO_EQUIPE"
-        return resolved
-
-    lookup = {str(key).strip().upper(): str(value).strip().upper()
-              for key, value in (identificador_para_equipe or {}).items()}
-
-    # 1. Busca direta por identificador de tablet/veículo (ex: CA085, MA974, MA965)
-    equipe_mapeada = lookup.get(identificador)
-    if equipe_codigo_valido(equipe_mapeada):
-        resolved["equipe_codigo"] = equipe_mapeada
-        resolved["origem_resolucao"] = "IDENTIFICACAO_TABLET"
-        return resolved
-
-    # 2. Busca por número do tablet
-    numeric_id = _extract_numeric_tablet_id(identificador)
-    if numeric_id:
-        equipe_numerica = lookup.get(f"NUMERIC_TABLET:{numeric_id}")
-        if equipe_codigo_valido(equipe_numerica):
-            resolved["equipe_codigo"] = equipe_numerica
-            resolved["origem_resolucao"] = "TABLET_NUMERICO_TRANSITORIO"
-            return resolved
-
-    # 3. Busca por integrantes / eletricistas
-    if colaborador:
-        colab_clean = re.sub(r"[^A-Z0-9\s]", "", colaborador)
-        tokens = [t for t in colab_clean.split() if len(t) >= 3]
-
-        if tokens:
-            candidate_counts: dict[str, int] = {}
-            for key, t_code in lookup.items():
-                if key.startswith("MEMBER_NAME:"):
-                    name_part = key[12:]
-                    for token in tokens:
-                        if token in name_part:
-                            candidate_counts[t_code] = candidate_counts.get(t_code, 0) + 1
-
-            if candidate_counts:
-                sorted_candidates = sorted(candidate_counts.items(), key=lambda x: x[1], reverse=True)
-                top_team, top_score = sorted_candidates[0]
-                if top_score >= 1 and (len(sorted_candidates) == 1 or top_score > sorted_candidates[1][1]):
-                    resolved["equipe_codigo"] = top_team
-                    resolved["origem_resolucao"] = "INTEGRANTES_EQUIPE"
-                    return resolved
-                elif top_score >= 2:
-                    resolved["equipe_codigo"] = top_team
-                    resolved["origem_resolucao"] = "INTEGRANTES_EQUIPE"
-                    return resolved
-
-    resolved["equipe_codigo"] = ""
-    resolved["origem_resolucao"] = "NAO_RELACIONADO"
-    return resolved
 
 
 def _obter_inicio_dia_operacional_ms(now: datetime.datetime | None = None) -> int:
@@ -360,7 +280,10 @@ def consolidar_equipes_duplicadas(equipes: list[dict[str, typing.Any]]) -> list[
     consolidadas: dict[str, dict[str, typing.Any]] = {}
     duplicadas: dict[str, int] = {}
     for equipe in equipes:
-        codigo = str(equipe.get("equipe_codigo") or "").strip().upper()
+        codigo = normalize_team_key(equipe.get("equipe_codigo"))
+        if not valid_team_key(codigo):
+            continue
+        equipe["equipe_codigo"] = codigo
         atual = consolidadas.get(codigo)
         if atual is None:
             consolidadas[codigo] = equipe
@@ -443,8 +366,10 @@ def _enriquecer_com_snapshot_anterior(
     )
     for eq in equipes:
         equipe_codigo = str(eq.get("equipe_codigo") or "").strip().upper()
-        team_key = re.sub(r"[^A-Z0-9_-]+", "", equipe_codigo)
-        anterior = snapshots.get(team_key) or snapshots.get(equipe_codigo) or {}
+        team_key = normalize_team_key(equipe_codigo)
+        anterior = snapshots.get(team_key) or snapshots.get(equipe_codigo) or next(
+            (doc for key, doc in snapshots.items() if normalize_team_key(key) == team_key), {}
+        )
 
         # Compatível com Schema v2 (ordensServico) e Schema v1 (ssExecutadas/ssEmAndamento)
         os_section = anterior.get("ordensServico") or {}
@@ -628,7 +553,7 @@ def _forcar_cliques_timeline_tempo_real(
                     equipe_popup = re.search(r"Equipe[\s:-]*(E[A-Z0-9]{3,7})\b", p_clean, re.IGNORECASE)
                     equipe_item = parse_group_string(group).get("equipe_codigo", "")
                     if equipe_popup and equipe_item:
-                        if equipe_popup.group(1).upper() != equipe_item.upper():
+                        if normalize_team_key(equipe_popup.group(1)) != normalize_team_key(equipe_item):
                             return idx, None, None, False
 
                     # Validação de compatibilidade de horários

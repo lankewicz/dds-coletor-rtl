@@ -18,6 +18,7 @@ import uuid
 from zoneinfo import ZoneInfo
 
 from .parser import _eh_protocolo_valido, formatar_protocolo_copel
+from .equipes import normalize_team_key
 
 LOCAL_TZ = ZoneInfo(os.getenv("DDS_TIMEZONE", "America/Sao_Paulo"))
 logger = logging.getLogger(__name__)
@@ -37,11 +38,6 @@ TRACKED_FIELDS = (
     "ssEmAndamento",
     "ssPendentes",
 )
-
-
-def normalize_team_key(team_code: str) -> str:
-    """Normaliza o código da equipe como chave única (ex: 'E3733' -> 'E3733')."""
-    return re.sub(r"[^A-Z0-9_-]+", "", str(team_code or "").strip().upper())
 
 
 def company_key(value: str) -> str:
@@ -135,9 +131,10 @@ def build_rotalog_document(
     timestamp_iso: str,
     fila_counts: dict[str, int],
 ) -> dict[str, typing.Any]:
+    team_key = _safe_team_key(team_key or eq.get("equipe_codigo"))
     return {
         "empresa": empresa,
-        "equipe": eq.get("equipe_codigo") or team_key,
+        "equipe": team_key,
         "teamKey": team_key,
         "groupRaw": eq.get("group_raw") or "",
         "veiculo": eq.get("veiculo") or "",
@@ -506,10 +503,15 @@ def write_json(path: Path, value: typing.Any, compress: bool | None = None) -> N
     if should_compress:
         raw_bytes = json.dumps(value, ensure_ascii=False, indent=2, default=str).encode("utf-8")
         compressed_bytes = gzip.compress(raw_bytes, compresslevel=6)
-        temporary.write_bytes(compressed_bytes)
+        with temporary.open("wb") as stream:
+            stream.write(compressed_bytes)
+            stream.flush()
+            os.fsync(stream.fileno())
     else:
         with temporary.open("w", encoding="utf-8") as stream:
             json.dump(value, stream, ensure_ascii=False, indent=2, default=str)
+            stream.flush()
+            os.fsync(stream.fileno())
 
     temporary.replace(path)
 
@@ -519,7 +521,7 @@ def write_json(path: Path, value: typing.Any, compress: bool | None = None) -> N
 # ---------------------------------------------------------------------------
 
 def _safe_team_key(value: str) -> str:
-    key = str(value or "").strip().upper()
+    key = normalize_team_key(value)
     if not re.fullmatch(r"E[A-Z0-9]{3,7}", key):
         raise ValueError("Codigo de equipe invalido")
     return key

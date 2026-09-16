@@ -45,6 +45,68 @@ from main import (
 TZ = ZoneInfo(os.getenv("DDS_TIMEZONE", "America/Sao_Paulo"))
 
 
+class _SafeStream:
+    """Redireciona saídas diretas de stdout/stderr para arquivo de log durante a interface TUI."""
+
+    def __init__(self, log_path: Path):
+        self.log_path = log_path
+        self._file = None
+
+    def write(self, text: str) -> None:
+        if not text:
+            return
+        try:
+            if self._file is None:
+                self._file = open(self.log_path, "a", encoding="utf-8")
+            self._file.write(text)
+            self._file.flush()
+        except Exception:
+            pass
+
+    def flush(self) -> None:
+        if self._file:
+            try:
+                self._file.flush()
+            except Exception:
+                pass
+
+    def isatty(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        if self._file:
+            try:
+                self._file.close()
+            except Exception:
+                pass
+            self._file = None
+
+
+def _setup_tui_logging(output_dir: Path) -> Path:
+    """Configura logging para arquivo sem cuspir linhas cruas no terminal curses."""
+    log_dir = output_dir / "rotalog" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    tui_log_file = log_dir / "tui.log"
+
+    root_logger = logging.getLogger()
+    for handler in list(root_logger.handlers):
+        if isinstance(handler, logging.StreamHandler):
+            root_logger.removeHandler(handler)
+
+    coletor_logger = logging.getLogger("coletor-rotalog")
+    for handler in list(coletor_logger.handlers):
+        if isinstance(handler, logging.StreamHandler):
+            coletor_logger.removeHandler(handler)
+
+    file_handler = logging.FileHandler(tui_log_file, encoding="utf-8")
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    root_logger.addHandler(file_handler)
+    root_logger.setLevel(logging.INFO)
+    return tui_log_file
+
+
 class TuiState:
     def __init__(
         self,
@@ -111,7 +173,17 @@ def _worker(runner: LocalRotalogRunner, state: TuiState) -> None:
             state.status_message = "COLETANDO DADOS DO ROTALOG..."
             state.next_run = None
 
-        result = runner.run_once()
+        try:
+            result = runner.run_once()
+        except Exception as exc:
+            now_str = datetime.now(TZ).isoformat()
+            result = {
+                "status": "error",
+                "startedAt": now_str,
+                "finishedAt": now_str,
+                "durationSeconds": 0,
+                "error": str(exc),
+            }
 
         with state.lock:
             state.is_running = False
@@ -121,7 +193,10 @@ def _worker(runner: LocalRotalogRunner, state: TuiState) -> None:
             now = datetime.now(TZ)
             interval = state.get_interval(now)
             state.next_run = now + timedelta(seconds=interval)
-            state.status_message = "AGUARDANDO PROXIMO CICLO"
+            if result.get("status") == "error":
+                state.status_message = f"FALHA NO CICLO: {result.get('error') or 'Erro'}"
+            else:
+                state.status_message = "AGUARDANDO PROXIMO CICLO"
 
         end_wait = time.time() + interval
         while time.time() < end_wait and not state.stop.is_set():
@@ -273,6 +348,8 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
         _line(screen, 4, f"STATUS: {data['status_message']}", width, curses.A_REVERSE)
     elif data.get("is_stale"):
         _line(screen, 4, f"STATUS: {data['status_message']}", width, curses.A_STANDOUT | curses.A_BOLD)
+    elif (data.get("last_result") or {}).get("status") == "error":
+        _line(screen, 4, f"STATUS: {data['status_message']}", width, curses.A_STANDOUT | curses.A_BOLD)
     else:
         next_run = data["next_run"]
         if next_run:
@@ -304,9 +381,9 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
         bytes_tag = f"  |  trafego: {_format_bytes(last_up)} env / {_format_bytes(last_down)} lidos" if (last_up or last_down) else ""
         _line(screen, 10, f"Historicos: enviados: {last.get('dailySyncUploaded', 0)}  |  pendentes: {last.get('dailySyncPending', 0)}  |  falhas: {last.get('dailySyncFailed', 0)}{bytes_tag}", width)
         if last.get("error"):
-            _line(screen, 11, f"Erro: {last['error']}", width, curses.A_BOLD)
-        else:
-            _line(screen, 7, "Aguardando registros do servico em execucoes.jsonl...", width)
+            _line(screen, 11, f"Erro: {last['error']}", width, curses.A_BOLD | curses.A_STANDOUT)
+    else:
+        _line(screen, 7, "Aguardando registros do servico em execucoes.jsonl...", width)
 
     cur_y = 12
     max_event_y = height - 6
@@ -396,6 +473,11 @@ def _curses_main(screen, runner: LocalRotalogRunner | None, state: TuiState, out
                 break
             if key in (ord("r"), ord("R")) and not state.viewer_mode:
                 state.run_now.set()
+            if key in (ord("c"), ord("C"), 12):  # 12 is Ctrl+L
+                screen.clear()
+                screen.refresh()
+            if key == getattr(curses, "KEY_RESIZE", -1):
+                screen.clear()
             if key in (ord("h"), ord("H")):
                 def _do_historico():
                     with state.lock:
@@ -429,6 +511,10 @@ def _curses_main(screen, runner: LocalRotalogRunner | None, state: TuiState, out
 
             if key in (ord("m"), ord("M")):
                 def _do_fechamento_mes():
+                    def atualizar_progresso(mensagem):
+                        with state.lock:
+                            state.status_message = mensagem
+
                     with state.lock:
                         if state.historico_running:
                             return
@@ -438,6 +524,7 @@ def _curses_main(screen, runner: LocalRotalogRunner | None, state: TuiState, out
                         emp = runner.empresa if runner else os.getenv("DDS_EMPRESA_PADRAO", "ChicoEletro")
                         fb = runner.enable_firebase if runner else False
                         ret_code = executar_fechamento_mes(
+                            progresso=atualizar_progresso,
                             mes_str="anterior",
                             output_dir=output_dir,
                             empresa=emp,
@@ -479,6 +566,8 @@ def main() -> int:
         parser.error("--peak-interval e --offpeak-interval devem ser no mínimo 30")
 
     output_dir = Path(args.output_dir).resolve()
+    tui_log_file = _setup_tui_logging(output_dir)
+
     if args.no_firebase:
         enable_firebase = False
     else:
@@ -510,7 +599,17 @@ def main() -> int:
         )
         return 1
 
-    curses.wrapper(_curses_main, runner, state, output_dir)
+    orig_stdout = sys.stdout
+    orig_stderr = sys.stderr
+    safe_stream = _SafeStream(tui_log_file)
+    sys.stdout = safe_stream
+    sys.stderr = safe_stream
+    try:
+        curses.wrapper(_curses_main, runner, state, output_dir)
+    finally:
+        sys.stdout = orig_stdout
+        sys.stderr = orig_stderr
+        safe_stream.close()
     return 0
 
 
