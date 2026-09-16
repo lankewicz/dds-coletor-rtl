@@ -760,7 +760,7 @@ def executar_fechamento_mes(
 
 
 def get_adaptive_interval_seconds(
-    now: datetime.datetime | None = None,
+    now: datetime | None = None,
     peak_interval: int = 180,
     offpeak_interval: int = 600,
     peak_start_hour: int = 7,
@@ -770,7 +770,7 @@ def get_adaptive_interval_seconds(
     - 07:00 às 20:00: 3 minutos (180s) [pico operacional de equipes em campo]
     - 20:00 às 07:00: 10 minutos (600s) [fora de pico / plantão noturno]
     """
-    target = now or datetime.datetime.now(TZ)
+    target = now or datetime.now(TZ)
     if peak_start_hour <= target.hour < peak_end_hour:
         return peak_interval
     return offpeak_interval
