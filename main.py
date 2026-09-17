@@ -114,6 +114,7 @@ class LocalRotalogRunner:
         self.empresa = empresa
         self.index_path = output_dir / "rotalog" / "equipes" / "current" / "index.json.gz"
         self.log_path = output_dir / "rotalog" / "logs" / "execucoes.jsonl"
+        self.runtime_status_path = output_dir / "rotalog" / "logs" / "runtime-status.json"
         self.index_sync_path = self.index_path.with_name("firebase-sync.json")
         self.company_key = company_key(empresa)
         self.daily_sync_queue_path = (
@@ -130,9 +131,54 @@ class LocalRotalogRunner:
         if self.enable_firebase:
             self.firebase_store, self.team_repo, self.exec_log = _init_firebase_storage(self.empresa)
 
+        self._set_runtime_status("AGUARDANDO", "Aguardando próximo ciclo")
+
     @property
     def firebase_enabled(self) -> bool:
         return bool(self.firebase_store and self.firebase_store.enabled)
+
+    def _set_runtime_status(self, phase: str, message: str, started_at: datetime | None = None) -> None:
+        """Publica o estado operacional local consumido pelo TUI em modo visualizador."""
+        payload = {
+            "phase": phase,
+            "message": message,
+            "updatedAt": datetime.now(TZ).isoformat(),
+        }
+        if started_at is not None:
+            payload["startedAt"] = started_at.isoformat()
+        try:
+            write_json(self.runtime_status_path, payload)
+        except Exception as exc:
+            LOG.debug("Não foi possível atualizar estado do TUI: %s", exc)
+
+    @staticmethod
+    def _empty_storage_metrics() -> dict[str, int]:
+        return {
+            "bytesUploaded": 0,
+            "bytesDownloaded": 0,
+            "readOperations": 0,
+            "writeOperations": 0,
+        }
+
+    def _take_storage_metrics(self) -> dict[str, int]:
+        """Retorna e zera as métricas do ciclo, inclusive com stores legados."""
+        metrics = self._empty_storage_metrics()
+        reset_metrics = getattr(self.firebase_store, "reset_cycle_metrics", None)
+        if not callable(reset_metrics):
+            return metrics
+        try:
+            reported = reset_metrics()
+        except Exception as exc:
+            LOG.debug("Não foi possível obter métricas do Storage: %s", exc)
+            return metrics
+        if not isinstance(reported, dict):
+            return metrics
+        for key in metrics:
+            try:
+                metrics[key] = int(reported.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                pass
+        return metrics
 
     def _sync_index(self, equipes: dict, timestamp: str) -> str:
         """Confirma em disco somente o conteúdo enviado com sucesso ao destino atual."""
@@ -341,6 +387,7 @@ class LocalRotalogRunner:
             daily_sync = self._flush_daily_sync_queue()
         except Exception as sync_exc:
             LOG.error("Não foi possível processar a fila diária: %s", sync_exc)
+        storage_metrics = self._take_storage_metrics()
         result = {
             "status": "error",
             "startedAt": started_at.isoformat(),
@@ -352,8 +399,7 @@ class LocalRotalogRunner:
             "dailySyncPending": daily_sync["pending"],
             "dailySyncUploaded": daily_sync["uploaded"],
             "dailySyncFailed": daily_sync["failed"],
-            "bytesUploaded": 0,
-            "bytesDownloaded": 0,
+            **storage_metrics,
         }
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with self.log_path.open("a", encoding="utf-8") as stream:
@@ -362,18 +408,20 @@ class LocalRotalogRunner:
 
     def run_once(self) -> dict:
         """Executa um ciclo mantendo o LED vermelho até a última gravação local."""
+        started_at = datetime.now(TZ)
+        self._set_runtime_status("COLETANDO", "Coletando dados do ROTALOG", started_at)
         self.processing_led.processing()
         try:
             return self._run_once()
         finally:
+            self._set_runtime_status("AGUARDANDO", "Aguardando próximo ciclo")
             self.processing_led.idle()
 
     def _run_once(self) -> dict:
         started_clock = time.perf_counter()
         started_at = datetime.now(TZ)
         daily_sync = {"uploaded": 0, "failed": 0, "pending": 0}
-        if self.firebase_store and hasattr(self.firebase_store, "reset_cycle_bytes"):
-            self.firebase_store.reset_cycle_bytes()
+        self._take_storage_metrics()
 
         # Automação: No 1º dia de cada mês, executa a varredura do mês anterior para fechar quilometragens
         today_iso = started_at.date().isoformat()
@@ -454,6 +502,7 @@ class LocalRotalogRunner:
         try:
             teams = extrair_dados_tempo_real(snapshots_anteriores=previous)
             scraped_at = datetime.now(TZ)
+            self._set_runtime_status("PROCESSANDO", "Processando equipes e gravando arquivos", started_at)
             timestamp = scraped_at.isoformat()
             day = scraped_at.date().isoformat()
             updates = {}
@@ -556,11 +605,7 @@ class LocalRotalogRunner:
                 except Exception as exc:
                     LOG.warning("Erro ao gravar log diário de execução no Storage: %s", exc)
 
-            bytes_uploaded, bytes_downloaded = 0, 0
-            if self.firebase_store and hasattr(self.firebase_store, "reset_cycle_bytes"):
-                res = self.firebase_store.reset_cycle_bytes()
-                if isinstance(res, (tuple, list)) and len(res) == 2:
-                    bytes_uploaded, bytes_downloaded = int(res[0]), int(res[1])
+            storage_metrics = self._take_storage_metrics()
 
             result = {
                 "status": "success",
@@ -576,8 +621,7 @@ class LocalRotalogRunner:
                 "dailySyncPending": daily_sync["pending"],
                 "dailySyncUploaded": daily_sync["uploaded"],
                 "dailySyncFailed": daily_sync["failed"],
-                "bytesUploaded": bytes_uploaded,
-                "bytesDownloaded": bytes_downloaded,
+                **storage_metrics,
                 "events": {
                     "local": local_events,
                     "cloud": cloud_events,
@@ -588,6 +632,7 @@ class LocalRotalogRunner:
                 daily_sync = self._flush_daily_sync_queue()
             except Exception as sync_exc:
                 LOG.error("Não foi possível processar a fila diária: %s", sync_exc)
+            storage_metrics = self._take_storage_metrics()
             result = {
                 "status": "error",
                 "startedAt": started_at.isoformat(),
@@ -599,8 +644,7 @@ class LocalRotalogRunner:
                 "dailySyncPending": daily_sync["pending"],
                 "dailySyncUploaded": daily_sync["uploaded"],
                 "dailySyncFailed": daily_sync["failed"],
-                "bytesUploaded": 0,
-                "bytesDownloaded": 0,
+                **storage_metrics,
                 "events": {
                     "local": [],
                     "cloud": [],

@@ -43,6 +43,7 @@ from main import (
 )
 
 TZ = ZoneInfo(os.getenv("DDS_TIMEZONE", "America/Sao_Paulo"))
+DAILY_HISTORY_MAX = 5_000
 
 
 class _SafeStream:
@@ -129,6 +130,7 @@ class TuiState:
         self.history: list[dict] = []
         self.next_run: datetime | None = None
         self.status_message = "Inicializando..."
+        self.runtime_status: dict = {}
 
     def get_interval(self, now: datetime | None = None) -> int:
         if self.interval_seconds is not None:
@@ -166,6 +168,23 @@ def _format_bytes(num_bytes: int | float | None) -> str:
     return f"{num:.1f} GB"
 
 
+def _entry_day(entry: dict) -> str | None:
+    for field in ("finishedAt", "startedAt"):
+        value = entry.get(field)
+        if isinstance(value, str) and len(value) >= 10:
+            try:
+                return datetime.fromisoformat(value[:10]).date().isoformat()
+            except ValueError:
+                pass
+    return None
+
+
+def _today_entries(entries: list[dict], today: str | None = None) -> list[dict]:
+    """Mantém no painel apenas os ciclos do dia corrente."""
+    day = today or datetime.now(TZ).date().isoformat()
+    return [entry for entry in entries if _entry_day(entry) == day][-DAILY_HISTORY_MAX:]
+
+
 def _worker(runner: LocalRotalogRunner, state: TuiState) -> None:
     while not state.stop.is_set():
         with state.lock:
@@ -188,9 +207,8 @@ def _worker(runner: LocalRotalogRunner, state: TuiState) -> None:
         with state.lock:
             state.is_running = False
             state.last_result = result
-            state.history.append(result)
-            state.history = state.history[-50:]
             now = datetime.now(TZ)
+            state.history = _today_entries([*state.history, result], now.date().isoformat())
             interval = state.get_interval(now)
             state.next_run = now + timedelta(seconds=interval)
             if result.get("status") == "error":
@@ -237,32 +255,42 @@ def _update_viewer_state_timing(state: TuiState) -> None:
         pass
 
 
+def _load_runtime_status(output_dir: Path) -> dict:
+    path = output_dir / "rotalog" / "logs" / "runtime-status.json"
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
 def _viewer_worker(state: TuiState, output_dir: Path) -> None:
     log_file = output_dir / "rotalog" / "logs" / "execucoes.jsonl"
-    reader = JsonlTailReader(log_file, max_history=50)
+    reader = JsonlTailReader(log_file, max_history=DAILY_HISTORY_MAX)
 
     # Carga inicial rápida da cauda em bloco reverso O(1)
     initial_entries = reader.read_initial()
     if initial_entries:
         with state.lock:
-            state.history = initial_entries[-50:]
-            state.last_result = initial_entries[-1]
+            state.history = _today_entries(initial_entries)
+            state.last_result = state.history[-1] if state.history else initial_entries[-1]
             _update_viewer_state_timing(state)
 
     while not state.stop.is_set():
         try:
+            runtime_status = _load_runtime_status(output_dir)
             new_entries, rotated = reader.read_incremental()
             if rotated:
                 # Arquivo rotacionado (novo dia ou truncado): recarrega a nova cauda
                 with state.lock:
-                    state.history = new_entries[-50:]
+                    state.history = _today_entries(new_entries)
                     if state.history:
                         state.last_result = state.history[-1]
                     _update_viewer_state_timing(state)
             elif new_entries:
                 with state.lock:
-                    state.history.extend(new_entries)
-                    state.history = state.history[-50:]
+                    state.history = _today_entries([*state.history, *new_entries])
                     state.last_result = state.history[-1]
                     _update_viewer_state_timing(state)
             else:
@@ -270,6 +298,8 @@ def _viewer_worker(state: TuiState, output_dir: Path) -> None:
                 with state.lock:
                     if state.last_result:
                         _update_viewer_state_timing(state)
+            with state.lock:
+                state.runtime_status = runtime_status
         except Exception:
             pass
 
@@ -319,8 +349,11 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
             "history": list(state.history),
             "next_run": state.next_run,
             "status_message": state.status_message,
+            "runtime_status": dict(state.runtime_status),
             "viewer_mode": state.viewer_mode,
         }
+    if runner is not None:
+        data["runtime_status"] = _load_runtime_status(runner.output_dir)
 
     now = datetime.now(TZ)
     history = data["history"]
@@ -330,6 +363,8 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     average = sum(durations) / len(durations) if durations else None
     total_bytes_up = sum(int(item.get("bytesUploaded") or 0) for item in successful)
     total_bytes_down = sum(int(item.get("bytesDownloaded") or 0) for item in successful)
+    total_reads = sum(int(item.get("readOperations") or 0) for item in successful)
+    total_writes = sum(int(item.get("writeOperations") or 0) for item in successful)
 
     screen.erase()
     is_viewer = data["viewer_mode"]
@@ -344,7 +379,12 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     _line(screen, 1, f"Empresa: {empresa_str}  |  Intervalo: {tag_intervalo}  |  Hora: {now:%H:%M:%S}", width)
     _line(screen, 2, "-" * (width - 1), width)
 
-    if data["is_running"]:
+    runtime = data.get("runtime_status") or {}
+    runtime_phase = str(runtime.get("phase") or "").upper()
+    runtime_message = str(runtime.get("message") or "").strip()
+    if runtime_phase in {"COLETANDO", "PROCESSANDO"}:
+        _line(screen, 4, f"STATUS: {runtime_phase}...  |  {runtime_message}", width, curses.A_REVERSE)
+    elif data["is_running"]:
         _line(screen, 4, f"STATUS: {data['status_message']}", width, curses.A_REVERSE)
     elif data.get("is_stale"):
         _line(screen, 4, f"STATUS: {data['status_message']}", width, curses.A_STANDOUT | curses.A_BOLD)
@@ -378,8 +418,13 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
         _line(screen, 9, f"Equipes: {last.get('totalTeams', '-')}  |  atualizadas: {last.get('updatedTeams', '-')}  |  ignoradas: {last.get('ignoredTeams', '-')}{upload_flag}", width)
         last_up = int(last.get("bytesUploaded") or 0)
         last_down = int(last.get("bytesDownloaded") or 0)
-        bytes_tag = f"  |  trafego: {_format_bytes(last_up)} env / {_format_bytes(last_down)} lidos" if (last_up or last_down) else ""
-        _line(screen, 10, f"Historicos: enviados: {last.get('dailySyncUploaded', 0)}  |  pendentes: {last.get('dailySyncPending', 0)}  |  falhas: {last.get('dailySyncFailed', 0)}{bytes_tag}", width)
+        last_reads = int(last.get("readOperations") or 0)
+        last_writes = int(last.get("writeOperations") or 0)
+        storage_tag = (
+            f"  |  Storage: {last_reads} leituras / {last_writes} gravacoes"
+            f"  |  trafego: {_format_bytes(last_up)} env / {_format_bytes(last_down)} lidos"
+        )
+        _line(screen, 10, f"Historicos: enviados: {last.get('dailySyncUploaded', 0)}  |  pendentes: {last.get('dailySyncPending', 0)}  |  falhas: {last.get('dailySyncFailed', 0)}{storage_tag}", width)
         if last.get("error"):
             _line(screen, 11, f"Erro: {last['error']}", width, curses.A_BOLD | curses.A_STANDOUT)
     else:
@@ -440,11 +485,14 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
                         _line(screen, cur_y, f"... e mais {remaining_cloud} eventos na nuvem", width)
                         cur_y += 1
 
-    # HISTORICO RECENTE ancorado na parte inferior
+    # HISTÓRICO DIÁRIO: execuções presentes no JSONL do dia atual.
     hist_y = max(cur_y + 1, height - 5)
-    _line(screen, hist_y, "HISTORICO RECENTE", width, curses.A_UNDERLINE)
-    nuvem_bytes_str = f"nuvem: {_format_bytes(total_bytes_up)} env / {_format_bytes(total_bytes_down)} lidos"
-    _line(screen, hist_y + 1, f"Ciclos: {len(history)}  |  sucesso: {len(successful)}  |  erros: {errors}  |  media: {_format_duration(average)}  |  {nuvem_bytes_str}", width)
+    _line(screen, hist_y, "HISTORICO DIARIO", width, curses.A_UNDERLINE)
+    storage_daily = (
+        f"Storage: {total_reads} leituras / {total_writes} gravacoes"
+        f"  |  {_format_bytes(total_bytes_up)} env / {_format_bytes(total_bytes_down)} lidos"
+    )
+    _line(screen, hist_y + 1, f"Ciclos hoje: {len(history)}  |  sucesso: {len(successful)}  |  erros: {errors}  |  media: {_format_duration(average)}  |  {storage_daily}", width)
     _line(screen, hist_y + 2, "Arquivos: equipes/current/index.json.gz  |  logs/execucoes.jsonl (rotacao diaria .jsonl.gz)", width)
 
     if is_viewer:

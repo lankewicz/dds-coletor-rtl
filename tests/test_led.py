@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -16,7 +17,7 @@ class ProcessingLedTest(unittest.TestCase):
         (path / "trigger").write_text("default-on", encoding="utf-8")
         return path
 
-    def test_processing_and_idle_switch_colors(self) -> None:
+    def test_processing_blinks_red_and_keeps_green_on(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             red = self._led(root, "red")
@@ -25,7 +26,9 @@ class ProcessingLedTest(unittest.TestCase):
                 led = ProcessingLed(str(red), str(green))
                 led.processing()
                 self.assertEqual((red / "brightness").read_text(), "1")
-                self.assertEqual((green / "brightness").read_text(), "0")
+                self.assertEqual((green / "brightness").read_text(), "1")
+                time.sleep(0.55)
+                self.assertEqual((red / "brightness").read_text(), "0")
                 led.idle()
                 self.assertEqual((red / "brightness").read_text(), "0")
                 self.assertEqual((green / "brightness").read_text(), "1")
@@ -35,4 +38,3 @@ class ProcessingLedTest(unittest.TestCase):
             root = Path(tmp)
             self._led(root, "green")
             self.assertEqual(list_system_leds(root)[0]["name"], "green")
-

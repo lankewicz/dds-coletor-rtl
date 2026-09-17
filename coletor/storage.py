@@ -1000,6 +1000,8 @@ class RotalogGcsSnapshotStore:
         self.bytes_downloaded = 0
         self.cycle_bytes_uploaded = 0
         self.cycle_bytes_downloaded = 0
+        self.cycle_read_operations = 0
+        self.cycle_write_operations = 0
 
     @property
     def enabled(self) -> bool:
@@ -1013,6 +1015,29 @@ class RotalogGcsSnapshotStore:
             self.cycle_bytes_uploaded = 0
             self.cycle_bytes_downloaded = 0
             return up, down
+
+    def reset_cycle_metrics(self) -> dict[str, int]:
+        """Retorna e zera métricas reais de acesso ao Storage no ciclo atual."""
+        with self._lock:
+            metrics = {
+                "bytesUploaded": self.cycle_bytes_uploaded,
+                "bytesDownloaded": self.cycle_bytes_downloaded,
+                "readOperations": self.cycle_read_operations,
+                "writeOperations": self.cycle_write_operations,
+            }
+            self.cycle_bytes_uploaded = 0
+            self.cycle_bytes_downloaded = 0
+            self.cycle_read_operations = 0
+            self.cycle_write_operations = 0
+            return metrics
+
+    def _count_read(self) -> None:
+        with self._lock:
+            self.cycle_read_operations += 1
+
+    def _count_write(self) -> None:
+        with self._lock:
+            self.cycle_write_operations += 1
 
     def _blob_named(self, blob_name: str):
         if not self.enabled:
@@ -1032,6 +1057,7 @@ class RotalogGcsSnapshotStore:
         with self._lock:
             try:
                 blob = self._blob()
+                self._count_read()
                 try:
                     compressed = blob.download_as_bytes(raw_download=True)
                 except TypeError:
@@ -1053,6 +1079,7 @@ class RotalogGcsSnapshotStore:
         with self._lock:
             try:
                 blob = self._blob_named(blob_name)
+                self._count_read()
                 try:
                     compressed = blob.download_as_bytes(raw_download=True)
                 except TypeError:
@@ -1078,6 +1105,7 @@ class RotalogGcsSnapshotStore:
             blob = self._blob_named(blob_name)
             blob.content_encoding = "gzip"
             compressed = gzip.compress(raw, compresslevel=6)
+            self._count_write()
             blob.upload_from_string(
                 compressed,
                 content_type="application/json",
@@ -1090,9 +1118,11 @@ class RotalogGcsSnapshotStore:
         for tentativa in range(5):
             blob = self._blob_named(blob_name)
             try:
+                self._count_read()
                 blob.reload()
                 generation = int(blob.generation)
                 try:
+                    self._count_read()
                     raw_bytes = blob.download_as_bytes(raw_download=True, if_generation_match=generation)
                 except TypeError:
                     raw_bytes = blob.download_as_bytes(if_generation_match=generation)
@@ -1113,6 +1143,7 @@ class RotalogGcsSnapshotStore:
             try:
                 blob.content_encoding = "gzip"
                 compressed = gzip.compress(raw)
+                self._count_write()
                 blob.upload_from_string(
                     compressed,
                     content_type="application/json",

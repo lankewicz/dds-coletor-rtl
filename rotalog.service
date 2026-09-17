@@ -8,6 +8,11 @@ Type=simple
 User=orangepi
 Group=orangepi
 
+# O processo continua como "orangepi", com a capacidade necessária para
+# gravar os atributos de LED expostos pelo kernel em /sys/class/leds.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_DAC_OVERRIDE
+
 # Diretorio de instalacao no Orange Pi
 WorkingDirectory=/home/orangepi/dds-coletor-rtl
 

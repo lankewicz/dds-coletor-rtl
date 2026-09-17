@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from pathlib import Path
 
 
@@ -43,13 +44,16 @@ def list_system_leds(root: Path = Path("/sys/class/leds")) -> list[dict[str, str
 
 
 class ProcessingLed:
-    """Alterna LEDs vermelho/verde durante um ciclo de coleta."""
+    """Mantém o verde aceso e pisca o vermelho durante um ciclo de coleta."""
 
     def __init__(self, red_path: str | None = None, green_path: str | None = None):
         self.red_path = self._brightness_path(red_path or os.getenv("ROTALOG_LED_RED_PATH"))
         self.green_path = self._brightness_path(green_path or os.getenv("ROTALOG_LED_GREEN_PATH"))
         self.enabled = self._as_bool(os.getenv("ROTALOG_LED_ENABLED", "false"))
         self._warned = False
+        self._blink_stop = threading.Event()
+        self._blink_thread: threading.Thread | None = None
+        self._blink_lock = threading.Lock()
 
         if self.enabled and (self.red_path is None or self.green_path is None):
             LOG.warning(
@@ -86,16 +90,41 @@ class ProcessingLed:
                 LOG.warning("Não foi possível atualizar LED em %s: %s", path, exc)
                 self._warned = True
 
+    def _blink_red(self) -> None:
+        red_on = True
+        while not self._blink_stop.is_set():
+            if self._blink_stop.wait(0.5):
+                break
+            red_on = not red_on
+            self._write(self.red_path, "1" if red_on else "0")
+        self._write(self.red_path, "0")
+
     def processing(self) -> None:
-        """Exibe vermelho enquanto a coleta, persistência e sincronização ocorrem."""
+        """Mantém verde e pisca vermelho durante coleta, persistência e sincronização."""
         if not self.enabled:
             return
-        self._write(self.green_path, "0")
-        self._write(self.red_path, "1")
+        self._write(self.green_path, "1")
+        with self._blink_lock:
+            if self._blink_thread and self._blink_thread.is_alive():
+                return
+            self._blink_stop.clear()
+            self._write(self.red_path, "1")
+            self._blink_thread = threading.Thread(
+                target=self._blink_red,
+                name="rotalog-led-blink",
+                daemon=True,
+            )
+            self._blink_thread.start()
 
     def idle(self) -> None:
-        """Retorna ao verde depois que o ciclo já gravou seu último arquivo."""
+        """Apaga o vermelho e preserva verde após a última gravação local."""
         if not self.enabled:
             return
+        with self._blink_lock:
+            self._blink_stop.set()
+            blink_thread = self._blink_thread
+            self._blink_thread = None
+        if blink_thread:
+            blink_thread.join(timeout=1.0)
         self._write(self.red_path, "0")
         self._write(self.green_path, "1")
