@@ -35,6 +35,8 @@ ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
 from coletor.logs import JsonlTailReader
+from coletor.storage import load_json
+from coletor.fleet_control import default_node_id, parse_iso
 from main import (
     LocalRotalogRunner,
     executar_fechamento_mes,
@@ -131,6 +133,8 @@ class TuiState:
         self.next_run: datetime | None = None
         self.status_message = "Inicializando..."
         self.runtime_status: dict = {}
+        self.device_health: dict = {}
+        self.device_health_updated_at: datetime | None = None
 
     def get_interval(self, now: datetime | None = None) -> int:
         if self.interval_seconds is not None:
@@ -166,6 +170,45 @@ def _format_bytes(num_bytes: int | float | None) -> str:
             return f"{num:.1f} {unit}"
         num /= 1024.0
     return f"{num:.1f} GB"
+
+
+def _format_health(health: dict) -> tuple[str, str, str]:
+    """Retorna as três linhas compactas exibidas no painel de saúde."""
+    overall_labels = {
+        "healthy": "SAUDAVEL",
+        "warning": "ATENCAO",
+        "critical": "CRITICO",
+    }
+    overall = overall_labels.get(str(health.get("overall") or ""), "DESCONHECIDA")
+    temperature = health.get("temperatureC")
+    disk = health.get("disk") or {}
+    memory = health.get("memory") or {}
+    load = health.get("loadAverage") or []
+    collector = health.get("collector") or {}
+
+    temp_text = f"{float(temperature):.1f} C" if temperature is not None else "indisponivel"
+    disk_used = disk.get("usedPercent")
+    disk_text = f"{float(disk_used):.1f}% usado" if disk_used is not None else "indisponivel"
+    memory_available = memory.get("availablePercent")
+    memory_text = (
+        f"{float(memory_available):.1f}% livre"
+        if memory_available is not None
+        else "indisponivel"
+    )
+    uptime_text = _format_duration(health.get("uptimeSeconds"))
+    load_text = "/".join(str(value) for value in load[:3]) if load else "indisponivel"
+    service = collector.get("serviceActive")
+    service_text = "ATIVO" if service is True else "INATIVO" if service is False else "DESCONHECIDO"
+    last_upload = str(collector.get("lastIndexUploadAt") or "-").replace("T", " ")[:19]
+    issues = health.get("issues") or []
+    issue_text = ", ".join(str(item.get("code") or item) for item in issues) or "nenhum"
+    heartbeat_at = str(health.get("_heartbeatAt") or "-").replace("T", " ")[:19]
+
+    return (
+        f"Estado: {overall}  |  CPU: {temp_text}  |  Disco: {disk_text}  |  Memoria: {memory_text}",
+        f"Coletor: {service_text}  |  Uptime: {uptime_text}  |  Carga: {load_text}  |  Ultimo envio: {last_upload}",
+        f"Heartbeat local: {heartbeat_at}  |  Alertas: {issue_text}",
+    )
 
 
 def _entry_day(entry: dict) -> str | None:
@@ -306,6 +349,36 @@ def _viewer_worker(state: TuiState, output_dir: Path) -> None:
         time.sleep(1.0)
 
 
+def _health_worker(state: TuiState, output_dir: Path) -> None:
+    """Lê a cópia local do heartbeat, sem consultar Firebase ou sensores novamente."""
+    interval = max(5, int(os.getenv("TUI_HEALTH_INTERVAL_SECONDS", "120")))
+    heartbeat_path = output_dir / "rotalog" / "fleet" / f"{default_node_id()}-heartbeat.json"
+    while not state.stop.is_set():
+        try:
+            heartbeat = load_json(heartbeat_path, {})
+            health = dict(heartbeat.get("health") or {})
+            heartbeat_at = heartbeat.get("heartbeatAt")
+            if health:
+                health["_heartbeatAt"] = heartbeat_at
+            else:
+                health = {
+                    "overall": "warning",
+                    "_heartbeatAt": heartbeat_at,
+                    "issues": [{"code": "HEARTBEAT_LOCAL_INDISPONIVEL", "severity": "warning"}],
+                }
+            with state.lock:
+                state.device_health = health
+                state.device_health_updated_at = parse_iso(heartbeat_at) or datetime.now(TZ)
+        except Exception as exc:
+            with state.lock:
+                state.device_health = {
+                    "overall": "warning",
+                    "issues": [{"code": f"HEALTH_READ_ERROR: {exc}", "severity": "warning"}],
+                }
+                state.device_health_updated_at = datetime.now(TZ)
+        state.stop.wait(interval)
+
+
 def _line(screen, y: int, text: str, width: int, attr: int = 0) -> None:
     if y < 0:
         return
@@ -350,6 +423,8 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
             "next_run": state.next_run,
             "status_message": state.status_message,
             "runtime_status": dict(state.runtime_status),
+            "device_health": dict(state.device_health),
+            "device_health_updated_at": state.device_health_updated_at,
             "viewer_mode": state.viewer_mode,
         }
     if runner is not None:
@@ -360,6 +435,7 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     successful = [item for item in history if item.get("status") == "success"]
     errors = sum(1 for item in history if item.get("status") != "success")
     durations = [float(item["durationSeconds"]) for item in successful if "durationSeconds" in item]
+    last_success = successful[-1] if successful else None
     average = sum(durations) / len(durations) if durations else None
     total_bytes_up = sum(int(item.get("bytesUploaded") or 0) for item in successful)
     total_bytes_down = sum(int(item.get("bytesDownloaded") or 0) for item in successful)
@@ -389,7 +465,13 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     elif data.get("is_stale"):
         _line(screen, 4, f"STATUS: {data['status_message']}", width, curses.A_STANDOUT | curses.A_BOLD)
     elif (data.get("last_result") or {}).get("status") == "error":
-        _line(screen, 4, f"STATUS: {data['status_message']}", width, curses.A_STANDOUT | curses.A_BOLD)
+        next_run = data["next_run"]
+        if next_run:
+            remaining = max(0, (next_run - now).total_seconds())
+            retry_text = f"proxima tentativa: {next_run:%H:%M:%S} (em {_format_duration(remaining)})"
+        else:
+            retry_text = "proxima tentativa: aguardando agendamento"
+        _line(screen, 4, f"STATUS: FALHA NA ULTIMA COLETA  |  {retry_text}", width, curses.A_STANDOUT | curses.A_BOLD)
     else:
         next_run = data["next_run"]
         if next_run:
@@ -400,6 +482,12 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
                 _line(screen, 4, "STATUS: AGUARDANDO CICLO DO SERVICO...", width, curses.A_BOLD)
         else:
             _line(screen, 4, "STATUS: AGUARDANDO REGISTROS...", width, curses.A_BOLD)
+
+    if last_success:
+        success_time = str(last_success.get("finishedAt") or last_success.get("startedAt") or "-")
+        _line(screen, 5, f"ULTIMA COLETA COM SUCESSO: {success_time[11:19]}", width, curses.A_BOLD)
+    else:
+        _line(screen, 5, "ULTIMA COLETA COM SUCESSO: sem registro hoje", width)
 
     last = data["last_result"]
     _line(screen, 6, "ULTIMA EXECUCAO", width, curses.A_UNDERLINE)
@@ -430,7 +518,17 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     else:
         _line(screen, 7, "Aguardando registros do servico em execucoes.jsonl...", width)
 
-    cur_y = 12
+    health = data.get("device_health") or {}
+    _line(screen, 12, "SAUDE DO DISPOSITIVO", width, curses.A_UNDERLINE)
+    if health:
+        health_lines = _format_health(health)
+        health_attr = curses.A_BOLD if health.get("overall") in {"warning", "critical"} else 0
+        for offset, health_line in enumerate(health_lines, start=13):
+            _line(screen, offset, health_line, width, health_attr)
+    else:
+        _line(screen, 13, "Coletando informacoes de saude...", width)
+
+    cur_y = 17
     max_event_y = height - 6
 
     if last:
@@ -513,6 +611,8 @@ def _curses_main(screen, runner: LocalRotalogRunner | None, state: TuiState, out
         worker = threading.Thread(target=_worker, args=(runner, state), daemon=True)
 
     worker.start()
+    health_worker = threading.Thread(target=_health_worker, args=(state, output_dir), daemon=True)
+    health_worker.start()
     try:
         while True:
             _render(screen, runner, state)

@@ -1,0 +1,5 @@
+# Permite somente o controle do serviço do coletor; não libera shell como root.
+orangepi ALL=(root) NOPASSWD: /usr/bin/systemctl start rotalog.service
+orangepi ALL=(root) NOPASSWD: /usr/bin/systemctl stop rotalog.service
+orangepi ALL=(root) NOPASSWD: /usr/bin/systemctl restart rotalog.service
+orangepi ALL=(root) NOPASSWD: /usr/bin/systemctl is-active rotalog.service

@@ -1,0 +1,15 @@
+[Unit]
+Description=DDS Fleet Update Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=orangepi
+Group=orangepi
+WorkingDirectory=/home/orangepi/dds-coletor-rtl
+EnvironmentFile=/home/orangepi/dds-coletor-rtl/.env
+ExecStart=/home/orangepi/dds-coletor-rtl/.venv-3.14/bin/python fleet_agent.py
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""Compatibilidade com o comando solicitado: python fleet --update."""
+
+from fleet import main
+
+raise SystemExit(main())

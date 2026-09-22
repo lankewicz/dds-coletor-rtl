@@ -207,9 +207,14 @@ class LocalRotalogRunner:
             "blob": self.firebase_store.blob_name,
             "sha256": digest,
         }
-        if load_json(self.index_sync_path, {}) == confirmation:
+        previous_confirmation = load_json(self.index_sync_path, {})
+        if all(previous_confirmation.get(key) == value for key, value in confirmation.items()):
             return "unchanged"
+        from coletor.fleet_control import default_node_id, utc_now_iso
+        published_at = utc_now_iso()
         self.firebase_store.save({
+            "publisherNodeId": default_node_id(),
+            "publishedAt": published_at,
             "schemaVersion": 2,
             "company": self.empresa,
             "updatedAtIso": timestamp,
@@ -217,7 +222,11 @@ class LocalRotalogRunner:
             "equipes": equipes,
             "snapshots": equipes,
         })
-        write_json(self.index_sync_path, confirmation)
+        write_json(self.index_sync_path, {
+            **confirmation,
+            "nodeId": default_node_id(),
+            "uploadedAt": utc_now_iso(),
+        })
         return "uploaded"
 
     @staticmethod
@@ -531,6 +540,27 @@ class LocalRotalogRunner:
 
                     # 1. Grava SEMPRE no disco local (fidelidade máxima da linha do tempo)
                     write_json(daily_path, merged_daily)
+
+                    # Se o turno fechou hoje mas iniciou na véspera, ou há dados da véspera, atualiza o diário anterior
+                    turno_info = merged_daily.get("jornada", {}).get("turno") or {}
+                    turnos_list = merged_daily.get("jornada", {}).get("turnos") or [turno_info]
+                    plantao_ant = next((t for t in turnos_list if t.get("tipo") == "PLANTAO_ANTERIOR" or (t.get("inicio") and str(t.get("inicio"))[:10] != day)), None)
+                    target_turno_ant = plantao_ant if plantao_ant else turno_info
+                    if target_turno_ant.get("status") == "FECHADO":
+                        ini_t = target_turno_ant.get("inicio")
+                        fim_t = target_turno_ant.get("fim")
+                        if ini_t and str(ini_t)[:10] != day and fim_t:
+                            prev_day = str(ini_t)[:10]
+                            prev_day_path = self.output_dir / "rotalog" / "equipes" / "daily" / prev_day / f"{team_key}.json.gz"
+                            if prev_day_path.exists():
+                                try:
+                                    prev_doc = self._load_daily_with_recovery(prev_day_path, prev_day, team_key)
+                                    if prev_doc:
+                                        merged_prev = merge_daily_document(prev_doc, document, prev_day)
+                                        write_json(prev_day_path, merged_prev)
+                                        self._enqueue_daily_sync(prev_day, team_key, ["fechamento_turno"])
+                                except Exception as exc:
+                                    LOG.debug("Não foi possível atualizar diário da véspera para %s: %s", team_key, exc)
 
                     # 2. Persiste o evento antes do upload. Intervalos permanecem na torre.
                     sync_reasons = self._daily_sync_reasons(previous_daily, merged_daily)

@@ -1,0 +1,12 @@
+[Unit]
+Description=Consulta comandos de atualização do DDS
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=true
+Unit=fleet-agent.service
+
+[Install]
+WantedBy=timers.target
