@@ -47,6 +47,53 @@ from main import (
 TZ = ZoneInfo(os.getenv("DDS_TIMEZONE", "America/Sao_Paulo"))
 DAILY_HISTORY_MAX = 5_000
 
+# ---------------------------------------------------------------------------
+# Paleta de cores
+# ---------------------------------------------------------------------------
+# Índices dos pares de cor (inicializados em _init_colors, dentro do curses.wrapper)
+C_DEFAULT = 1     # texto padrão
+C_TITLE = 2       # cabeçalhos / títulos de seção (ciano em negrito)
+C_OK = 3          # sucesso / saudável (verde)
+C_WARN = 4        # atenção / pendente (amarelo)
+C_ERROR = 5       # erro / crítico (vermelho)
+C_STATUS_OK = 6   # barra de status normal (fundo verde)
+C_STATUS_WARN = 7 # barra de status alerta (fundo amarelo)
+C_STATUS_ERR = 8  # barra de status erro (fundo vermelho)
+C_STATUS_RUN = 9  # barra de status "coletando" (fundo azul)
+C_DIM = 10        # texto secundário / apagado
+C_ACCENT = 11     # destaque (magenta) para nomes de empresa etc.
+
+
+def _init_colors() -> None:
+    """Inicializa os pares de cor. Precisa rodar depois de curses.wrapper iniciar."""
+    if not curses.has_colors():
+        return
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+        bg = -1
+    except curses.error:
+        bg = curses.COLOR_BLACK
+
+    curses.init_pair(C_DEFAULT, curses.COLOR_WHITE, bg)
+    curses.init_pair(C_TITLE, curses.COLOR_CYAN, bg)
+    curses.init_pair(C_OK, curses.COLOR_GREEN, bg)
+    curses.init_pair(C_WARN, curses.COLOR_YELLOW, bg)
+    curses.init_pair(C_ERROR, curses.COLOR_RED, bg)
+    curses.init_pair(C_STATUS_OK, curses.COLOR_BLACK, curses.COLOR_GREEN)
+    curses.init_pair(C_STATUS_WARN, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+    curses.init_pair(C_STATUS_ERR, curses.COLOR_WHITE, curses.COLOR_RED)
+    curses.init_pair(C_STATUS_RUN, curses.COLOR_WHITE, curses.COLOR_BLUE)
+    curses.init_pair(C_DIM, curses.COLOR_WHITE, bg)
+    curses.init_pair(C_ACCENT, curses.COLOR_MAGENTA, bg)
+
+
+def _cp(index: int) -> int:
+    """Retorna o atributo de cor correspondente, com fallback seguro se cores indisponíveis."""
+    if curses is None or not curses.has_colors():
+        return 0
+    return curses.color_pair(index)
+
 
 class _SafeStream:
     """Redireciona saídas diretas de stdout/stderr para arquivo de log durante a interface TUI."""
@@ -209,6 +256,17 @@ def _format_health(health: dict) -> tuple[str, str, str]:
         f"Coletor: {service_text}  |  Uptime: {uptime_text}  |  Carga: {load_text}  |  Ultimo envio: {last_upload}",
         f"Heartbeat local: {heartbeat_at}  |  Alertas: {issue_text}",
     )
+
+
+def _health_color(health: dict) -> int:
+    overall = str(health.get("overall") or "")
+    if overall == "critical":
+        return C_ERROR
+    if overall == "warning":
+        return C_WARN
+    if overall == "healthy":
+        return C_OK
+    return C_DIM
 
 
 def _entry_day(entry: dict) -> str | None:
@@ -379,70 +437,6 @@ def _health_worker(state: TuiState, output_dir: Path) -> None:
         state.stop.wait(interval)
 
 
-# ---------------------------------------------------------------------------
-# Paleta de cores com alto contraste semântico
-# ---------------------------------------------------------------------------
-C_DEFAULT = 1      # Texto padrão (Branco/Cinza claro sobre fundo escuro)
-C_TITLE = 2        # Cabeçalhos e títulos de seção (Ciano em negrito)
-C_OK = 3           # Sucesso / Saudável (Verde)
-C_WARN = 4         # Atenção / Pendente (Amarelo)
-C_ERROR = 5        # Erro / Crítico (Vermelho)
-C_STATUS_OK = 6    # Barra status: normal/aguardando (Preto sobre Fundo Verde)
-C_STATUS_WARN = 7  # Barra status: alerta/stale (Preto sobre Fundo Amarelo)
-C_STATUS_ERR = 8   # Barra status: erro/falha (Branco sobre Fundo Vermelho)
-C_STATUS_RUN = 9   # Barra status: coletando/processando (Branco sobre Fundo Azul)
-C_DIM = 10         # Texto secundário / apagado
-C_ACCENT = 11      # Destaque / Empresa (Magenta)
-C_HEADER_BAR = 12  # Barra de teclas / rodapé (Preto sobre Fundo Ciano)
-
-
-def _init_colors() -> None:
-    """Inicializa os pares de cor com foco em alto contraste."""
-    if not curses or not curses.has_colors():
-        return
-    curses.start_color()
-    try:
-        curses.use_default_colors()
-        bg = -1
-    except curses.error:
-        bg = curses.COLOR_BLACK
-
-    curses.init_pair(C_DEFAULT, curses.COLOR_WHITE, bg)
-    curses.init_pair(C_TITLE, curses.COLOR_CYAN, bg)
-    curses.init_pair(C_OK, curses.COLOR_GREEN, bg)
-    curses.init_pair(C_WARN, curses.COLOR_YELLOW, bg)
-    curses.init_pair(C_ERROR, curses.COLOR_RED, bg)
-
-    # Barras de status (alto contraste garantido)
-    curses.init_pair(C_STATUS_OK, curses.COLOR_BLACK, curses.COLOR_GREEN)
-    curses.init_pair(C_STATUS_WARN, curses.COLOR_BLACK, curses.COLOR_YELLOW)
-    curses.init_pair(C_STATUS_ERR, curses.COLOR_WHITE, curses.COLOR_RED)
-    curses.init_pair(C_STATUS_RUN, curses.COLOR_WHITE, curses.COLOR_BLUE)
-
-    curses.init_pair(C_DIM, curses.COLOR_WHITE, bg)
-    curses.init_pair(C_ACCENT, curses.COLOR_MAGENTA, bg)
-    curses.init_pair(C_HEADER_BAR, curses.COLOR_BLACK, curses.COLOR_CYAN)
-
-
-def _cp(index: int, extra: int = 0) -> int:
-    """Retorna o atributo de par de cor seguro mesmo se o terminal não tiver cores."""
-    if curses is None or not curses.has_colors():
-        return extra
-    return curses.color_pair(index) | extra
-
-
-def _health_color(health: dict) -> int:
-    """Determina a cor de destaque da saúde do dispositivo."""
-    overall = str(health.get("overall") or "").lower()
-    if overall == "critical":
-        return C_ERROR
-    if overall == "warning":
-        return C_WARN
-    if overall == "healthy":
-        return C_OK
-    return C_WARN
-
-
 def _line(screen, y: int, x: int, text: str, width: int, attr: int = 0) -> None:
     """Escreve uma linha de texto na posição (y, x), truncando se necessário."""
     if y < 0:
@@ -451,20 +445,19 @@ def _line(screen, y: int, x: int, text: str, width: int, attr: int = 0) -> None:
     if y >= max_y or x >= max_x - 1:
         return
     available = max_x - 1 - x
-    fit_w = max(0, min(width, available))
+    text = text[: max(0, min(width, available))]
     try:
-        screen.addstr(y, x, text[:fit_w], attr)
+        screen.addstr(y, x, text, attr)
     except curses.error:
         pass
 
 
 def _fill(screen, y: int, x: int, width: int, attr: int) -> None:
-    """Preenche uma faixa com espaços usando o atributo/cor dado (para banners de alto contraste)."""
+    """Preenche uma faixa com espaços usando o atributo/cor dado (para barras de status)."""
     max_y, max_x = screen.getmaxyx()
     if y >= max_y or y < 0:
         return
-    available = max_x - 1 - x
-    w = max(0, min(width, available))
+    w = max(0, min(width, max_x - 1 - x))
     try:
         screen.addstr(y, x, " " * w, attr)
     except curses.error:
@@ -472,12 +465,13 @@ def _fill(screen, y: int, x: int, width: int, attr: int) -> None:
 
 
 def _box(screen, top: int, left: int, height: int, width: int, title: str = "", color: int = C_TITLE) -> None:
-    """Desenha caixa usando caracteres nativos ACS do Curses com título embutido."""
+    """Desenha uma caixa com cantos arredondados/linhas simples e um título embutido na borda superior."""
     max_y, max_x = screen.getmaxyx()
     if top < 0 or top + height > max_y or left < 0 or left + width > max_x:
         return
-    win_attr = _cp(color)
     try:
+        win_attr = _cp(color)
+        # bordas
         screen.addch(top, left, curses.ACS_ULCORNER, win_attr)
         screen.addch(top, left + width - 1, curses.ACS_URCORNER, win_attr)
         screen.addch(top + height - 1, left, curses.ACS_LLCORNER, win_attr)
@@ -510,9 +504,9 @@ def _format_columns(items: list[str], width: int, col_width: int = 35) -> list[s
 
 def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     height, width = screen.getmaxyx()
-    if height < 18 or width < 75:
+    if height < 20 or width < 90:
         screen.erase()
-        _line(screen, 0, 0, "Terminal muito pequeno (min. 75x18). Redimensione a janela.", width, _cp(C_WARN, curses.A_BOLD))
+        _line(screen, 0, 0, "Terminal muito pequeno. Redimensione a janela (min. 90x20).", width, _cp(C_WARN) | curses.A_BOLD)
         screen.refresh()
         return
 
@@ -548,30 +542,25 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     is_viewer = data["viewer_mode"]
     title_mode = "VISUALIZADOR PASSIVO - SYSTEMD" if is_viewer else "EXECUCAO DIRETA"
 
-    # -- 1. Cabeçalho --------------------------------------------------------
-    _line(screen, 0, 0, "■ DDS COLETOR ROTALOG", width, _cp(C_TITLE, curses.A_BOLD))
-    mode_attr = _cp(C_ACCENT, curses.A_BOLD) if is_viewer else _cp(C_OK, curses.A_BOLD)
-    _line(screen, 0, 24, f"[{title_mode}]", width - 24, mode_attr)
-
+    # -- Cabeçalho --------------------------------------------------------
+    _line(screen, 0, 0, f"■ DDS COLETOR ROTALOG", width, _cp(C_TITLE) | curses.A_BOLD)
+    _line(screen, 0, 24, f"[{title_mode}]", width - 24, _cp(C_ACCENT) | curses.A_BOLD)
     empresa_str = runner.empresa if runner else os.getenv("DDS_EMPRESA_PADRAO", "ChicoEletro")
     cur_interval = state.get_interval(now)
     is_peak = 7 <= now.hour < 20
     tag_intervalo = f"{cur_interval}s [PICO 07-20h]" if is_peak else f"{cur_interval}s [NOTURNO 20-07h]"
     if state.interval_seconds is not None:
         tag_intervalo = f"{state.interval_seconds}s [FIXO]"
-
     _line(screen, 1, 0, f"Empresa: {empresa_str}", width, _cp(C_ACCENT))
-    _line(screen, 1, 24, f"Intervalo: {tag_intervalo}", width - 24, _cp(C_DEFAULT))
-    clock_str = f"{now:%H:%M:%S}"
-    _line(screen, 1, width - 12, clock_str, 10, _cp(C_TITLE, curses.A_BOLD))
+    _line(screen, 1, 22, f"Intervalo: {tag_intervalo}", width - 22, _cp(C_DEFAULT))
+    _line(screen, 1, width - 12, f"{now:%H:%M:%S}", 10, _cp(C_DEFAULT) | curses.A_BOLD)
     screen.hline(2, 0, curses.ACS_HLINE, width - 1)
 
-    # -- 2. Barra de Status de Alto Contraste (Banner) ---------------------
+    # -- Barra de status (com cor de fundo conforme severidade) -----------
     runtime = data.get("runtime_status") or {}
     runtime_phase = str(runtime.get("phase") or "").upper()
     runtime_message = str(runtime.get("message") or "").strip()
-    status_y = 3
-
+    status_y = 4
     if runtime_phase in {"COLETANDO", "PROCESSANDO"}:
         status_text = f" STATUS: {runtime_phase}...  |  {runtime_message} "
         status_color = C_STATUS_RUN
@@ -580,23 +569,22 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
         status_color = C_STATUS_RUN
     elif data.get("is_stale"):
         status_text = f" STATUS: {data['status_message']} "
-        status_color = C_STATUS_WARN
+        status_color = C_STATUS_ERR
     elif (data.get("last_result") or {}).get("status") == "error":
         next_run = data["next_run"]
         if next_run:
-            rem = max(0, (next_run - now).total_seconds())
-            retry_text = f"proxima tentativa: {next_run:%H:%M:%S} (em {_format_duration(rem)})"
+            remaining = max(0, (next_run - now).total_seconds())
+            retry_text = f"proxima tentativa: {next_run:%H:%M:%S} (em {_format_duration(remaining)})"
         else:
             retry_text = "proxima tentativa: aguardando agendamento"
-        err_msg = data["last_result"].get("error") or "Erro na execucao"
-        status_text = f" STATUS: FALHA NA ULTIMA COLETA  |  {err_msg}  |  {retry_text} "
+        status_text = f" STATUS: FALHA NA ULTIMA COLETA  |  {retry_text} "
         status_color = C_STATUS_ERR
     else:
         next_run = data["next_run"]
         if next_run:
-            rem = (next_run - now).total_seconds()
-            if rem > 0:
-                status_text = f" STATUS: AGUARDANDO  |  proxima coleta: {next_run:%H:%M:%S} (em {_format_duration(rem)}) "
+            remaining = (next_run - now).total_seconds()
+            if remaining > 0:
+                status_text = f" STATUS: AGUARDANDO  |  proxima coleta: {next_run:%H:%M:%S} (em {_format_duration(remaining)}) "
             else:
                 status_text = " STATUS: AGUARDANDO CICLO DO SERVICO... "
         else:
@@ -604,93 +592,77 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
         status_color = C_STATUS_OK
 
     _fill(screen, status_y, 0, width - 1, _cp(status_color))
-    _line(screen, status_y, 1, status_text, width - 2, _cp(status_color, curses.A_BOLD))
+    _line(screen, status_y, 0, status_text, width - 1, _cp(status_color) | curses.A_BOLD)
 
     if last_success:
         success_time = str(last_success.get("finishedAt") or last_success.get("startedAt") or "-")
-        _line(screen, status_y + 1, 0, f"Ultima coleta com sucesso: {success_time[11:19]}", width, _cp(C_OK, curses.A_BOLD))
+        _line(screen, status_y + 1, 0, f"Ultima coleta com sucesso: {success_time[11:19]}", width, _cp(C_OK) | curses.A_BOLD)
     else:
         _line(screen, status_y + 1, 0, "Ultima coleta com sucesso: sem registro hoje", width, _cp(C_WARN))
 
-    # -- 3. Caixa: Última Execução -----------------------------------------
-    exec_top = status_y + 2
+    # -- Caixa: Última execução -------------------------------------------
+    exec_top = status_y + 3
     exec_h = 6
-    _box(screen, exec_top, 0, exec_h, width - 1, title="ULTIMA EXECUCAO", color=C_TITLE)
+    _box(screen, exec_top, 0, exec_h, width, title="ULTIMA EXECUCAO", color=C_TITLE)
     last = data["last_result"]
     if last:
         result_status = str(last.get("status", "-")).upper()
         result_color = C_OK if result_status == "SUCCESS" else C_ERROR
-        _line(screen, exec_top + 1, 2, f"Resultado: {result_status}", 22, _cp(result_color, curses.A_BOLD))
-        res_meta = (
-            f"inicio: {str(last.get('startedAt', '-'))[11:19]}"
-            f"  |  fim: {str(last.get('finishedAt', '-'))[11:19]}"
-            f"  |  duracao: {last.get('durationSeconds', '-')}s (raspagem: {last.get('scrapeDurationSeconds', '-')}s)"
-        )
-        _line(screen, exec_top + 1, 24, res_meta, width - 26, _cp(C_DEFAULT))
+        _line(screen, exec_top + 1, 2, f"Resultado: {result_status}", 20, _cp(result_color) | curses.A_BOLD)
+        _line(screen, exec_top + 1, 24, f"inicio: {str(last.get('startedAt', '-'))[11:19]}  |  fim: {str(last.get('finishedAt', '-'))[11:19]}", width - 26, _cp(C_DEFAULT))
+        _line(screen, exec_top + 2, 2, f"Tempo total: {last.get('durationSeconds', '-')}s  |  raspagem: {last.get('scrapeDurationSeconds', '-')}s", width - 4, _cp(C_DEFAULT))
 
         fb_status = last.get("firebaseSyncStatus")
         if fb_status == "disabled":
             upload_flag, upload_color = "nuvem: DESATIVADA (LOCAL)", C_WARN
         elif fb_status == "unchanged":
-            upload_flag, upload_color = "torre: SEM ALTERACAO", C_TITLE
+            upload_flag, upload_color = "torre: SEM ALTERACAO", C_DIM
         elif last.get("firebaseUploaded") or fb_status == "uploaded":
-            upload_flag, upload_color = "nuvem: SINCRONIZADO OK", C_OK
+            upload_flag, upload_color = "nuvem: OK", C_OK
         else:
             upload_flag, upload_color = "nuvem: PENDENTE", C_WARN
-
-        team_line = (
-            f"Equipes: {last.get('totalTeams', '-')} total"
-            f"  |  {last.get('updatedTeams', '-')} atualizadas"
-            f"  |  {last.get('ignoredTeams', '-')} sem alteracao  |  "
-        )
-        _line(screen, exec_top + 2, 2, team_line, width - 4, _cp(C_DEFAULT))
-        _line(screen, exec_top + 2, 2 + len(team_line), upload_flag, width - 4 - len(team_line), _cp(upload_color, curses.A_BOLD))
+        _line(screen, exec_top + 3, 2, f"Equipes: {last.get('totalTeams', '-')}  |  atualizadas: {last.get('updatedTeams', '-')}  |  ignoradas: {last.get('ignoredTeams', '-')}  |  ", width - 4, _cp(C_DEFAULT))
+        equipes_line_len = len(f"Equipes: {last.get('totalTeams', '-')}  |  atualizadas: {last.get('updatedTeams', '-')}  |  ignoradas: {last.get('ignoredTeams', '-')}  |  ")
+        _line(screen, exec_top + 3, 2 + equipes_line_len, upload_flag, width - 4 - equipes_line_len, _cp(upload_color) | curses.A_BOLD)
 
         last_up = int(last.get("bytesUploaded") or 0)
         last_down = int(last.get("bytesDownloaded") or 0)
         last_reads = int(last.get("readOperations") or 0)
         last_writes = int(last.get("writeOperations") or 0)
-        storage_info = (
-            f"Storage: {last_reads} leituras / {last_writes} gravacoes"
-            f"  |  Trafego: {_format_bytes(last_up)} env / {_format_bytes(last_down)} lidos"
+        storage_tag = (
+            f"Historicos: enviados: {last.get('dailySyncUploaded', 0)}  |  pendentes: {last.get('dailySyncPending', 0)}  |  falhas: {last.get('dailySyncFailed', 0)}"
         )
-        _line(screen, exec_top + 3, 2, storage_info, width - 4, _cp(C_DEFAULT))
-
+        _line(screen, exec_top + 4, 2, storage_tag, width - 4, _cp(C_DEFAULT))
+        storage2 = (
+            f"Storage: {last_reads} leituras / {last_writes} gravacoes  |  trafego: {_format_bytes(last_up)} env / {_format_bytes(last_down)} lidos"
+        )
         if last.get("error"):
-            _line(screen, exec_top + 4, 2, f"Erro: {last['error']}", width - 4, _cp(C_ERROR, curses.A_BOLD))
-        else:
-            daily_sync_info = (
-                f"Historicos: enviados: {last.get('dailySyncUploaded', 0)}"
-                f"  |  pendentes: {last.get('dailySyncPending', 0)}"
-                f"  |  falhas: {last.get('dailySyncFailed', 0)}"
-            )
-            _line(screen, exec_top + 4, 2, daily_sync_info, width - 4, _cp(C_DIM))
+            _line(screen, exec_top + 4, 2, storage2[: max(0, width - 6)], width - 4, _cp(C_DIM))
+        if last.get("error"):
+            _line(screen, exec_top + 5, 2, f"Erro: {last['error']}", width - 4, _cp(C_ERROR) | curses.A_BOLD)
     else:
         _line(screen, exec_top + 1, 2, "Aguardando registros do servico em execucoes.jsonl...", width - 4, _cp(C_DIM))
 
-    # -- 4. Caixa: Saúde do Dispositivo ------------------------------------
+    # -- Caixa: Saúde do dispositivo ---------------------------------------
     health = data.get("device_health") or {}
-    health_top = exec_top + exec_h
+    health_top = exec_top + exec_h + 1
     health_h = 5
     health_color = _health_color(health)
-    _box(screen, health_top, 0, health_h, width - 1, title="SAUDE DO DISPOSITIVO", color=health_color)
+    _box(screen, health_top, 0, health_h, width, title="SAUDE DO DISPOSITIVO", color=health_color)
     if health:
         health_lines = _format_health(health)
-        _line(screen, health_top + 1, 2, health_lines[0], width - 4, _cp(health_color, curses.A_BOLD if health_color != C_OK else 0))
-        _line(screen, health_top + 2, 2, health_lines[1], width - 4, _cp(C_DEFAULT))
-        issues_attr = _cp(C_WARN, curses.A_BOLD) if (health.get("issues") or health_color != C_OK) else _cp(C_OK)
-        _line(screen, health_top + 3, 2, health_lines[2], width - 4, issues_attr)
+        for offset, health_line in enumerate(health_lines):
+            _line(screen, health_top + 1 + offset, 2, health_line, width - 4, _cp(health_color) | (curses.A_BOLD if health_color != C_OK else 0))
     else:
         _line(screen, health_top + 1, 2, "Coletando informacoes de saude...", width - 4, _cp(C_DIM))
 
-    # -- 5 e 6. Eventos Operacionais e Histórico Diário --------------------
-    bottom_reserved = 5
-    hist_top = max(health_top + health_h, height - bottom_reserved)
-    events_top = health_top + health_h
-    events_h = hist_top - events_top
-
+    # -- Caixa: Eventos (local/nuvem) --------------------------------------
+    events_top = health_top + health_h + 1
+    bottom_reserved = 5  # histórico diário + teclas
+    events_bottom = height - bottom_reserved
+    events_h = max(3, events_bottom - events_top)
     if events_h >= 3:
-        _box(screen, events_top, 0, events_h, width - 1, title="EVENTOS DE EQUIPES", color=C_TITLE)
+        _box(screen, events_top, 0, events_h, width, title="EVENTOS DE EQUIPES", color=C_TITLE)
         cur_y = events_top + 1
         max_event_y = events_top + events_h - 1
 
@@ -701,7 +673,7 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
 
             if local_events or cloud_events:
                 if local_events and cur_y < max_event_y:
-                    _line(screen, cur_y, 2, f"LOCAL ({len(local_events)} equipes com transicao apenas local):", width - 4, _cp(C_WARN, curses.A_BOLD))
+                    _line(screen, cur_y, 2, f"LOCAL ({len(local_events)} equipes com transicao apenas local)", width - 4, _cp(C_WARN) | curses.A_BOLD)
                     cur_y += 1
                     local_strs = [f"{e['team']}: {e['action']}" for e in local_events]
                     local_rows = _format_columns(local_strs, width - 4, col_width=35)
@@ -712,18 +684,20 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
                     for row in local_rows[:allowed_local_rows]:
                         if cur_y >= max_event_y:
                             break
-                        _line(screen, cur_y, 4, row, width - 6, _cp(C_DEFAULT))
+                        _line(screen, cur_y, 2, row, width - 4, _cp(C_DEFAULT))
                         cur_y += 1
 
                     if len(local_rows) > allowed_local_rows and cur_y < max_event_y:
                         items_per_row = max(1, (width - 4) // 38)
                         remaining_local = len(local_events) - (allowed_local_rows * items_per_row)
                         if remaining_local > 0:
-                            _line(screen, cur_y, 4, f"... e mais {remaining_local} equipes", width - 6, _cp(C_DIM))
+                            _line(screen, cur_y, 2, f"... e mais {remaining_local} equipes atualizadas localmente", width - 4, _cp(C_DIM))
                             cur_y += 1
 
                 if cloud_events and cur_y < max_event_y:
-                    _line(screen, cur_y, 2, f"NUVEM ({len(cloud_events)} eventos sincronizados no Firebase):", width - 4, _cp(C_OK, curses.A_BOLD))
+                    if local_events and cur_y < max_event_y:
+                        cur_y += 1
+                    _line(screen, cur_y, 2, f"NUVEM ({len(cloud_events)} eventos sincronizados no Firebase)", width - 4, _cp(C_OK) | curses.A_BOLD)
                     cur_y += 1
                     cloud_strs = [f"{e['team']}: {e['action']}" for e in cloud_events]
                     cloud_rows = _format_columns(cloud_strs, width - 4, col_width=35)
@@ -732,42 +706,37 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
                     for row in cloud_rows[:allowed_cloud_rows]:
                         if cur_y >= max_event_y:
                             break
-                        _line(screen, cur_y, 4, row, width - 6, _cp(C_DEFAULT))
+                        _line(screen, cur_y, 2, row, width - 4, _cp(C_DEFAULT))
                         cur_y += 1
 
                     if len(cloud_rows) > allowed_cloud_rows and cur_y < max_event_y:
                         items_per_row = max(1, (width - 4) // 38)
                         remaining_cloud = len(cloud_events) - (allowed_cloud_rows * items_per_row)
                         if remaining_cloud > 0:
-                            _line(screen, cur_y, 4, f"... e mais {remaining_cloud} eventos na nuvem", width - 6, _cp(C_DIM))
+                            _line(screen, cur_y, 2, f"... e mais {remaining_cloud} eventos na nuvem", width - 4, _cp(C_DIM))
+                            cur_y += 1
             else:
                 _line(screen, cur_y, 2, "Nenhuma transicao de equipe no ultimo ciclo.", width - 4, _cp(C_DIM))
-        else:
-            _line(screen, cur_y, 2, "Aguardando execucoes para exibir eventos.", width - 4, _cp(C_DIM))
 
-    # -- 6. Caixa: Histórico Diário ----------------------------------------
-    _box(screen, hist_top, 0, 4, width - 1, title="HISTORICO DIARIO (HOJE)", color=C_TITLE)
+    # -- Histórico diário ----------------------------------------------------
+    hist_y = height - bottom_reserved
+    _line(screen, hist_y, 0, "HISTORICO DIARIO", width, _cp(C_TITLE) | curses.A_BOLD | curses.A_UNDERLINE)
     storage_daily = (
-        f"Storage: {total_reads} leituras / {total_writes} gravacoes"
-        f"  |  {_format_bytes(total_bytes_up)} env / {_format_bytes(total_bytes_down)} lidos"
+        f"{_format_bytes(total_bytes_up)} env / {_format_bytes(total_bytes_down)} lidos"
     )
-    _line(screen, hist_top + 1, 2, f"Ciclos: {len(history)}", 14, _cp(C_DEFAULT))
-    _line(screen, hist_top + 1, 16, f"Sucesso: {len(successful)}", 16, _cp(C_OK, curses.A_BOLD))
-    err_color = _cp(C_ERROR, curses.A_BOLD) if errors > 0 else _cp(C_DIM)
-    _line(screen, hist_top + 1, 32, f"Erros: {errors}", 12, err_color)
-    _line(screen, hist_top + 1, 44, f"Media: {_format_duration(average)}", 16, _cp(C_DEFAULT))
-    _line(screen, hist_top + 1, 60, f"| {storage_daily}", width - 62, _cp(C_DIM))
-    _line(screen, hist_top + 2, 2, "Arquivos: equipes/current/index.json.gz  |  logs/execucoes.jsonl (rotacao diaria .jsonl.gz)", width - 4, _cp(C_DIM))
+    _line(screen, hist_y + 1, 0, f"Ciclos hoje: {len(history)}", 18, _cp(C_DEFAULT))
+    _line(screen, hist_y + 1, 18, f"sucesso: {len(successful)}", 14, _cp(C_OK))
+    _line(screen, hist_y + 1, 33, f"erros: {errors}", 12, _cp(C_ERROR) if errors else _cp(C_DIM))
+    _line(screen, hist_y + 1, 46, f"media: {_format_duration(average)}", 16, _cp(C_DEFAULT))
+    _line(screen, hist_y + 1, 63, f"Storage: {total_reads} leituras / {total_writes} gravacoes  |  {storage_daily}", width - 64, _cp(C_DIM))
+    _line(screen, hist_y + 2, 0, "Arquivos: equipes/current/index.json.gz  |  logs/execucoes.jsonl (rotacao diaria .jsonl.gz)", width, _cp(C_DIM))
 
-    # -- 7. Barra de Rodapé / Teclas de Alto Contraste --------------------
     if is_viewer:
-        keys_text = " [h] Historico (ontem)   [m] Fechar mes anterior   [c] Limpar tela   [q] Sair "
+        keys_text = " h = historico (ontem)   m = fechar mes anterior   q = fechar "
     else:
-        keys_text = " [r] Executar agora   [h] Historico (ontem)   [m] Fechar mes anterior   [c] Limpar tela   [q] Sair "
-
-    footer_y = height - 1
-    _fill(screen, footer_y, 0, width - 1, _cp(C_HEADER_BAR, curses.A_BOLD))
-    _line(screen, footer_y, 0, keys_text, width - 1, _cp(C_HEADER_BAR, curses.A_BOLD))
+        keys_text = " r = executar agora   h = historico (ontem)   m = fechar mes anterior   q = sair "
+    _fill(screen, height - 1, 0, width - 1, _cp(C_DEFAULT) | curses.A_REVERSE)
+    _line(screen, height - 1, 0, keys_text, width - 1, _cp(C_DEFAULT) | curses.A_REVERSE | curses.A_BOLD)
 
     screen.refresh()
 
