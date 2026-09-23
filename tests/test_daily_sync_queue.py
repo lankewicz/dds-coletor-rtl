@@ -95,6 +95,13 @@ class DailySyncQueueTests(unittest.TestCase):
         self.assertNotIn("turno_fechado", self.runner._daily_sync_reasons({}, closed))
         self.assertEqual(self.runner._daily_sync_reasons({}, {"jornada": {"turno": {"status": "FECHADO"}}}), [])
 
+    def test_closed_daily_history_is_finalized_and_open_history_is_not(self):
+        open_history = {"jornada": {"turno": {"status": "ABERTO"}}}
+        closed_history = {"jornada": {"turno": {"status": "FECHADO"}}}
+
+        self.assertFalse(self.runner._daily_history_is_finalized(open_history))
+        self.assertTrue(self.runner._daily_history_is_finalized(closed_history))
+
     def test_corrupt_sync_queue_is_quarantined_and_reinitialized(self):
         queue_file = self.runner.daily_sync_queue_path
         queue_file.parent.mkdir(parents=True, exist_ok=True)

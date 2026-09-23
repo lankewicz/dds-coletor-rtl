@@ -311,6 +311,12 @@ class LocalRotalogRunner:
             reasons.append("servico_concluido")
         return reasons
 
+    @staticmethod
+    def _daily_history_is_finalized(document: dict) -> bool:
+        """Um diario fechado e imutavel: nao deve ser mesclado ou reenviado."""
+        turno = ((document.get("jornada") or {}).get("turno") or {})
+        return str(turno.get("status") or "").upper() == "FECHADO"
+
     def _load_daily_sync_queue(self) -> dict:
         payload, status = load_json_with_status(self.daily_sync_queue_path, {})
         if status == "corrupt":
@@ -555,7 +561,10 @@ class LocalRotalogRunner:
                             if prev_day_path.exists():
                                 try:
                                     prev_doc = self._load_daily_with_recovery(prev_day_path, prev_day, team_key)
-                                    if prev_doc:
+                                    # Depois que o diario anterior recebeu o fechamento do turno,
+                                    # ele fica imutavel. Isso evita regravar e reenviar o mesmo
+                                    # historico a cada alteracao da equipe no dia seguinte.
+                                    if prev_doc and not self._daily_history_is_finalized(prev_doc):
                                         merged_prev = merge_daily_document(prev_doc, document, prev_day)
                                         write_json(prev_day_path, merged_prev)
                                         self._enqueue_daily_sync(prev_day, team_key, ["fechamento_turno"])
