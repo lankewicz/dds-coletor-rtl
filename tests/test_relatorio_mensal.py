@@ -211,6 +211,28 @@ class RelatorioMensalTests(unittest.TestCase):
             self.assertTrue(result["firebaseRawSynced"])
             self.assertTrue(result["firebaseSynced"])
 
+    def test_coleta_diaria_identica_nao_reenvia_arquivos(self):
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "coletor.historico.RotalogEventosScraper"
+        ) as eventos_factory, patch("coletor.historico.RotalogEquipesScraper") as equipes_factory:
+            eventos_factory.return_value.raspar_periodo.return_value = [evento("4600026988", "10", "8")]
+            equipes_factory.return_value.raspar_dia.return_value = []
+            store = Mock(enabled=True, root_prefix="dados/empresa/rotalog", bucket_name="bucket")
+
+            first = executar_coleta_historico_dia(
+                datetime.date(2026, 9, 14), Path(directory), "Empresa", True, store,
+                atualizar_terminal=False,
+            )
+            second = executar_coleta_historico_dia(
+                datetime.date(2026, 9, 14), Path(directory), "Empresa", True, store,
+                atualizar_terminal=False,
+            )
+
+            self.assertEqual(2, store.save_blob.call_count)
+            self.assertTrue(first["firebaseUploaded"])
+            self.assertFalse(second["firebaseUploaded"])
+            self.assertFalse(second["firebaseRawUploaded"])
+
     def test_mes_vazio_informa_ausencia(self):
         with tempfile.TemporaryDirectory() as directory, patch(
             "coletor.historico.RotalogEquipesScraper"

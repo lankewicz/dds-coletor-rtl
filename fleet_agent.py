@@ -399,6 +399,8 @@ def run_once() -> int:
     node_id = default_node_id()
     store = FleetStore.from_environment(ROOT)
     publish_heartbeat(store, node_id)
+    if os.getenv("FLEET_COMMANDS_ENABLED", "false").strip().lower() not in {"1", "true", "yes"}:
+        return 0
     commands = store.pending_commands(node_id)
     if not commands:
         return 0

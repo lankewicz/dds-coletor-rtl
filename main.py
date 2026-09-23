@@ -120,6 +120,9 @@ class LocalRotalogRunner:
         self.daily_sync_queue_path = (
             output_dir / "rotalog" / "sync" / self.company_key / "pending-daily.json.gz"
         )
+        self.daily_sync_receipts_path = (
+            output_dir / "rotalog" / "sync" / self.company_key / "daily-receipts.json.gz"
+        )
         self.enable_firebase = enable_firebase
         self.firebase_store = None
         self.team_repo = None
@@ -317,6 +320,66 @@ class LocalRotalogRunner:
         turno = ((document.get("jornada") or {}).get("turno") or {})
         return str(turno.get("status") or "").upper() == "FECHADO"
 
+    @staticmethod
+    def _daily_document_digest(document: dict) -> str:
+        def stable(value):
+            if isinstance(value, dict):
+                return {
+                    key: stable(item)
+                    for key, item in value.items()
+                    if key not in {"updatedAt", "updatedAtIso", "version", "observadoEm", "eventIdx"}
+                }
+            if isinstance(value, list):
+                return [stable(item) for item in value]
+            return value
+
+        raw = json.dumps(stable(document), sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _load_daily_sync_receipts(self) -> dict:
+        payload = load_json(self.daily_sync_receipts_path, {})
+        items = payload.get("items", {}) if isinstance(payload, dict) else {}
+        return items if isinstance(items, dict) else {}
+
+    def _save_daily_sync_receipts(self, items: dict) -> None:
+        write_json(self.daily_sync_receipts_path, {
+            "schemaVersion": 1,
+            "updatedAt": datetime.now(TZ).isoformat(),
+            "items": items,
+        })
+
+    def _rebuild_daily_sync_queue(self) -> dict:
+        items = {}
+        receipts = self._load_daily_sync_receipts()
+        daily_root = self.output_dir / "rotalog" / "equipes" / "daily"
+        for path in daily_root.glob("*/*.json.gz") if daily_root.exists() else ():
+            document, status = load_json_with_status(path, {})
+            day = str(document.get("date") or path.parent.name)
+            team_key = normalize_team_key(document.get("teamKey") or path.name.removesuffix(".json.gz"))
+            if status != "ok" or not day or not team_key or not self._valid_daily_recovery(document, day, team_key):
+                continue
+            has_history = bool((document.get("ordensServico") or {}).get("historico"))
+            has_shift = bool(((document.get("jornada") or {}).get("turno") or {}).get("inicio"))
+            if not (has_history or has_shift):
+                continue
+            item_key = f"{day}/{team_key}"
+            digest = self._daily_document_digest(document)
+            if receipts.get(item_key, {}).get("sha256") == digest:
+                continue
+            items[item_key] = {
+                "day": day,
+                "teamKey": team_key,
+                "reasons": ["fila_reconstruida"],
+                "queuedAt": datetime.now(TZ).isoformat(),
+                "attempts": 0,
+                "lastAttemptAt": None,
+                "lastError": None,
+            }
+        queue = {"schemaVersion": 1, "items": items}
+        self._save_daily_sync_queue(queue)
+        LOG.warning("Fila diária reconstruída com %d histórico(s) local(is) não confirmado(s)", len(items))
+        return queue
+
     def _load_daily_sync_queue(self) -> dict:
         payload, status = load_json_with_status(self.daily_sync_queue_path, {})
         if status == "corrupt":
@@ -326,7 +389,7 @@ class LocalRotalogRunner:
                 self.daily_sync_queue_path,
                 quarantine,
             )
-            return {"schemaVersion": 1, "items": {}}
+            return self._rebuild_daily_sync_queue()
         items = payload.get("items", {}) if isinstance(payload, dict) else {}
         if not isinstance(items, dict):
             quarantine = self._quarantine_corrupt_file(self.daily_sync_queue_path)
@@ -335,7 +398,7 @@ class LocalRotalogRunner:
                 self.daily_sync_queue_path,
                 quarantine,
             )
-            return {"schemaVersion": 1, "items": {}}
+            return self._rebuild_daily_sync_queue()
         return {"schemaVersion": 1, "items": items}
 
     def _save_daily_sync_queue(self, queue: dict) -> None:
@@ -345,6 +408,12 @@ class LocalRotalogRunner:
 
     def _enqueue_daily_sync(self, day: str, team_key: str, reasons: list[str]) -> None:
         if not self.enable_firebase or not reasons:
+            return
+        daily_path = self.output_dir / "rotalog" / "equipes" / "daily" / day / f"{team_key}.json.gz"
+        document = load_json(daily_path, {})
+        digest = self._daily_document_digest(document) if document else None
+        receipt = self._load_daily_sync_receipts().get(f"{day}/{team_key}", {})
+        if digest and receipt.get("sha256") == digest:
             return
         queue = self._load_daily_sync_queue()
         item_key = f"{day}/{team_key}"
@@ -388,6 +457,12 @@ class LocalRotalogRunner:
                 self._save_daily_sync_queue(queue)
                 LOG.error("Pendência diária %s mantida após falha de sincronização: %s", item_key, exc)
             else:
+                receipts = self._load_daily_sync_receipts()
+                receipts[item_key] = {
+                    "sha256": self._daily_document_digest(document),
+                    "uploadedAt": datetime.now(TZ).isoformat(),
+                }
+                self._save_daily_sync_receipts(receipts)
                 del queue["items"][item_key]
                 stats["uploaded"] += 1
                 self._save_daily_sync_queue(queue)
@@ -623,27 +698,6 @@ class LocalRotalogRunner:
             finished_at = datetime.now(TZ)
             duration_total = round(time.perf_counter() - started_clock, 3)
 
-            # Log diário de auditoria no Storage
-            if self.firebase_enabled and self.exec_log:
-                try:
-                    self.exec_log.record(
-                        status="success",
-                        started_at=started_at,
-                        finished_at=finished_at,
-                        duration_seconds=duration_total,
-                        details={
-                            "totalTeams": len(teams),
-                            "updatedTeams": len(updates),
-                            "ignoredTeams": ignored,
-                            "scrapeDurationSeconds": round((scraped_at - started_at).total_seconds(), 3),
-                            "dailySyncPending": daily_sync["pending"],
-                            "dailySyncUploaded": daily_sync["uploaded"],
-                            "dailySyncFailed": daily_sync["failed"],
-                        },
-                    )
-                except Exception as exc:
-                    LOG.warning("Erro ao gravar log diário de execução no Storage: %s", exc)
-
             storage_metrics = self._take_storage_metrics()
 
             result = {
@@ -660,6 +714,9 @@ class LocalRotalogRunner:
                 "dailySyncPending": daily_sync["pending"],
                 "dailySyncUploaded": daily_sync["uploaded"],
                 "dailySyncFailed": daily_sync["failed"],
+                "cloudEventWrites": daily_sync["uploaded"],
+                "cloudIndexWrites": 1 if firebase_uploaded else 0,
+                "cloudAuditWrites": 0,
                 **storage_metrics,
                 "events": {
                     "local": local_events,

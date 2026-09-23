@@ -108,10 +108,26 @@ class DailySyncQueueTests(unittest.TestCase):
         queue_file.write_bytes(b"corrupted-non-gzip-content-or-truncated")
 
         loaded = self.runner._load_daily_sync_queue()
-        self.assertEqual(loaded, {"schemaVersion": 1, "items": {}})
-        self.assertFalse(queue_file.exists())
+        self.assertEqual(loaded["schemaVersion"], 1)
+        self.assertEqual(loaded["items"], {})
+        self.assertTrue(queue_file.exists())
         corrupt_files = list(queue_file.parent.glob("pending-daily.json.gz.corrupt-*"))
         self.assertEqual(len(corrupt_files), 1)
+
+    def test_corrupt_queue_is_rebuilt_from_unconfirmed_local_history(self):
+        completed = copy.deepcopy(self.document)
+        completed["ordensServico"]["historico"] = [{"protocolo": "12345678"}]
+        write_json(self.daily_path, completed)
+        self.runner.daily_sync_queue_path.parent.mkdir(parents=True, exist_ok=True)
+        self.runner.daily_sync_queue_path.write_bytes(b"corrupted")
+
+        rebuilt = self.runner._load_daily_sync_queue()
+
+        self.assertIn(f"{self.day}/{self.team_key}", rebuilt["items"])
+        self.assertEqual(
+            rebuilt["items"][f"{self.day}/{self.team_key}"]["reasons"],
+            ["fila_reconstruida"],
+        )
 
 
 if __name__ == "__main__":

@@ -67,7 +67,7 @@ centralizadas em `coletor/equipes.py`.
 
 ## 3. Estrutura de Arquivos
 
-A confirmação do último índice enviado fica em `current/firebase-sync.json`, vinculada ao bucket e ao caminho remoto. Sem confirmação local, o primeiro ciclo envia o índice; ciclos sem mudanças dispensam o upload, inclusive após reiniciar. Falhas são tentadas novamente nos ciclos seguintes com os dados mais recentes. O índice local continua sendo atualizado em cada coleta. No Firebase, `updatedAtIso` indica a última publicação, não a última coleta. Os logs de auditoria remotos continuam seguindo a política anterior.
+A confirmação do último índice enviado fica em `current/firebase-sync.json`, vinculada ao bucket e ao caminho remoto. Sem confirmação local, o primeiro ciclo envia o índice; ciclos sem mudanças dispensam o upload, inclusive após reiniciar. Falhas são tentadas novamente nos ciclos seguintes com os dados mais recentes. O índice local continua sendo atualizado em cada coleta. No Firebase, `updatedAtIso` indica a última publicação, não a última coleta. Os logs de execução permanecem somente no Orange Pi e são consumidos pela TUI.
 
 Se o índice ou o histórico diário de uma equipe estiver corrompido, o coletor tenta recuperar a cópia correspondente do Firebase. A cópia diária só é aceita quando equipe, data e estrutura são compatíveis. Depois da validação, o arquivo defeituoso recebe o sufixo `.corrupt-<identificador>` e permanece ao lado do arquivo reconstruído para diagnóstico. Se não existir uma cópia remota válida, o ciclo registra erro e preserva o arquivo original; ele não cria um histórico vazio sobre dados corrompidos. Arquivo ausente em um dia novo continua sendo tratado como início normal, sem recuperação remota.
 
@@ -118,6 +118,8 @@ mas não substitui o heartbeat. A verificação local não consulta o Firebase.
 Configure `FLEET_DATA_DIR` se o coletor usar um `--output-dir` diferente de
 `dados-local`. Falhas de upload e ciclos sem mudanças não renovam o recibo.
 Resultados de deploy são imediatos.
+Por padrão, `FLEET_COMMANDS_ENABLED=false`: o agente publica somente heartbeat e
+não lista nem executa comandos de deploy. Defina `true` explicitamente para reativar.
 No Windows, a descoberta consulta também o índice remoto identificado pelo publicador,
 com tolerância de 45 minutos no pico e 2h30 fora dele. Isso indica comunicação
 recente, não garante saúde do coletor. As consultas de comandos ainda usam Firebase.

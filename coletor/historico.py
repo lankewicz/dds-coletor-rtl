@@ -10,6 +10,7 @@ from __future__ import annotations
 import calendar
 import datetime
 import gzip
+import hashlib
 import json
 import logging
 import math
@@ -31,7 +32,7 @@ from coletor.client import CrawlerRotalog
 from coletor.parser import formatar_protocolo_copel
 from coletor.relatorio import gerar_relatorio_diario, gerar_relatorio_mensal
 from coletor.equipes import normalize_team_key
-from coletor.storage import company_key, write_json
+from coletor.storage import company_key, load_json, write_json
 
 LOG = logging.getLogger("coletor-historico")
 TZ = ZoneInfo(os.getenv("DDS_TIMEZONE", "America/Sao_Paulo"))
@@ -42,6 +43,49 @@ URL_EQUIPES = f"{URL_BASE}/paginas/equipes"
 
 # Contratos monitorados para controle de produção / faturamento
 CONTRATOS_ALVO: tuple[str, ...] = ("4600026988", "4600025149")
+
+
+def _stable_payload_digest(payload: dict[str, typing.Any]) -> str:
+    """Digest operacional: horários de coleta não provocam novo upload."""
+    def stable(value):
+        if isinstance(value, dict):
+            return {
+                key: stable(item)
+                for key, item in value.items()
+                if key not in {"collectedAt", "updatedAt", "updatedAtIso"}
+            }
+        if isinstance(value, list):
+            return [stable(item) for item in value]
+        return value
+
+    raw = json.dumps(stable(payload), sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _upload_payload_if_changed(
+    firebase_store: typing.Any,
+    remote_blob: str,
+    payload: dict[str, typing.Any],
+    receipt_path: Path,
+) -> str:
+    digest = _stable_payload_digest(payload)
+    receipt = load_json(receipt_path, {})
+    if (
+        isinstance(receipt, dict)
+        and receipt.get("bucket") == firebase_store.bucket_name
+        and receipt.get("blob") == remote_blob
+        and receipt.get("sha256") == digest
+    ):
+        return "unchanged"
+    firebase_store.save_blob(remote_blob, payload)
+    write_json(receipt_path, {
+        "schemaVersion": 1,
+        "bucket": firebase_store.bucket_name,
+        "blob": remote_blob,
+        "sha256": digest,
+        "uploadedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    })
+    return "uploaded"
 
 EQUIPES_HEADERS = (
     "Veiculo", "Tablet", "Agencia", "Contrato", "Data Referencia - Turno",
@@ -914,20 +958,31 @@ def executar_coleta_historico_dia(
     # 4. Upload de APENAS UM ARQUIVO para o Firebase Storage
     firebase_synced = False
     firebase_raw_synced = False
+    firebase_uploaded = False
+    firebase_raw_uploaded = False
+    upload_errors = []
+    if enable_firebase and (not firebase_store or not firebase_store.enabled):
+        upload_errors.append("Firebase solicitado, mas indisponível; arquivos locais preservados")
     if enable_firebase and firebase_store and firebase_store.enabled:
         try:
             remote_raw_blob = f"{firebase_store.root_prefix}/eventos/diario/{day_iso}.json.gz"
-            firebase_store.save_blob(remote_raw_blob, raw_payload)
+            raw_receipt = output_dir / "rotalog" / "sync" / company_key(empresa) / "historico" / "eventos" / f"{day_iso}.json"
+            raw_status = _upload_payload_if_changed(firebase_store, remote_raw_blob, raw_payload, raw_receipt)
             firebase_raw_synced = True
+            firebase_raw_uploaded = raw_status == "uploaded"
             LOG.debug("Arquivo bruto diário sincronizado no Firebase: %s", remote_raw_blob)
         except Exception as exc:
+            upload_errors.append(str(exc))
             LOG.error("Erro ao sincronizar arquivo bruto diário no Firebase Storage: %s", exc)
         try:
             remote_blob = f"{firebase_store.root_prefix}/quilometragem/diario/{day_iso}.json.gz"
-            firebase_store.save_blob(remote_blob, payload_km)
+            km_receipt = output_dir / "rotalog" / "sync" / company_key(empresa) / "historico" / "quilometragem" / f"{day_iso}.json"
+            km_status = _upload_payload_if_changed(firebase_store, remote_blob, payload_km, km_receipt)
             firebase_synced = True
+            firebase_uploaded = km_status == "uploaded"
             LOG.debug("Arquivo diário consolidado sincronizado no Firebase: %s", remote_blob)
         except Exception as exc:
+            upload_errors.append(str(exc))
             LOG.error("Erro ao sincronizar arquivo diário no Firebase Storage: %s", exc)
 
     if atualizar_terminal:
@@ -942,7 +997,7 @@ def executar_coleta_historico_dia(
     duration_s = round((finished_at - started_at).total_seconds(), 2)
 
     return {
-        "status": "success",
+        "status": "error" if upload_errors else "success",
         "date": day_iso,
         "durationSeconds": duration_s,
         "totalEquipes": payload_km["totalEquipes"],
@@ -957,6 +1012,9 @@ def executar_coleta_historico_dia(
         "localRelatorioHtml": str(relatorio_diario_path),
         "firebaseSynced": firebase_synced,
         "firebaseRawSynced": firebase_raw_synced,
+        "firebaseUploaded": firebase_uploaded,
+        "firebaseRawUploaded": firebase_raw_uploaded,
+        "erroUpload": "; ".join(upload_errors) if upload_errors else None,
     }
 
 
@@ -1122,7 +1180,8 @@ def varrer_mes(
             if not firebase_store or not firebase_store.enabled:
                 raise RuntimeError("Firebase solicitado, mas indisponível; arquivos locais preservados")
             remote_monthly_blob = f"{firebase_store.root_prefix}/quilometragem/mensal/{mes_str}.json.gz"
-            firebase_store.save_blob(remote_monthly_blob, payload_mensal)
+            monthly_receipt = output_dir / "rotalog" / "sync" / company_key(empresa) / "historico" / "mensal" / f"{mes_str}.json"
+            _upload_payload_if_changed(firebase_store, remote_monthly_blob, payload_mensal, monthly_receipt)
             firebase_synced = True
             LOG.debug("Arquivo único mensal sincronizado no Firebase: %s", remote_monthly_blob)
         except Exception as exc:

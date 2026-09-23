@@ -666,10 +666,11 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
         _line(screen, exec_top + 2, 2 + len(team_line), upload_flag, width - 4 - len(team_line), _cp(upload_color, curses.A_BOLD))
 
         last_up = int(last.get("bytesUploaded") or 0)
-        last_cloud_writes = int(last.get("writeOperations") or 0)
         last_local_writes = int(last.get("updatedTeams") or 0)
         gravacoes_info = (
-            f"Gravacoes:  Local: {last_local_writes} no disco  |  Nuvem: {last_cloud_writes} ({_format_bytes(last_up)} enviados)"
+            f"Gravacoes: Local {last_local_writes} | Eventos {last.get('cloudEventWrites', last.get('dailySyncUploaded', 0))}"
+            f" | Indice {last.get('cloudIndexWrites', 1 if last.get('firebaseUploaded') else 0)}"
+            f" | Auditoria 0 (local) | Heartbeat separado | {_format_bytes(last_up)}"
         )
         _line(screen, exec_top + 3, 2, gravacoes_info, width - 4, _cp(C_DEFAULT))
 
