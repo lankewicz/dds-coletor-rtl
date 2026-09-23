@@ -14,6 +14,9 @@ class TeamTransitionsTests(unittest.TestCase):
 
         self.assertEqual(summarize_team_transition(doc_closed, doc_open), "Início de Turno")
         self.assertEqual(summarize_team_transition(doc_open, doc_closed), "Fim de Turno")
+        self.assertNotEqual(summarize_team_transition(None, doc_closed), "Fim de Turno")
+        self.assertNotEqual(summarize_team_transition({}, doc_closed), "Fim de Turno")
+        self.assertNotEqual(summarize_team_transition({"jornada": {"turno": {"status": "DESCONHECIDO"}}}, doc_closed), "Fim de Turno")
 
     def test_interval_start_and_end(self):
         doc_normal = {"jornada": {"turno": {"status": "ABERTO"}, "emIntervalo": False}}

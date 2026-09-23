@@ -91,6 +91,9 @@ class DailySyncQueueTests(unittest.TestCase):
         closed = copy.deepcopy(corrected)
         closed["jornada"]["turno"]["status"] = "FECHADO"
         self.assertEqual(self.runner._daily_sync_reasons(corrected, closed), ["turno_fechado"])
+        # Equipe que começa o dia já fechada (sem estado prévio) NÃO deve disparar turno_fechado
+        self.assertNotIn("turno_fechado", self.runner._daily_sync_reasons({}, closed))
+        self.assertEqual(self.runner._daily_sync_reasons({}, {"jornada": {"turno": {"status": "FECHADO"}}}), [])
 
     def test_corrupt_sync_queue_is_quarantined_and_reinitialized(self):
         queue_file = self.runner.daily_sync_queue_path

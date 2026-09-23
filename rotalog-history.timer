@@ -1,0 +1,12 @@
+[Unit]
+Description=Agenda coleta historica diaria do Rotalog as 05:30
+
+[Timer]
+OnCalendar=*-*-* 05:30:00 America/Sao_Paulo
+Persistent=true
+AccuracySec=1min
+Unit=rotalog-history.service
+
+[Install]
+WantedBy=timers.target
+

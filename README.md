@@ -247,7 +247,7 @@ Em vez de atualizar cada equipe individualmente (o que geraria centenas de acess
   * `dados/{empresa}/rotalog/quilometragem/diario/AAAA-MM-DD.json.gz` (~9 KB)
   * Indexado por **`protocolos`**: `protocolo -> { "equipe": "E3K95", "kmInformado": 14.0, "kmAutorizadoFinal": 14.0 }`.
   * Indexado por **`totaisPorEquipe`**: `equipe -> { "kmInformado": 247.0, "kmAutorizadoFinal": 204.24, "contrato": "4600026988" }`.
-  * **Consumo no Firebase**: Apenas **1 gravação por dia** (30 gravações no mês inteiro!).
+  * **Consumo no Firebase**: **2 gravações por dia**: arquivo bruto de auditoria e consolidado diário.
 
 ```bash
 # 1. Coleta diária (ontem D-1 por padrão) gerando o arquivo único do dia:
@@ -255,6 +255,20 @@ python main.py --historico --firebase
 
 # 2. Coleta de uma data específica:
 python main.py --historico 2026-09-12 --firebase
+```
+
+#### Agendamento diário às 05:30
+
+O timer persistente coleta automaticamente o dia anterior às 05:30 no fuso
+`America/Sao_Paulo`. Se o Orange Pi estiver desligado nesse horário, o systemd
+executa a coleta pendente quando o equipamento voltar.
+
+```bash
+sudo install -m 0644 rotalog-history.service /etc/systemd/system/rotalog-history.service
+sudo install -m 0644 rotalog-history.timer /etc/systemd/system/rotalog-history.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now rotalog-history.timer
+systemctl list-timers rotalog-history.timer
 ```
 
 ### Fechamento Mensal e Varredura do Mês Anterior (Notas de Cobrança)
@@ -279,6 +293,7 @@ O coletor possui duas fontes oficiais distintas no portal RTLWeb da Copel, cada 
 * **Conteúdo**: Detalhamento operacional e auditoria de cada serviço executado no dia (protocolo, equipe, horários de início/retorno do deslocamento, início/fim da execução, KM informado com limitador e KM autorizado final).
 * **Paginação**: Varre todas as páginas da tabela PrimeFaces (`form:tbListagemEventos`) até obter 100% dos eventos.
 * **Saída local**: 
+  - `dados-local/rotalog/eventos/diario/AAAA-MM-DD.json.gz` (eventos brutos para auditoria)
   - `dados-local/rotalog/quilometragem/diario/AAAA-MM-DD.json.gz` (dados estruturados)
   - `dados-local/rotalog/quilometragem/diario/AAAA-MM-DD-relatorio.html` (relatório imprimível / PDF)
 

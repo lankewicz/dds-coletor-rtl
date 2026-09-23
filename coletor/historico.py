@@ -19,6 +19,7 @@ import re
 import sys
 import typing
 import warnings
+from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import requests
@@ -387,14 +388,98 @@ class RotalogEquipesScraper:
                 continue
             cells = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
             if len(cells) >= len(EQUIPES_HEADERS):
-                records.append(dict(zip(EQUIPES_HEADERS, cells[:len(EQUIPES_HEADERS)])))
+                record = dict(zip(EQUIPES_HEADERS, cells[:len(EQUIPES_HEADERS)]))
+                team_link = tds[0].find("a")
+                if team_link:
+                    href = str(team_link.get("href") or "").strip()
+                    onclick = str(team_link.get("onclick") or "").strip()
+                    source_match = re.search(r"(?:s|source)\s*:\s*['\"]([^'\"]+)", onclick)
+                    render_match = re.search(r"(?:u|update)\s*:\s*['\"]([^'\"]+)", onclick)
+                    source = source_match.group(1) if source_match else str(team_link.get("id") or "").strip()
+                    record["_detalheHref"] = href
+                    record["_detalheSource"] = source
+                    record["_detalheRender"] = render_match.group(1) if render_match else "@all"
+                records.append(record)
         return records
+
+    @staticmethod
+    def _parse_electricians(context: typing.Any) -> dict[str, str]:
+        """Extrai matrícula e nome completo do painel de detalhes da equipe."""
+        result: dict[str, str] = {}
+        if not context:
+            return result
+        candidates = []
+        for tag in context.find_all(["li", "tr", "p", "div"]):
+            text = tag.get_text(" ", strip=True)
+            if "Eletricista" in text and len(text) <= 300:
+                candidates.append(text)
+        candidates.append(context.get_text("\n", strip=True))
+        for number in (1, 2):
+            pattern = re.compile(
+                rf"Eletricista\s*{number}\s*:\s*(\d+)\s*-\s*([^\n|]+)",
+                re.IGNORECASE,
+            )
+            match = next(
+                (pattern.search(text) for text in sorted(candidates, key=len) if pattern.search(text)),
+                None,
+            )
+            if match:
+                result[f"Eletricista {number} Registro"] = match.group(1).strip()
+                result[f"Eletricista {number} Nome"] = match.group(2).strip()
+                result[f"Eletricista {number}"] = f"{match.group(1).strip()} - {match.group(2).strip()}"
+        return result
+
+    def _fetch_team_details(self, record: dict[str, str], view_state: str) -> tuple[dict[str, str], str]:
+        href = str(record.get("_detalheHref") or "").strip()
+        source = str(record.get("_detalheSource") or "").strip()
+        response = None
+        if href and href != "#" and not href.lower().startswith("javascript:"):
+            response = self.session.get(urljoin(URL_EQUIPES, href), verify=False, timeout=30)
+        elif source:
+            render = str(record.get("_detalheRender") or "@all")
+            ajax_data = {
+                "javax.faces.partial.ajax": "true",
+                "javax.faces.source": source,
+                "javax.faces.partial.execute": source,
+                "javax.faces.partial.render": render,
+                source: source,
+                "form": "form",
+                "javax.faces.ViewState": view_state,
+            }
+            response = self.session.post(
+                URL_EQUIPES,
+                data=ajax_data,
+                headers={"Faces-Request": "partial/ajax", "X-Requested-With": "XMLHttpRequest"},
+                verify=False,
+                timeout=30,
+            )
+        if response is None:
+            return {}, view_state
+        response.raise_for_status()
+        detail_soup = BeautifulSoup(response.content, "html.parser")
+        state_update = detail_soup.find("update", {"id": "javax.faces.ViewState"})
+        new_state = state_update.get_text().strip() if state_update else view_state
+        return self._parse_electricians(detail_soup), new_state
+
+    def _enrich_team_details(self, records: list[dict[str, str]], view_state: str) -> str:
+        for record in records:
+            try:
+                details, view_state = self._fetch_team_details(record, view_state)
+                record.update(details)
+            except Exception as exc:
+                LOG.debug("Falha ao consultar detalhes da equipe %s: %s", record.get("Veiculo"), exc)
+            finally:
+                record.pop("_detalheHref", None)
+                record.pop("_detalheSource", None)
+                record.pop("_detalheRender", None)
+        return view_state
 
     def raspar_periodo(
         self,
         data_inicio_br: str,
         data_fim_br: str,
         progresso: typing.Callable[[str], None] | None = None,
+        enriquecer_detalhes: bool = False,
     ) -> list[dict[str, str]]:
         """Pesquisa e extrai todos os fechamentos de equipes do período na tela /paginas/equipes."""
         LOG.debug("Consultando fechamento de equipes: período %s até %s", data_inicio_br, data_fim_br)
@@ -426,6 +511,8 @@ class RotalogEquipesScraper:
 
         component = searched_soup.find(id="form:tbEquipes")
         records = self._parse_rows(component) if component else []
+        if enriquecer_detalhes:
+            current_state = self._enrich_team_details(records, current_state)
         total_pages = math.ceil(row_count / page_size) if row_count else 1
         LOG.debug("Equipes encontradas: %d linhas em %d páginas", row_count, total_pages)
 
@@ -458,12 +545,14 @@ class RotalogEquipesScraper:
             paged.raise_for_status()
             ajax_soup = BeautifulSoup(paged.content, "html.parser")
             update = ajax_soup.find("update", {"id": "form:tbEquipes"})
-            if update:
-                page_rows = self._parse_rows(BeautifulSoup(update.get_text(), "html.parser"))
-                records.extend(page_rows)
             vs_update = ajax_soup.find("update", {"id": "javax.faces.ViewState"})
             if vs_update and vs_update.get_text().strip():
                 current_state = vs_update.get_text().strip()
+            if update:
+                page_rows = self._parse_rows(BeautifulSoup(update.get_text(), "html.parser"))
+                if enriquecer_detalhes:
+                    current_state = self._enrich_team_details(page_rows, current_state)
+                records.extend(page_rows)
 
             if progresso:
                 cur_serv = sum(int(parse_float_br(r.get("Servicos executados"))) for r in records)
@@ -484,7 +573,7 @@ class RotalogEquipesScraper:
         data_br: str,
         progresso: typing.Callable[[str], None] | None = None,
     ) -> list[dict[str, str]]:
-        return self.raspar_periodo(data_br, data_br, progresso=progresso)
+        return self.raspar_periodo(data_br, data_br, progresso=progresso, enriquecer_detalhes=True)
 
 
 def salvar_arquivo_gzip(path: Path, payload: dict[str, typing.Any]) -> None:
@@ -511,6 +600,65 @@ def _quantidade_e_km(value: typing.Any) -> tuple[int, float]:
     )
 
 
+def _electrician_identity(row: dict[str, typing.Any], number: int) -> tuple[str, str, str]:
+    display = str(row.get(f"Eletricista {number}") or "").strip()
+    registration = str(row.get(f"Eletricista {number} Registro") or "").strip()
+    name = str(row.get(f"Eletricista {number} Nome") or "").strip()
+    if (not registration or not name) and display:
+        match = re.match(r"\s*(\d+)\s*-\s*(.+?)\s*$", display)
+        if match:
+            registration = registration or match.group(1)
+            name = name or match.group(2)
+    return registration, name, display or " - ".join(value for value in (registration, name) if value)
+
+
+def _normalized_event_type(row: dict[str, typing.Any]) -> str:
+    for key in ("Evento", "Tipo Evento", "Tipo de Evento", "Descricao", "Descrição", "Status"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return re.sub(r"\s+", " ", value).casefold()
+    return ""
+
+
+def deduplicar_eventos_consolidados(
+    records: list[dict[str, typing.Any]],
+) -> tuple[list[dict[str, typing.Any]], dict[str, int]]:
+    """Remove duplicatas do consolidado sem alterar o arquivo bruto de auditoria."""
+    exact_seen: set[str] = set()
+    last_technical_state: dict[tuple[str, str], str] = {}
+    kept: list[dict[str, typing.Any]] = []
+    exact_removed = 0
+    burst_removed = 0
+    technical_types = {"fim de turno", "inicio de turno", "início de turno"}
+
+    for row in records:
+        exact_key = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
+        if exact_key in exact_seen:
+            exact_removed += 1
+            continue
+        exact_seen.add(exact_key)
+
+        event_type = _normalized_event_type(row)
+        if event_type in technical_types:
+            team = normalize_team_key(row.get("Veiculo") or row.get("Veículo"))
+            contract = str(row.get("Contrato") or "").strip()
+            logical_key = (team, contract)
+            normalized_state = event_type.replace("í", "i")
+            if last_technical_state.get(logical_key) == normalized_state:
+                burst_removed += 1
+                continue
+            last_technical_state[logical_key] = normalized_state
+        kept.append(row)
+
+    return kept, {
+        "recebidos": len(records),
+        "mantidos": len(kept),
+        "duplicatasExatasRemovidas": exact_removed,
+        "repeticoesTecnicasRemovidas": burst_removed,
+        "totalRemovidos": exact_removed + burst_removed,
+    }
+
+
 def estruturar_resumo_equipes(
     records: list[dict[str, typing.Any]],
     contratos_alvo: tuple[str, ...] = CONTRATOS_ALVO,
@@ -528,14 +676,20 @@ def estruturar_resumo_equipes(
             continue
         aguardando_qtd, aguardando_km = _quantidade_e_km(row.get("Aguardando justificativa"))
         analise_qtd, analise_km = _quantidade_e_km(row.get("Em analise") or row.get("Em análise"))
+        eletricista1_registro, eletricista1_nome, eletricista1 = _electrician_identity(row, 1)
+        eletricista2_registro, eletricista2_nome, eletricista2 = _electrician_identity(row, 2)
         registro = {
             "equipe": equipe,
             "tablet": str(row.get("Tablet") or "").replace("*", "").strip(),
             "agencia": str(row.get("Agencia") or row.get("Agência") or "").strip(),
             "contrato": contrato,
             "turnoReferencia": str(row.get("Data Referencia - Turno") or row.get("Data Referência - Turno") or "").strip(),
-            "eletricista1": str(row.get("Eletricista 1") or "").strip(),
-            "eletricista2": str(row.get("Eletricista 2") or "").strip(),
+            "eletricista1": eletricista1,
+            "eletricista1Registro": eletricista1_registro,
+            "eletricista1Nome": eletricista1_nome,
+            "eletricista2": eletricista2,
+            "eletricista2Registro": eletricista2_registro,
+            "eletricista2Nome": eletricista2_nome,
             "servicosExecutados": int(parse_float_br(row.get("Servicos executados") or row.get("Serviços executados"))),
             "kmInformado": parse_float_br(row.get("Informado com limitador (km)")),
             "kmGlosadoCritico": parse_float_br(row.get("Glosado critico (km)") or row.get("Glosado crítico (km)")),
@@ -597,6 +751,7 @@ def estruturar_quilometragem_diaria(
 ) -> dict[str, typing.Any]:
     """Cria a estrutura enxuta única do dia com totais por equipe e protocolos filtrados pelos contratos alvo."""
     emp_key = company_key(empresa)
+    eventos_records, dedup_stats = deduplicar_eventos_consolidados(eventos_records)
     protocolos: dict[str, dict[str, typing.Any]] = {}
     servicos: list[dict[str, typing.Any]] = []
     totais_equipe: dict[str, dict[str, typing.Any]] = {}
@@ -680,6 +835,7 @@ def estruturar_quilometragem_diaria(
             "totalKmInformado": round(total_km_inf, 2),
             "totalKmAutorizadoFinal": round(total_km_aut, 2),
         },
+        "deduplicacaoEventos": dedup_stats,
         "resumoEquipes": resumo_equipes,
     }
 
@@ -715,6 +871,22 @@ def executar_coleta_historico_dia(
     scraper = RotalogEventosScraper(session=session)
     eventos = scraper.raspar_periodo(day_br, day_br, progresso=progresso_handler)
 
+    # Preserva todas as linhas e colunas retornadas pela listagem para auditoria/reprocessamento.
+    raw_payload = {
+        "schemaVersion": 1,
+        "fonte": "ROTALOG_LISTAGEM_EVENTOS",
+        "data": day_iso,
+        "empresa": empresa,
+        "empresaKey": company_key(empresa),
+        "collectedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "totalRegistros": len(eventos),
+        "registros": eventos,
+    }
+    raw_dir = output_dir / "rotalog" / "eventos" / "diario"
+    raw_path = raw_dir / f"{day_iso}.json.gz"
+    salvar_arquivo_gzip(raw_path, raw_payload)
+    LOG.debug("Arquivo bruto diário de eventos salvo: %s", raw_path)
+
     equipes = []
     try:
         equipes_scraper = RotalogEquipesScraper(session=session or scraper.session)
@@ -741,12 +913,20 @@ def executar_coleta_historico_dia(
 
     # 4. Upload de APENAS UM ARQUIVO para o Firebase Storage
     firebase_synced = False
+    firebase_raw_synced = False
     if enable_firebase and firebase_store and firebase_store.enabled:
+        try:
+            remote_raw_blob = f"{firebase_store.root_prefix}/eventos/diario/{day_iso}.json.gz"
+            firebase_store.save_blob(remote_raw_blob, raw_payload)
+            firebase_raw_synced = True
+            LOG.debug("Arquivo bruto diário sincronizado no Firebase: %s", remote_raw_blob)
+        except Exception as exc:
+            LOG.error("Erro ao sincronizar arquivo bruto diário no Firebase Storage: %s", exc)
         try:
             remote_blob = f"{firebase_store.root_prefix}/quilometragem/diario/{day_iso}.json.gz"
             firebase_store.save_blob(remote_blob, payload_km)
             firebase_synced = True
-            LOG.debug("Arquivo diário sincronizado no Firebase: %s", remote_blob)
+            LOG.debug("Arquivo diário consolidado sincronizado no Firebase: %s", remote_blob)
         except Exception as exc:
             LOG.error("Erro ao sincronizar arquivo diário no Firebase Storage: %s", exc)
 
@@ -773,8 +953,10 @@ def executar_coleta_historico_dia(
         "totalKmOficialAutorizadoFinal": payload_km["resumoEquipes"]["totais"]["kmAutorizadoFinal"],
         "totalKmRecuperadoParecer": payload_km["resumoEquipes"]["totais"]["kmRecuperadoParecer"],
         "localArquivoKm": str(local_km_path),
+        "localArquivoEventosBrutos": str(raw_path),
         "localRelatorioHtml": str(relatorio_diario_path),
         "firebaseSynced": firebase_synced,
+        "firebaseRawSynced": firebase_raw_synced,
     }
 
 
@@ -1000,4 +1182,3 @@ def varrer_mes_anterior(
         coletar_diarios=coletar_diarios,
         session=session,
     )
-

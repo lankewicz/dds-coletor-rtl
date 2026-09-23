@@ -7,9 +7,10 @@ ordens de serviço (SSs executadas, em andamento e pendentes) e consolida duplic
 from __future__ import annotations
 
 import datetime
-import html as html_lib
+import json
 import logging
 import os
+from pathlib import Path
 import re
 import threading
 import time
@@ -30,6 +31,28 @@ logger = logging.getLogger(__name__)
 
 _CLIQUE_EVENTOS_CACHE: dict[tuple[int, int | None, str], dict[str, typing.Any]] = {}
 _CLIQUE_CACHE_LOCK = threading.RLock()
+
+
+def carregar_servicos_ignorados(output_dir: Path | str | None = None) -> set[str]:
+    """Carrega lista de protocolos anômalos/travados a serem ignorados na timeline."""
+    caminhos = [
+        Path("dados-local/rotalog/config/ignored_services.json"),
+        Path("data/rotalog/config/ignored_services.json"),
+    ]
+    if output_dir:
+        caminhos.insert(0, Path(output_dir) / "rotalog" / "config" / "ignored_services.json")
+    for p in caminhos:
+        if p.exists():
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        return set(str(x).strip() for x in data)
+                    elif isinstance(data, dict):
+                        return set(str(k).strip() for k in data.keys())
+            except Exception as e:
+                logger.warning("Erro ao ler ignored_services.json: %s", e)
+    return set()
 
 
 def equipe_codigo_valido(value: str | None) -> bool:
@@ -451,22 +474,23 @@ def consolidar_turno_por_contexto(
         if fora_horario_comercial and tempo_sem_servico_ms >= 2 * 3600 * 1000:
             first_today_t = next((t for t in marker_times if t >= inicio_dia_ms), None)
             ini_ms = first_today_t or (services_today[0] if services_today else (marker_times[0] if marker_times else sorted_service_starts[0]))
-            duracao = int((fim_servico_ms - ini_ms) / 60000) if ini_ms else None
+            fim_efetivo_ms = retorno_ultimo_servico_ms or fim_servico_ms
+            duracao = int((fim_efetivo_ms - ini_ms) / 60000) if ini_ms else None
             shift_unico = {
                 "tipo": "REGULAR",
                 "status": "FECHADO",
                 "inicio": _convert_ms_to_iso(ini_ms) if ini_ms else None,
                 "inicio_ms": ini_ms,
-                "fim": _convert_ms_to_iso(fim_servico_ms),
-                "fim_ms": fim_servico_ms,
+                "fim": _convert_ms_to_iso(fim_efetivo_ms),
+                "fim_ms": fim_efetivo_ms,
                 "duracaoMinutos": duracao,
             }
             result.update({
                 "aberto": False,
                 "inicio_ms": ini_ms,
                 "inicio_iso": _convert_ms_to_iso(ini_ms) if ini_ms else None,
-                "fim_ms": fim_servico_ms,
-                "fim_iso": _convert_ms_to_iso(fim_servico_ms),
+                "fim_ms": fim_efetivo_ms,
+                "fim_iso": _convert_ms_to_iso(fim_efetivo_ms),
                 "classificacao": "FECHADO",
                 "turnos": [shift_unico],
                 "artigo66": None,
@@ -928,7 +952,14 @@ def extrair_dados_tempo_real(
     if not raw_items:
         raise RuntimeError("Timeline sem eventos reconhecidos; preservar último snapshot.")
 
+    servicos_ignorados = carregar_servicos_ignorados()
+
     for item in raw_items:
+        cls = item["className"]
+        cnt = item["content"]
+        if cnt in servicos_ignorados or formatar_protocolo_copel(cnt) in servicos_ignorados:
+            continue
+
         group_raw = item["group"]
         if group_raw not in equipas_map:
             meta = resolver_equipe_group(
@@ -1146,10 +1177,41 @@ def extrair_dados_tempo_real(
     except Exception as exc:
         logger.warning("Falha ao executar cliques forçados na timeline: %s", exc)
 
+    # Expurgar serviços ignorados identificados pelos popups
+    if servicos_ignorados:
+        for eq in resultado:
+            eq["ss_executadas"] = [
+                s for s in eq.get("ss_executadas", [])
+                if s.get("protocolo") not in servicos_ignorados and s.get("protocoloBruto") not in servicos_ignorados
+            ]
+            eq["ss_em_andamento"] = [
+                s for s in eq.get("ss_em_andamento", [])
+                if s.get("protocolo") not in servicos_ignorados and s.get("protocoloBruto") not in servicos_ignorados
+            ]
+            eq["bdo_list"] = [
+                s for s in eq.get("bdo_list", [])
+                if s.get("protocolo") not in servicos_ignorados and s.get("protocoloBruto") not in servicos_ignorados
+            ]
+            if eq.get("atividade_atual") and (
+                eq["atividade_atual"].get("protocolo") in servicos_ignorados
+                or eq["atividade_atual"].get("protocoloBruto") in servicos_ignorados
+            ):
+                eq["atividade_atual"] = None
+
     # Consolidação final do turno
     for eq in resultado:
         equipe_codigo = str(eq.get("equipe_codigo") or "").strip().upper()
         team_key = normalize_team_key(equipe_codigo)
+
+        # Unicidade de atividade ativa: descarta OS em andamento iniciada em dia anterior se a equipe já realizou outros serviços hoje
+        if eq.get("atividade_atual") and eq.get("ss_executadas"):
+            hoje_str = hoje_local.isoformat()
+            atv = eq["atividade_atual"]
+            atv_ini = str(atv.get("inicioIso") or "")[:10]
+            if atv_ini and atv_ini < hoje_str:
+                logger.info("Equipe %s: descartando atividade ativa antiga de %s (%s)", team_key, atv_ini, atv.get("protocolo"))
+                eq["ss_em_andamento"] = [s for s in eq.get("ss_em_andamento", []) if s != atv]
+                eq["atividade_atual"] = None
         anterior = (snapshots_anteriores or {}).get(team_key) or (snapshots_anteriores or {}).get(equipe_codigo) or next(
             (doc for key, doc in (snapshots_anteriores or {}).items() if normalize_team_key(key) == team_key), {}
         )

@@ -302,7 +302,7 @@ class LocalRotalogRunner:
         curr_status = str(curr_turno.get("status") or "").upper()
         if curr_status == "ABERTO" and prev_status != "ABERTO":
             reasons.append("turno_aberto")
-        if curr_status == "FECHADO" and prev_status != "FECHADO":
+        if curr_status == "FECHADO" and prev_status == "ABERTO":
             reasons.append("turno_fechado")
 
         prev_history = (previous.get("ordensServico") or {}).get("historico") or []

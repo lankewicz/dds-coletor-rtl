@@ -1,11 +1,13 @@
 import datetime
+import gzip
+import json
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
 from coletor.historico import (
-    RotalogEquipesScraper, RotalogEventosScraper, executar_coleta_historico_dia,
+    RotalogEquipesScraper, RotalogEventosScraper, deduplicar_eventos_consolidados, executar_coleta_historico_dia,
     estruturar_quilometragem_diaria, estruturar_resumo_equipes, varrer_mes,
 )
 from coletor.client import CrawlerRotalog
@@ -39,6 +41,34 @@ def row_equipe(veiculo="E3C02", contrato="4600026988"):
 
 
 class RelatorioMensalTests(unittest.TestCase):
+    def test_deduplica_fim_de_turno_repetido_sem_alterar_entrada(self):
+        rows = [
+            {"Veiculo": "E3K91", "Contrato": "4600025149", "Evento": "Fim de turno", "Data Evento": "21/09/26 02:10"},
+            {"Veiculo": "E3K91", "Contrato": "4600025149", "Evento": "Fim de turno", "Data Evento": "21/09/26 02:10"},
+            {"Veiculo": "E3K91", "Contrato": "4600025149", "Evento": "Fim de turno", "Data Evento": "21/09/26 02:11"},
+            {"Veiculo": "E3K91", "Contrato": "4600025149", "Evento": "Fim de turno", "Data Evento": "21/09/26 02:12"},
+            {"Veiculo": "E3389", "Contrato": "4600026988", "Evento": "Fim de turno", "Data Evento": "21/09/26 02:19"},
+        ]
+        original = [dict(row) for row in rows]
+        deduplicated, stats = deduplicar_eventos_consolidados(rows)
+        self.assertEqual(original, rows)
+        self.assertEqual(2, len(deduplicated))
+        self.assertEqual("21/09/26 02:10", deduplicated[0]["Data Evento"])
+        self.assertEqual(1, stats["duplicatasExatasRemovidas"])
+        self.assertEqual(2, stats["repeticoesTecnicasRemovidas"])
+        self.assertEqual(3, stats["totalRemovidos"])
+
+    def test_novo_inicio_libera_outro_fim_de_turno(self):
+        rows = [
+            {"Veiculo": "E3K91", "Contrato": "4600025149", "Evento": "Fim de turno", "Data Evento": "21/09/26 02:10"},
+            {"Veiculo": "E3K91", "Contrato": "4600025149", "Evento": "Fim de turno", "Data Evento": "21/09/26 02:40"},
+            {"Veiculo": "E3K91", "Contrato": "4600025149", "Evento": "Inicio de turno", "Data Evento": "21/09/26 09:00"},
+            {"Veiculo": "E3K91", "Contrato": "4600025149", "Evento": "Fim de turno", "Data Evento": "21/09/26 18:00"},
+        ]
+        deduplicated, stats = deduplicar_eventos_consolidados(rows)
+        self.assertEqual(["Fim de turno", "Inicio de turno", "Fim de turno"], [r["Evento"] for r in deduplicated])
+        self.assertEqual(1, stats["repeticoesTecnicasRemovidas"])
+
     def test_autenticacao_usa_interface_real_do_cliente(self):
         with patch("coletor.historico.CrawlerRotalog", autospec=CrawlerRotalog) as factory:
             scraper = RotalogEventosScraper()
@@ -136,6 +166,12 @@ class RelatorioMensalTests(unittest.TestCase):
             self.assertIn("15,50", html)
             self.assertIn("12,00", html)
             self.assertTrue(Path(result["localArquivoKm"]).exists())
+            raw_path = Path(result["localArquivoEventosBrutos"])
+            self.assertTrue(raw_path.exists())
+            with gzip.open(raw_path, "rt", encoding="utf-8") as stream:
+                raw = json.load(stream)
+            self.assertEqual(1, raw["totalRegistros"])
+            self.assertEqual("9876543210", raw["registros"][0]["Protocolo"])
 
     def test_envio_firebase_mensal_apos_geracao(self):
         with tempfile.TemporaryDirectory() as directory, patch(
@@ -154,6 +190,26 @@ class RelatorioMensalTests(unittest.TestCase):
             result_err = varrer_mes(2026, 8, Path(directory), "Empresa", True, store, coletar_diarios=False)
             self.assertEqual(result_err["status"], "error")
             self.assertEqual(result_err["erroUpload"], "offline")
+
+    def test_coleta_diaria_envia_bruto_e_consolidado_ao_firebase(self):
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "coletor.historico.RotalogEventosScraper"
+        ) as eventos_factory, patch("coletor.historico.RotalogEquipesScraper") as equipes_factory:
+            eventos_factory.return_value.raspar_periodo.return_value = [evento("4600026988", "10", "8")]
+            equipes_factory.return_value.raspar_dia.return_value = []
+            store = Mock(enabled=True, root_prefix="dados/empresa/rotalog")
+
+            result = executar_coleta_historico_dia(
+                datetime.date(2026, 9, 14), Path(directory), "Empresa", True, store,
+                atualizar_terminal=False,
+            )
+
+            self.assertEqual(2, store.save_blob.call_count)
+            paths = [call.args[0] for call in store.save_blob.call_args_list]
+            self.assertIn("dados/empresa/rotalog/eventos/diario/2026-09-14.json.gz", paths)
+            self.assertIn("dados/empresa/rotalog/quilometragem/diario/2026-09-14.json.gz", paths)
+            self.assertTrue(result["firebaseRawSynced"])
+            self.assertTrue(result["firebaseSynced"])
 
     def test_mes_vazio_informa_ausencia(self):
         with tempfile.TemporaryDirectory() as directory, patch(
@@ -192,6 +248,25 @@ class RelatorioMensalTests(unittest.TestCase):
         records = RotalogEquipesScraper._parse_rows(BeautifulSoup(html, "html.parser").div)
         self.assertEqual(records[0]["Veiculo"], "E3C02")
         self.assertEqual(records[0]["Recuperados por Parecer (km)"], "17,78")
+
+    def test_parser_detalhe_separa_registro_e_nome_dos_eletricistas(self):
+        from bs4 import BeautifulSoup
+        html = """
+        <div>
+          <div>Eletricista 1: 354291 - ROBERT RENAN DA SILVA CARLESSO</div>
+          <div>Eletricista 2: 392267 - MARCIO LUIZ GOMES</div>
+        </div>
+        """
+        details = RotalogEquipesScraper._parse_electricians(BeautifulSoup(html, "html.parser"))
+        self.assertEqual("354291", details["Eletricista 1 Registro"])
+        self.assertEqual("ROBERT RENAN DA SILVA CARLESSO", details["Eletricista 1 Nome"])
+        self.assertEqual("392267", details["Eletricista 2 Registro"])
+        self.assertEqual("MARCIO LUIZ GOMES", details["Eletricista 2 Nome"])
+
+        resumo = estruturar_resumo_equipes([{**row_equipe(), **details}])
+        registro = resumo["registros"][0]
+        self.assertEqual("354291", registro["eletricista1Registro"])
+        self.assertEqual("ROBERT RENAN DA SILVA CARLESSO", registro["eletricista1Nome"])
 
 
 if __name__ == "__main__":

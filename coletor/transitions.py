@@ -198,7 +198,7 @@ def summarize_team_transition(
 
     if curr_turno_status == "ABERTO" and prev_turno_status != "ABERTO":
         return "Início de Turno"
-    if curr_turno_status == "FECHADO" and prev_turno_status != "FECHADO":
+    if curr_turno_status == "FECHADO" and prev_turno_status == "ABERTO":
         return "Fim de Turno"
 
     # Intervalo

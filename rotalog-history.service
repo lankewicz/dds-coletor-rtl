@@ -1,0 +1,16 @@
+[Unit]
+Description=DDS Rotalog - Coleta historica diaria do dia anterior
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=orangepi
+Group=orangepi
+WorkingDirectory=/home/orangepi/dds-coletor-rtl
+EnvironmentFile=/home/orangepi/dds-coletor-rtl/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/orangepi/dds-coletor-rtl/.venv-3.14/bin/python main.py --historico ontem --firebase --output-dir /home/orangepi/dds-coletor-rtl/dados-local
+TimeoutStartSec=4h
+Nice=5
+
