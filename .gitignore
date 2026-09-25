@@ -8,3 +8,5 @@ __pycache__/
 serviceAccountKey.json
 firebase_config.json
 dados-local/
+v2/dados-local/
+v2/.env
