@@ -3,10 +3,51 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 
 
 _AUTOTRACK_SUFFIX = re.compile(r"\s*\(\s*\d+\s*\)\s*$")
 _REGIONAL_PREFIXES = ("CA", "CB", "LO", "MA", "PG")
+
+
+def member_signature(value: object) -> str:
+    """Cria uma assinatura estável e independente da ordem dos integrantes."""
+    text = unicodedata.normalize("NFKD", str(value or "").upper())
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    tokens = [token for token in re.sub(r"[^A-Z0-9\s]", " ", text).split() if len(token) >= 3]
+    return "|".join(sorted(set(tokens)))
+
+
+def build_identifier_map(snapshots: dict | None) -> dict[str, str]:
+    """Extrai aliases observados sem transformar o veículo em identidade histórica."""
+    aliases: dict[str, str] = {}
+    ambiguous: set[str] = set()
+
+    def add(alias: str, team_key: str) -> None:
+        alias = str(alias or "").strip().upper()
+        if not alias or not valid_team_key(team_key):
+            return
+        team_key = normalize_team_key(team_key)
+        if alias in aliases and aliases[alias] != team_key:
+            ambiguous.add(alias)
+        else:
+            aliases[alias] = team_key
+
+    for source_key, document in (snapshots or {}).items():
+        if not isinstance(document, dict):
+            continue
+        team_key = normalize_team_key(document.get("teamKey") or document.get("equipe") or source_key)
+        conexao = document.get("conexao") if isinstance(document.get("conexao"), dict) else {}
+        device = document.get("veiculo") or conexao.get("veiculo") or document.get("identificadorEquipamento")
+        members = document.get("colaborador") or conexao.get("colaborador")
+        add(str(device or ""), team_key)
+        signature = member_signature(members)
+        if signature:
+            add(f"MEMBER_SET:{signature}", team_key)
+
+    for alias in ambiguous:
+        aliases.pop(alias, None)
+    return aliases
 
 
 def normalize_team_key(value: object) -> str:
@@ -89,6 +130,12 @@ def resolve_team_group(
         return resolved
 
     if member:
+        signature_team = lookup.get(f"MEMBER_SET:{member_signature(member)}")
+        if valid_team_key(signature_team):
+            resolved["equipe_codigo"] = signature_team
+            resolved["origem_resolucao"] = "INTEGRANTES_EXATOS"
+            return resolved
+
         tokens = [token for token in re.sub(r"[^A-Z0-9\s]", "", member).split() if len(token) >= 3]
         candidates: dict[str, int] = {}
         for key, team_code in lookup.items():

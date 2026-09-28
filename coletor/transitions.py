@@ -177,7 +177,30 @@ def summarize_team_transition(
     """Gera um resumo legível e específico da transição operacional da equipe."""
     reasons = set(sync_reasons or [])
     if "servico_concluido" in reasons:
-        return "Execução --> Conclusão"
+        prev_history = ((previous or {}).get("ordensServico") or {}).get("historico") or []
+        curr_history = (current.get("ordensServico") or {}).get("historico") or []
+        previous_ids = {
+            str(service.get("serviceId") or "").strip()
+            or (
+                str(service.get("protocolo") or "").strip(),
+                str(service.get("inicioDeslocamento") or service.get("inicioExecucao") or "").strip(),
+            )
+            for service in prev_history
+            if isinstance(service, dict)
+        }
+        for service in reversed(curr_history):
+            if not isinstance(service, dict) or service.get("statusAtual") != "CONCLUSAO":
+                continue
+            service_id = str(service.get("serviceId") or "").strip()
+            identity = service_id or (
+                str(service.get("protocolo") or "").strip(),
+                str(service.get("inicioDeslocamento") or service.get("inicioExecucao") or "").strip(),
+            )
+            if identity in previous_ids:
+                continue
+            protocol = str(service.get("protocolo") or service.get("ssId") or "").strip()
+            return f"{protocol}: Concluído" if protocol else "OS concluída"
+        return "OS concluída"
     if "correcao_servico_concluido" in reasons:
         return _summarize_history_correction(previous, current)
     if "turno_aberto" in reasons:

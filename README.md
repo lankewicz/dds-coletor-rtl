@@ -106,7 +106,7 @@ dds-coletor-rtl/
 
 ---
 
-## Atualização remota por versão Git
+## Heartbeat e saúde dos equipamentos
 
 O agente atualiza o heartbeat e a saúde no arquivo local a cada 120 segundos. No
 Firebase, publica a cada 30 minutos entre 07h e 20h e a cada 2 horas fora desse
@@ -117,38 +117,14 @@ confirmado do índice, é enviado como informação operacional (`lastIndexUploa
 mas não substitui o heartbeat. A verificação local não consulta o Firebase.
 Configure `FLEET_DATA_DIR` se o coletor usar um `--output-dir` diferente de
 `dados-local`. Falhas de upload e ciclos sem mudanças não renovam o recibo.
-Resultados de deploy são imediatos.
-Por padrão, `FLEET_COMMANDS_ENABLED=false`: o agente publica somente heartbeat e
-não lista nem executa comandos de deploy. Defina `true` explicitamente para reativar.
+O agente publica somente heartbeat e não lista nem executa comandos de deploy.
+O deploy remoto permanece desabilitado mesmo que uma configuração antiga ainda
+contenha `FLEET_COMMANDS_ENABLED=true`.
 No Windows, a descoberta consulta também o índice remoto identificado pelo publicador,
 com tolerância de 45 minutos no pico e 2h30 fora dele. Isso indica comunicação
-recente, não garante saúde do coletor. As consultas de comandos ainda usam Firebase.
-No computador Windows, a CLI conta os equipamentos ativos, publica a solicitação de
-deploy e acompanha o resultado.
-
-```powershell
-# Envia a branch atual ao Git e instala o commit enviado nos Orange Pis ativos
-python fleet --update
-
-# Instala exatamente uma versão que já existe no Git remoto
-python fleet --version 8f93d814e5
-
-# Apenas consulta equipamentos e versões ativas
-python fleet --status
-```
-
-`--update` não cria commits automaticamente e recusa um repositório com alterações
-locais. Isso impede que arquivos ainda não revisados sejam enviados por engano. As
-duas formas resolvem o hash curto para o SHA completo e só aceitam commits disponíveis
-em uma branch do remoto configurado.
-
-Para limitar a operação e controlar a espera:
-
-```powershell
-python fleet --version 8f93d814e5 --node orange-01
-python fleet --update --timeout 1200
-python fleet --update --no-wait
-```
+recente, não garante saúde do coletor. A CLI `python fleet --status` continua disponível
+para consultar equipamentos e versões, mas solicitações de atualização não são
+processadas pelos agentes.
 
 ### Instalação inicial no Orange Pi
 
@@ -158,26 +134,17 @@ Adicione ao `.env` de cada equipamento uma identidade exclusiva:
 FLEET_NODE_ID=orange-01
 ```
 
-Instale as unidades fornecidas e a regra restrita de `sudo`:
+Instale as unidades fornecidas:
 
 ```bash
 sudo install -m 0644 fleet-agent.service /etc/systemd/system/fleet-agent.service
 sudo install -m 0644 fleet-agent.timer /etc/systemd/system/fleet-agent.timer
-sudo install -m 0440 fleet-agent.sudoers /etc/sudoers.d/dds-fleet-agent
-sudo visudo -cf /etc/sudoers.d/dds-fleet-agent
 sudo systemctl daemon-reload
 sudo systemctl enable --now fleet-agent.timer
 ```
 
-O agente prepara o commit em uma worktree temporária, compila o Python, executa os
-testes disponíveis e instala dependências antes de interromper o coletor. A troca usa
-um checkout destacado do SHA exato. Se o serviço não permanecer ativo, o agente volta
-automaticamente ao commit anterior.
-
-O usuário `orangepi` recebe permissão apenas para iniciar, parar, reiniciar e consultar
-`rotalog.service`; o agente não aceita comandos de shell vindos do Firebase. Para uma
-separação completa, use credenciais IAM distintas: o Windows cria comandos; o Orange
-apenas lê comandos, publica heartbeat e grava resultados.
+O agente não requer permissão para iniciar, parar ou reiniciar `rotalog.service`; ele
+apenas consulta o estado do serviço para compor a informação de saúde do heartbeat.
 
 ---
 
@@ -264,6 +231,11 @@ python main.py --historico 2026-09-12 --firebase
 O timer persistente coleta automaticamente o dia anterior às 05:30 no fuso
 `America/Sao_Paulo`. Se o Orange Pi estiver desligado nesse horário, o systemd
 executa a coleta pendente quando o equipamento voltar.
+
+Na mesma execução, os registros e nomes completos retornados pela tela de
+equipes enriquecem o cadastro permanente `rotalog/equipes/team-registry.json`.
+O arquivo compactado remoto do cadastro é sincronizado pelo próximo ciclo do
+coletor somente quando seu conteúdo tiver mudado.
 
 ```bash
 sudo install -m 0644 rotalog-history.service /etc/systemd/system/rotalog-history.service

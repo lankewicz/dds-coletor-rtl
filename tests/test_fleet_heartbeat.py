@@ -81,10 +81,10 @@ class HeartbeatTests(unittest.TestCase):
         self.assertEqual("healthy", health["overall"])
         self.assertEqual([], health["issues"])
 
-    @patch.dict("os.environ", {}, clear=False)
+    @patch.dict("os.environ", {"FLEET_COMMANDS_ENABLED": "true"}, clear=False)
     @patch("fleet_agent.FleetStore.from_environment")
     @patch("fleet_agent.publish_heartbeat")
-    def test_commands_are_paused_by_default(self, heartbeat, store_factory):
+    def test_deploy_commands_remain_disabled_even_if_environment_enables_them(self, heartbeat, store_factory):
         store = store_factory.return_value
 
         self.assertEqual(0, fleet_agent.run_once())

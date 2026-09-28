@@ -116,6 +116,70 @@ class LocalSnapshotStore:
         return list(dict.fromkeys(reasons))
 
     @staticmethod
+    def _estado_consolidado(team: dict[str, Any]) -> str:
+        shift_status = (team.get("shift") or {}).get("status")
+        if shift_status == "FECHADO":
+            return "FECHADO"
+        if team.get("state") == "BREAK":
+            return "INTERVALO"
+        if shift_status == "ABERTO":
+            return "ABERTO"
+        return "DESCONHECIDO"
+
+    @staticmethod
+    def _duracao_minutos(start: Any, end: Any) -> int | None:
+        if not start or not end:
+            return None
+        try:
+            from datetime import datetime
+            return max(0, int((datetime.fromisoformat(str(end)) - datetime.fromisoformat(str(start))).total_seconds() // 60))
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _jornada(cls, team: dict[str, Any]) -> dict[str, Any]:
+        shift = team.get("shift") or {}
+        return {
+            "turno": {
+                "status": shift.get("status", "DESCONHECIDO"),
+                "inicio": shift.get("openedAt"),
+                "fim": shift.get("closedAt"),
+                "duracaoMinutos": cls._duracao_minutos(shift.get("openedAt"), shift.get("closedAt")),
+                "fonteAbertura": shift.get("fonteAbertura"),
+                "fonteFechamento": shift.get("fonteFechamento"),
+                "fechamentoPendente": shift.get("fechamentoPendente"),
+                "atualizacoesTurno": shift.get("atualizacoesTurno") or [],
+            },
+            "emIntervalo": team.get("state") == "BREAK",
+        }
+
+    @staticmethod
+    def _ordem_servico(service: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not service:
+            return None
+        status = {
+            "IN_TRANSIT": "DESLOCAMENTO",
+            "IN_PROGRESS": "EXECUCAO",
+            "COMPLETED": "CONCLUSAO",
+        }.get(service.get("status"), service.get("status"))
+        return {
+            "protocolo": service.get("protocol"),
+            "protocoloBruto": service.get("rawProtocol") or service.get("rawContent"),
+            "categoria": service.get("category"),
+            "tipo": service.get("serviceType"),
+            "statusAtual": status,
+            "sequencia": service.get("sequence"),
+            "inicioDeslocamento": service.get("dispatchStart") or service.get("startAt"),
+            "inicioExecucao": service.get("executionStart"),
+            "fimExecucao": service.get("executionEnd") or service.get("endAt"),
+            "retorno": service.get("returnTime"),
+            "latitude": service.get("latitude"),
+            "longitude": service.get("longitude"),
+            "fonteProtocolo": service.get("source"),
+            "eventIdx": service.get("eventIndex"),
+        }
+
+    @staticmethod
     def _control_tower(snapshot: dict[str, Any]) -> dict[str, Any]:
         teams = {}
         global_completed = 0
@@ -151,6 +215,12 @@ class LocalSnapshotStore:
                 "state": team.get("state"),
                 "shift": shift,
                 "currentActivity": team.get("currentActivity"),
+                "estadoConsolidado": LocalSnapshotStore._estado_consolidado(team),
+                "jornada": LocalSnapshotStore._jornada(team),
+                "ordensServico": {
+                    "atual": LocalSnapshotStore._ordem_servico(team.get("currentActivity")),
+                    "totalConcluidos": completed_count,
+                },
                 "shiftServices": {
                     "completed": completed_count,
                     "active": active_count,
@@ -219,6 +289,15 @@ class LocalSnapshotStore:
                 "source": snapshot.get("source"),
                 "teamKey": team_key,
                 "team": team,
+                "estadoConsolidado": self._estado_consolidado(team),
+                "jornada": self._jornada(team),
+                "ordensServico": {
+                    "atual": self._ordem_servico(team.get("currentActivity")),
+                    "historico": [
+                        self._ordem_servico(service)
+                        for service in (team.get("completedServices") or [])
+                    ],
+                },
                 "writeReasons": reasons,
                 "eventCount": len(team_events),
                 "events": team_events,
@@ -339,6 +418,12 @@ class LocalSnapshotStore:
         counts["completed"] = len(new_team["completedServices"])
         new_team["counts"] = counts
         current["team"] = new_team
+        current["estadoConsolidado"] = cls._estado_consolidado(new_team)
+        current["jornada"] = cls._jornada(new_team)
+        current["ordensServico"] = {
+            "atual": cls._ordem_servico(new_team.get("currentActivity")),
+            "historico": [cls._ordem_servico(service) for service in new_team["completedServices"]],
+        }
 
         merged_queue: dict[tuple[Any, ...], dict[str, Any]] = {}
         queue_order: list[tuple[Any, ...]] = []

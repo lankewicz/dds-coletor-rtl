@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from main import LocalRotalogRunner
+from coletor.storage import write_json
 
 
 class IndexSyncTests(unittest.TestCase):
@@ -62,6 +63,36 @@ class IndexSyncTests(unittest.TestCase):
         self.assertEqual(self.runner._sync_index(self.teams, "08:00"), "disabled")
         self.assertFalse(self.runner.index_sync_path.exists())
         self.store.save.assert_not_called()
+
+    def test_executed_today_scans_history_once_and_deduplicates(self):
+        calendar_day = "2026-09-25"
+        previous_day = self.root / "rotalog" / "equipes" / "daily" / "2026-09-24"
+        current_day = self.root / "rotalog" / "equipes" / "daily" / calendar_day
+        repeated_service = {
+            "serviceId": "service-1",
+            "statusAtual": "CONCLUSAO",
+            "retorno": f"{calendar_day}T10:00:00-03:00",
+            "categoria": "COMERCIAL",
+        }
+        emergency_service = {
+            "serviceId": "service-2",
+            "statusAtual": "CONCLUSAO",
+            "fimExecucao": f"{calendar_day}T11:00:00-03:00",
+            "categoria": "EMERGENCIA",
+        }
+        write_json(previous_day / "E3733.json", {"services": [repeated_service]})
+        write_json(current_day / "E3733.json.gz", {
+            "services": [repeated_service, emergency_service],
+        })
+        write_json(current_day / "E9999.json", {"services": [emergency_service]})
+
+        original_glob = Path.glob
+        with patch("main.Path.glob", autospec=True) as glob:
+            glob.side_effect = lambda path, pattern: original_glob(path, pattern)
+            counts = self.runner._executed_today_by_team(["E3733"], calendar_day)
+
+        self.assertEqual(counts["E3733"], {"comercial": 1, "emergencia": 1})
+        glob.assert_called_once_with(self.root / "rotalog" / "equipes" / "daily", "*/*")
 
     def test_identical_scrapes_skip_second_upload(self):
         team = {"equipe_codigo": "E3733", "is_online": True}

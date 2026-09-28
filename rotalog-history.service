@@ -1,5 +1,5 @@
 [Unit]
-Description=DDS Rotalog - Coleta historica diaria do dia anterior
+Description=DDS Rotalog - Historico D-1 e cadastro permanente de equipes/profissionais
 After=network-online.target
 Wants=network-online.target
 
@@ -13,4 +13,3 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/orangepi/dds-coletor-rtl/.venv-3.14/bin/python main.py --historico ontem --firebase --output-dir /home/orangepi/dds-coletor-rtl/dados-local
 TimeoutStartSec=4h
 Nice=5
-

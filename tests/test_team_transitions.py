@@ -68,7 +68,7 @@ class TeamTransitionsTests(unittest.TestCase):
         # Com sync_reasons
         self.assertEqual(
             summarize_team_transition(doc_v2_exec, doc_v2_exec, sync_reasons=["servico_concluido"]),
-            "Execução --> Conclusão",
+            "OS concluída",
         )
         self.assertEqual(
             summarize_team_transition(doc_v2_exec, doc_v2_exec, sync_reasons=["correcao_servico_concluido"]),
@@ -132,6 +132,28 @@ class TeamTransitionsTests(unittest.TestCase):
         self.assertEqual(
             summarize_team_transition(None, doc_v2_exec, sync_reasons=["turno_aberto"]),
             "Início de Turno",
+        )
+
+    def test_completed_service_summary_includes_protocol(self):
+        previous = {"ordensServico": {"historico": []}}
+        completed = {
+            "ordensServico": {
+                "historico": [{
+                    "serviceId": "E3733_service-1",
+                    "statusAtual": "CONCLUSAO",
+                    "protocolo": "50912345",
+                }],
+            },
+        }
+        self.assertEqual(
+            summarize_team_transition(previous, completed, sync_reasons=["servico_concluido"]),
+            "50912345: Concluído",
+        )
+
+        completed["ordensServico"]["historico"][0].pop("protocolo")
+        self.assertEqual(
+            summarize_team_transition(previous, completed, sync_reasons=["servico_concluido"]),
+            "OS concluída",
         )
 
     def test_format_columns_fixed_width(self):

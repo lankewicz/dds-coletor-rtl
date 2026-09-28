@@ -92,6 +92,22 @@ intervalos somente quando a situação muda: `BUSY`, `WAITING_WITH_QUEUE`,
 observação, protocolo atual e composição da fila. Nos eventos de gravação, o histórico
 da equipe também é incorporado ao seu documento individual.
 
+## Consolidação de turno
+
+A nomenclatura publicada segue a V1: `estadoConsolidado` usa `ABERTO`,
+`INTERVALO`, `FECHADO` ou `DESCONHECIDO`; `jornada.turno` contém `inicio`,
+`fim`, `duracaoMinutos` e as fontes usadas; e `ordensServico` publica os estados
+`DESLOCAMENTO`, `EXECUCAO` e `CONCLUSAO`. Os campos detalhados nativos da v2
+continuam no mesmo documento para auditoria.
+
+Marcadores `T` não alternam o turno automaticamente. Em uma sequência de abertura,
+vale o último sinal. Sinais enviados durante um turno aberto são registrados em
+`atualizacoesTurno`. Sem marcador, o primeiro início de deslocamento abre o turno.
+Depois do último serviço, o primeiro sinal posterior — ou o horário de retorno, se não
+houver sinal — cria `fechamentoPendente`; o fechamento só é confirmado na coleta
+seguinte se nenhuma atividade nova tiver aparecido. Um turno pode atravessar a
+meia-noite e não é encerrado por limite fixo de duração.
+
 ## Testes
 
 ```powershell

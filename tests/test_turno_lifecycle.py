@@ -374,8 +374,8 @@ class TestTurnoLifecycle(unittest.TestCase):
         self.assertEqual(len(merged_21["ordensServico"]["historico"]), 1)
         self.assertEqual(merged_21["ordensServico"]["historico"][0]["protocolo"], "20261234567890")
 
-    def test_turnos_recentes_no_index_janela_48h(self):
-        """compactar_equipe_para_index preserva os turnos recentes na jornada para a torre de controle."""
+    def test_tower_keeps_only_current_shift_and_service(self):
+        """A torre não transporta históricos que já estão nos arquivos locais/individuais."""
         from coletor.storage import compactar_equipe_para_index
 
         doc = {
@@ -398,11 +398,10 @@ class TestTurnoLifecycle(unittest.TestCase):
         }
 
         compacted = compactar_equipe_para_index(doc)
-        self.assertIn("turnosRecentes", compacted["jornada"])
-        self.assertEqual(len(compacted["jornada"]["turnosRecentes"]), 2)
-        self.assertTrue(compacted["jornada"]["artigo66"]["cumprido"])
+        self.assertNotIn("turnosRecentes", compacted["jornada"])
+        self.assertNotIn("artigo66", compacted["jornada"])
         self.assertIsNone(compacted["ordensServico"]["atual"])
-        self.assertEqual(compacted["ordensServico"]["totalConcluidos"], 2)
+        self.assertNotIn("totalConcluidos", compacted["ordensServico"])
 
 
 if __name__ == "__main__":

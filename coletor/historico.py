@@ -33,6 +33,7 @@ from coletor.parser import formatar_protocolo_copel
 from coletor.relatorio import gerar_relatorio_diario, gerar_relatorio_mensal
 from coletor.equipes import normalize_team_key
 from coletor.storage import company_key, load_json, write_json
+from coletor.team_registry import TeamRegistry
 
 LOG = logging.getLogger("coletor-historico")
 TZ = ZoneInfo(os.getenv("DDS_TIMEZONE", "America/Sao_Paulo"))
@@ -555,8 +556,6 @@ class RotalogEquipesScraper:
 
         component = searched_soup.find(id="form:tbEquipes")
         records = self._parse_rows(component) if component else []
-        if enriquecer_detalhes:
-            current_state = self._enrich_team_details(records, current_state)
         total_pages = math.ceil(row_count / page_size) if row_count else 1
         LOG.debug("Equipes encontradas: %d linhas em %d páginas", row_count, total_pages)
 
@@ -594,8 +593,6 @@ class RotalogEquipesScraper:
                 current_state = vs_update.get_text().strip()
             if update:
                 page_rows = self._parse_rows(BeautifulSoup(update.get_text(), "html.parser"))
-                if enriquecer_detalhes:
-                    current_state = self._enrich_team_details(page_rows, current_state)
                 records.extend(page_rows)
 
             if progresso:
@@ -608,6 +605,12 @@ class RotalogEquipesScraper:
                     f"KM Inf: {formatar_numero_br(cur_km_inf, 2)} | "
                     f"KM Aut: {formatar_numero_br(cur_km_aut, 2)}"
                 )
+
+        # Os detalhes usam o mesmo ViewState da tabela. Abrir cada equipe durante a
+        # paginação invalida as requisições das páginas seguintes; por isso a lista
+        # completa é carregada primeiro e somente então os detalhes são consultados.
+        if enriquecer_detalhes:
+            self._enrich_team_details(records, current_state)
 
         LOG.debug("Fechamentos de equipes obtidos: %d registros em %d páginas", len(records), total_pages)
         return records
@@ -786,6 +789,53 @@ def estruturar_resumo_equipes(
     }
 
 
+def enriquecer_cadastro_permanente_equipes(
+    output_dir: Path,
+    records: list[dict[str, typing.Any]],
+    day_iso: str,
+) -> dict[str, int]:
+    """Incorpora todas as equipes da página, independentemente do contrato."""
+    registry = TeamRegistry(output_dir / "rotalog" / "equipes" / "team-registry.json")
+    enriched_teams: set[str] = set()
+    registrations: set[str] = set()
+    for row in records:
+        vehicle = normalize_team_key(row.get("Veiculo") or row.get("Veículo"))
+        if not vehicle:
+            continue
+        shift_reference = str(
+            row.get("Data Referencia - Turno") or row.get("Data Referência - Turno") or ""
+        )
+        shift_match = re.search(r"(\d{2}/\d{2}/\d{4}).*?(\d{2}:\d{2})", shift_reference)
+        observed_at = f"{day_iso}T12:00:00-03:00"
+        if shift_match:
+            try:
+                shift_dt = datetime.datetime.strptime(
+                    f"{shift_match.group(1)} {shift_match.group(2)}", "%d/%m/%Y %H:%M"
+                ).replace(tzinfo=TZ)
+                observed_at = shift_dt.isoformat()
+            except ValueError:
+                pass
+
+        professionals = []
+        for number in (1, 2):
+            registration, full_name, _ = _electrician_identity(row, number)
+            if registration or full_name:
+                professionals.append({"registration": registration, "fullName": full_name})
+                if registration:
+                    registrations.add(registration)
+        team_id = registry.enrich_professionals(
+            vehicle, professionals, observed_at, shift_reference,
+        )
+        if team_id:
+            enriched_teams.add(team_id)
+    registry.save()
+    return {
+        "sourceRows": len(records),
+        "teamsEnriched": len(enriched_teams),
+        "professionalsIdentified": len(registrations),
+    }
+
+
 def estruturar_quilometragem_diaria(
     eventos_records: list[dict[str, typing.Any]],
     target_day: str,
@@ -943,6 +993,10 @@ def executar_coleta_historico_dia(
         eventos, target_day=day_iso, empresa=empresa, equipes_records=equipes,
     )
 
+    identity_enrichment = enriquecer_cadastro_permanente_equipes(
+        output_dir, equipes, day_iso,
+    )
+
     # 2. Salva localmente em dados-local/rotalog/quilometragem/diario/AAAA-MM-DD.json.gz
     dir_km_local = output_dir / "rotalog" / "quilometragem" / "diario"
     local_km_path = dir_km_local / f"{day_iso}.json.gz"
@@ -1011,6 +1065,7 @@ def executar_coleta_historico_dia(
         "localArquivoEventosBrutos": str(raw_path),
         "localRelatorioHtml": str(relatorio_diario_path),
         "firebaseSynced": firebase_synced,
+        "identityEnrichment": identity_enrichment,
         "firebaseRawSynced": firebase_raw_synced,
         "firebaseUploaded": firebase_uploaded,
         "firebaseRawUploaded": firebase_raw_uploaded,

@@ -114,6 +114,9 @@ def build_rotalog_document(
         "empresa": empresa,
         "equipe": team_key,
         "teamKey": team_key,
+        "teamId": eq.get("team_id") or eq.get("teamId"),
+        "membersKey": eq.get("members_key") or eq.get("membersKey"),
+        "identitySource": eq.get("identity_source") or eq.get("identitySource"),
         "groupRaw": eq.get("group_raw") or "",
         "veiculo": eq.get("veiculo") or "",
         "identificadorEquipamento": eq.get("identificador_equipamento"),
@@ -139,12 +142,12 @@ def build_rotalog_document(
     }
 
 
-def compactar_equipe_para_index(document: dict[str, typing.Any]) -> dict[str, typing.Any]:
-    """Gera a versão compacta da equipe para o index.json (tempo real / torre de controle).
-
-    Remove o array pesado de histórico, mantendo apenas o serviço atual (se em turno aberto),
-    os turnos recentes (janela de 48h) e contadores resumidos para acompanhamento operacional.
-    """
+def compactar_equipe_para_index(
+    document: dict[str, typing.Any],
+    current: dict[str, typing.Any] | None = None,
+    calendar_day: str | None = None,
+) -> dict[str, typing.Any]:
+    """Projeta somente o estado atual e os contadores rápidos usados pela torre."""
     jornada = document.get("jornada") or {}
     turno = jornada.get("turno") or {}
     turno_status = str(turno.get("status") or "").upper()
@@ -157,50 +160,45 @@ def compactar_equipe_para_index(document: dict[str, typing.Any]) -> dict[str, ty
     if turno_status == "FECHADO":
         servico_atual = None
 
-    ult_concluido = historico[-1] if historico else None
-    ult_hora = (
-        ult_concluido.get("retorno")
-        or ult_concluido.get("fimExecucao")
-        or ult_concluido.get("inicioExecucao")
-    ) if ult_concluido else None
+    current = current or {}
+    target_day = calendar_day or str(document.get("updatedAt") or document.get("date") or "")[:10]
+    executados = dict(document.get("executadosHoje") or {"comercial": 0, "emergencia": 0})
+    for service in historico:
+        if not isinstance(service, dict) or service.get("statusAtual") != "CONCLUSAO":
+            continue
+        completed_at = (
+            service.get("retorno") or service.get("fimExecucao")
+            or service.get("concluidoEm") or service.get("fimIso")
+        )
+        if target_day and str(completed_at or "")[:10] != target_day:
+            continue
+        category = str(service.get("categoria") or "").upper()
+        key = "emergencia" if category == "EMERGENCIA" else "comercial"
+        executados[key] += 1
 
-    turnos_base = (
-        jornada.get("turnos")
-        or jornada.get("turnosRecentes")
-        or ([turno] if (turno.get("inicio") or turno.get("fim")) else [])
-    )
-    turnos_recentes = turnos_base[-3:] if len(turnos_base) > 3 else turnos_base
+    fila = dict(document.get("fila") or {"comercial": 0, "emergencia": 0})
+    if current:
+        fila = {
+            "comercial": int(current.get("ssPendentesComercialCount") or 0),
+            "emergencia": int(current.get("ssPendentesEmergenciaCount") or 0),
+        }
 
     return {
         "schemaVersion": document.get("schemaVersion", 2),
         "teamKey": document.get("teamKey"),
-        "date": document.get("date"),
+        "teamId": document.get("teamId"),
+        "operationalDate": document.get("operationalDate") or document.get("date"),
         "updatedAt": document.get("updatedAt"),
         "timezone": document.get("timezone", "America/Sao_Paulo"),
         "version": document.get("version", 1),
         "conexao": document.get("conexao") or {},
         "jornada": {
             "turno": turno,
-            "turnosRecentes": turnos_recentes,
-            "artigo66": jornada.get("artigo66"),
             "emIntervalo": bool(jornada.get("emIntervalo")),
-            "totalIntervalos": (
-                len(jornada.get("intervalos") or [])
-                if "intervalos" in jornada
-                else jornada.get("totalIntervalos", 0)
-            ),
         },
         "ordensServico": {
             "atual": servico_atual,
-            "totalConcluidos": (
-                len(historico)
-                if "historico" in os_section
-                else os_section.get("totalConcluidos", 0)
-            ),
-            "historicoUpdatedAt": (
-                ult_hora
-                if "historico" in os_section
-                else os_section.get("historicoUpdatedAt")
-            ),
         },
+        "executadosHoje": executados,
+        "fila": fila,
     }

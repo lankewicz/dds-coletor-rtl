@@ -21,7 +21,7 @@ from bs4 import BeautifulSoup
 import requests
 
 from .client import CrawlerRotalog, URL_BASE, URL_TEMPO_REAL
-from .equipes import normalize_team_key, resolve_team_group, valid_team_key
+from .equipes import member_signature, normalize_team_key, resolve_team_group, valid_team_key
 
 # Nome mantido para compatibilidade com chamadas existentes.
 resolver_equipe_group = resolve_team_group
@@ -898,6 +898,7 @@ def extrair_dados_tempo_real(
     max_tentativas: int = 3,
     identificador_para_equipe: dict[str, str] | None = None,
     snapshots_anteriores: dict[str, dict[str, typing.Any]] | None = None,
+    unresolved_groups: list[dict[str, typing.Any]] | None = None,
 ) -> list[dict[str, typing.Any]]:
     """Extrai e estrutura os dados do /paginas/tempoReal do ROTALOG Copel."""
     if crawler is None:
@@ -954,6 +955,30 @@ def extrair_dados_tempo_real(
 
     servicos_ignorados = carregar_servicos_ignorados()
 
+    # O próprio ROTALOG pode corrigir o prefixo durante a coleta. Aprendemos primeiro
+    # apenas relações explícitas presentes nesta mesma página e depois resolvemos as
+    # linhas transitórias (ex.: veiculo?-MA968 FELIPE ELIAS).
+    lookup_atual = dict(identificador_para_equipe or {})
+    aliases_pagina: dict[str, set[str]] = {}
+    for raw in raw_items:
+        parsed = parse_group_string(raw["group"])
+        explicit = normalize_team_key(parsed.get("equipe_codigo"))
+        if not valid_team_key(explicit):
+            continue
+        device = str(parsed.get("veiculo") or "").strip().upper()
+        if device:
+            aliases_pagina.setdefault(device, set()).add(explicit)
+        signature = member_signature(parsed.get("colaborador"))
+        if signature:
+            aliases_pagina.setdefault(f"MEMBER_SET:{signature}", set()).add(explicit)
+    for alias, candidates in aliases_pagina.items():
+        if len(candidates) == 1:
+            # A observação explícita atual prevalece sobre relações antigas. Isso
+            # permite a transferência permanente de um veículo sem usar o alias velho.
+            lookup_atual[alias] = next(iter(candidates))
+        else:
+            lookup_atual.pop(alias, None)
+
     for item in raw_items:
         cls = item["className"]
         cnt = item["content"]
@@ -963,9 +988,19 @@ def extrair_dados_tempo_real(
         group_raw = item["group"]
         if group_raw not in equipas_map:
             meta = resolver_equipe_group(
-                parse_group_string(group_raw), identificador_para_equipe
+                parse_group_string(group_raw), lookup_atual
             )
             if not equipe_codigo_valido(meta["equipe_codigo"]):
+                if unresolved_groups is not None and not any(
+                    item.get("groupRaw") == group_raw for item in unresolved_groups
+                ):
+                    unresolved_groups.append({
+                        "groupRaw": group_raw,
+                        "vehicleIdentifier": meta.get("identificador_equipamento") or meta.get("veiculo") or "",
+                        "membersDisplay": meta.get("colaborador") or "",
+                        "membersKey": member_signature(meta.get("colaborador")),
+                        "reason": meta.get("origem_resolucao") or "NAO_RELACIONADO",
+                    })
                 continue
             equipas_map[group_raw] = {
                 "group_raw": group_raw,

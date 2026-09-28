@@ -26,7 +26,7 @@ load_dotenv(ROOT / ".env")
 
 from coletor.logs import record_execution_log
 from coletor.led import ProcessingLed, list_system_leds
-from coletor.equipes import canonicalize_team_snapshots, normalize_team_key
+from coletor.equipes import build_identifier_map, canonicalize_team_snapshots, normalize_team_key
 from coletor.historico import (
     atualizar_status_terminal,
     executar_coleta_historico_dia,
@@ -38,6 +38,7 @@ from coletor.historico import (
     varrer_mes_anterior,
 )
 from coletor.parser import extrair_dados_tempo_real
+from coletor.team_registry import TeamRegistry
 from coletor.storage import (
     RotalogExecutionLog,
     RotalogGcsSnapshotStore,
@@ -123,6 +124,10 @@ class LocalRotalogRunner:
         self.daily_sync_receipts_path = (
             output_dir / "rotalog" / "sync" / self.company_key / "daily-receipts.json.gz"
         )
+        self.team_registry = TeamRegistry(
+            output_dir / "rotalog" / "equipes" / "team-registry.json"
+        )
+        self.team_registry_sync_path = output_dir / "rotalog" / "sync" / self.company_key / "team-registry-receipt.json"
         self.enable_firebase = enable_firebase
         self.firebase_store = None
         self.team_repo = None
@@ -133,12 +138,149 @@ class LocalRotalogRunner:
 
         if self.enable_firebase:
             self.firebase_store, self.team_repo, self.exec_log = _init_firebase_storage(self.empresa)
+            if self.firebase_enabled and not self.team_registry.data.get("teams"):
+                remote_registry = self.firebase_store.load_blob(self._team_registry_blob())
+                if isinstance(remote_registry.get("teams"), dict):
+                    self.team_registry.data = remote_registry
+                    self.team_registry.dirty = True
+                    self.team_registry.save()
 
         self._set_runtime_status("AGUARDANDO", "Aguardando próximo ciclo")
 
     @property
     def firebase_enabled(self) -> bool:
         return bool(self.firebase_store and self.firebase_store.enabled)
+
+    def _daily_path(self, day: str, team_key: str) -> Path:
+        return self.output_dir / "rotalog" / "equipes" / "daily" / day / f"{team_key}.json"
+
+    def _legacy_daily_path(self, day: str, team_key: str) -> Path:
+        return self._daily_path(day, team_key).with_suffix(".json.gz")
+
+    def _team_registry_blob(self) -> str:
+        root = self.team_repo.root_prefix if self.team_repo else "rotalog/equipes"
+        return f"{root}/team-registry.json.gz"
+
+    def _sync_team_registry(self) -> str:
+        """Sincroniza o cadastro somente quando seu conteúdo permanente mudou."""
+        if not self.firebase_enabled:
+            return "disabled"
+        payload = self.team_registry.data
+        digest = hashlib.sha256(json.dumps(
+            payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str,
+        ).encode("utf-8")).hexdigest()
+        confirmation = {
+            "bucket": self.firebase_store.bucket_name,
+            "blob": self._team_registry_blob(),
+            "sha256": digest,
+        }
+        previous = load_json(self.team_registry_sync_path, {})
+        if all(previous.get(key) == value for key, value in confirmation.items()):
+            return "unchanged"
+        self.firebase_store.save_blob(confirmation["blob"], payload)
+        write_json(self.team_registry_sync_path, {
+            **confirmation,
+            "uploadedAt": datetime.now(TZ).isoformat(),
+        })
+        return "uploaded"
+
+    @staticmethod
+    def _operational_date(document: dict, fallback_day: str) -> str:
+        turno = document.get("turno") or {}
+        inicio = turno.get("inicio_iso") or turno.get("inicioIso") or turno.get("inicio")
+        if inicio and len(str(inicio)) >= 10:
+            return str(inicio)[:10]
+        return fallback_day
+
+    @staticmethod
+    def _tower_summary(equipes: dict) -> dict:
+        summary = {
+            "executados": {"comercial": 0, "emergencia": 0},
+            "fila": {"comercial": 0, "emergencia": 0},
+            "equipes": {
+                "online": 0, "turnoAberto": 0, "emIntervalo": 0,
+                "emDeslocamento": 0, "emExecucao": 0,
+            },
+        }
+        for team in equipes.values():
+            for section in ("executadosHoje", "fila"):
+                for category in ("comercial", "emergencia"):
+                    summary["executados" if section == "executadosHoje" else "fila"][category] += int(
+                        (team.get(section) or {}).get(category) or 0
+                    )
+            if (team.get("conexao") or {}).get("isOnline"):
+                summary["equipes"]["online"] += 1
+            jornada = team.get("jornada") or {}
+            if ((jornada.get("turno") or {}).get("status") == "ABERTO"):
+                summary["equipes"]["turnoAberto"] += 1
+            if jornada.get("emIntervalo"):
+                summary["equipes"]["emIntervalo"] += 1
+            status = str(((team.get("ordensServico") or {}).get("atual") or {}).get("statusAtual") or "")
+            if status == "DESLOCAMENTO":
+                summary["equipes"]["emDeslocamento"] += 1
+            elif status == "EXECUCAO":
+                summary["equipes"]["emExecucao"] += 1
+        return summary
+
+    def _update_timeline_index(self, document: dict, calendar_day: str) -> None:
+        path = self.output_dir / "rotalog" / "timeline" / f"{calendar_day}.json"
+        timeline = load_json(path, {"schemaVersion": 1, "date": calendar_day, "teams": {}})
+        team_key = normalize_team_key(document.get("teamKey"))
+        references = []
+        for service in document.get("services") or (document.get("ordensServico") or {}).get("historico") or []:
+            times = [service.get(field) for field in ("inicioDeslocamento", "inicioExecucao", "fimExecucao", "retorno")]
+            transitions = service.get("transitions") or []
+            if not any(str(value or "")[:10] == calendar_day for value in times) and not any(
+                str(item.get("observadoEm") or item.get("at") or "")[:10] == calendar_day
+                for item in transitions if isinstance(item, dict)
+            ):
+                continue
+            references.append({
+                "type": "PREVIOUS_SHIFT_SERVICE" if document.get("operationalDate") != calendar_day else "SERVICE",
+                "operationalDate": document.get("operationalDate") or document.get("date"),
+                "turnoId": service.get("turnoId"),
+                "serviceId": service.get("serviceId"),
+                "inicio": service.get("inicioDeslocamento") or service.get("inicioExecucao"),
+                "fim": service.get("retorno") or service.get("fimExecucao"),
+            })
+        timeline.setdefault("teams", {})[team_key] = {
+            "hasPreviousShiftActivity": any(item["type"] == "PREVIOUS_SHIFT_SERVICE" for item in references),
+            "relatedOperationalDates": sorted({item["operationalDate"] for item in references if item.get("operationalDate")}),
+            "references": references,
+        }
+        write_json(path, timeline)
+
+    def _executed_today_by_team(self, team_keys: list[str], calendar_day: str) -> dict[str, dict[str, int]]:
+        team_keys = {normalize_team_key(team_key) for team_key in team_keys}
+        counts = {
+            team_key: {"comercial": 0, "emergencia": 0}
+            for team_key in team_keys
+        }
+        seen = {team_key: set() for team_key in team_keys}
+        daily_root = self.output_dir / "rotalog" / "equipes" / "daily"
+        for path in daily_root.glob("*/*"):
+            if path.name.endswith(".json.gz"):
+                file_team_key = path.name[:-8]
+            elif path.suffix == ".json":
+                file_team_key = path.stem
+            else:
+                continue
+            team_key = normalize_team_key(file_team_key)
+            if team_key not in counts:
+                continue
+            document = load_json(path, {})
+            services = document.get("services") or (document.get("ordensServico") or {}).get("historico") or []
+            for service in services:
+                completed = service.get("retorno") or service.get("fimExecucao") or service.get("concluidoEm")
+                if service.get("statusAtual") != "CONCLUSAO" or str(completed or "")[:10] != calendar_day:
+                    continue
+                identity = service.get("serviceId") or (service.get("protocolo"), service.get("inicioDeslocamento"))
+                if identity in seen[team_key]:
+                    continue
+                seen[team_key].add(identity)
+                category = "emergencia" if str(service.get("categoria") or "").upper() == "EMERGENCIA" else "comercial"
+                counts[team_key][category] += 1
+        return counts
 
     def _set_runtime_status(self, phase: str, message: str, started_at: datetime | None = None) -> None:
         """Publica o estado operacional local consumido pelo TUI em modo visualizador."""
@@ -183,7 +325,7 @@ class LocalRotalogRunner:
                 pass
         return metrics
 
-    def _sync_index(self, equipes: dict, timestamp: str) -> str:
+    def _sync_index(self, equipes: dict, timestamp: str, summary: dict | None = None) -> str:
         """Confirma em disco somente o conteúdo enviado com sucesso ao destino atual."""
         if not self.firebase_enabled:
             return "disabled"
@@ -201,7 +343,7 @@ class LocalRotalogRunner:
                               if field not in {"updatedAt", "updatedAtIso", "version"}})
             for key, doc in equipes.items()
         }
-        content = {"schemaVersion": 2, "company": self.empresa, "equipes": comparable}
+        content = {"schemaVersion": 3, "company": self.empresa, "summary": summary or {}, "equipes": comparable}
         digest = hashlib.sha256(json.dumps(
             content, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str,
         ).encode("utf-8")).hexdigest()
@@ -218,10 +360,10 @@ class LocalRotalogRunner:
         self.firebase_store.save({
             "publisherNodeId": default_node_id(),
             "publishedAt": published_at,
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "company": self.empresa,
             "updatedAtIso": timestamp,
-            "totalEquipes": len(equipes),
+            "summary": summary or {},
             "equipes": equipes,
             "snapshots": equipes,
         })
@@ -265,6 +407,10 @@ class LocalRotalogRunner:
 
     def _load_daily_with_recovery(self, path: Path, day: str, team_key: str) -> dict:
         local, status = load_json_with_status(path, {})
+        if status == "missing" and path.suffix == ".json":
+            legacy, legacy_status = load_json_with_status(path.with_suffix(".json.gz"), {})
+            if legacy_status == "ok":
+                local, status = legacy, legacy_status
         if status != "corrupt":
             local_company = str(local.get("companyKey") or "").strip().lower() if local else ""
             if not local_company and local and local.get("company"):
@@ -308,9 +454,30 @@ class LocalRotalogRunner:
         if curr_status == "FECHADO" and prev_status == "ABERTO":
             reasons.append("turno_fechado")
 
-        prev_history = (previous.get("ordensServico") or {}).get("historico") or []
-        curr_history = (current.get("ordensServico") or {}).get("historico") or []
-        if len(curr_history) > len(prev_history):
+        def concluded_service_ids(document: dict) -> set[tuple[str, str]]:
+            history = (document.get("ordensServico") or {}).get("historico") or []
+            identities = set()
+            for index, service in enumerate(history):
+                if not isinstance(service, dict) or service.get("statusAtual") != "CONCLUSAO":
+                    continue
+                service_id = str(service.get("serviceId") or "").strip()
+                start = str(
+                    service.get("inicioDeslocamento") or service.get("inicioExecucao") or ""
+                ).strip()
+                protocol = str(service.get("protocolo") or "").strip()
+                if service_id:
+                    identities.add(("id", service_id))
+                elif start:
+                    identities.add(("start", start))
+                elif protocol:
+                    identities.add(("protocol", protocol))
+                else:
+                    identities.add(("position", str(index)))
+            return identities
+
+        previous_concluded = concluded_service_ids(previous)
+        current_concluded = concluded_service_ids(current)
+        if current_concluded - previous_concluded:
             reasons.append("servico_concluido")
         return reasons
 
@@ -352,10 +519,12 @@ class LocalRotalogRunner:
         items = {}
         receipts = self._load_daily_sync_receipts()
         daily_root = self.output_dir / "rotalog" / "equipes" / "daily"
-        for path in daily_root.glob("*/*.json.gz") if daily_root.exists() else ():
+        paths = (list(daily_root.glob("*/*.json")) + list(daily_root.glob("*/*.json.gz"))) if daily_root.exists() else []
+        for path in paths:
             document, status = load_json_with_status(path, {})
             day = str(document.get("date") or path.parent.name)
-            team_key = normalize_team_key(document.get("teamKey") or path.name.removesuffix(".json.gz"))
+            filename_team = path.name.removesuffix(".json.gz").removesuffix(".json")
+            team_key = normalize_team_key(document.get("teamKey") or filename_team)
             if status != "ok" or not day or not team_key or not self._valid_daily_recovery(document, day, team_key):
                 continue
             has_history = bool((document.get("ordensServico") or {}).get("historico"))
@@ -409,7 +578,7 @@ class LocalRotalogRunner:
     def _enqueue_daily_sync(self, day: str, team_key: str, reasons: list[str]) -> None:
         if not self.enable_firebase or not reasons:
             return
-        daily_path = self.output_dir / "rotalog" / "equipes" / "daily" / day / f"{team_key}.json.gz"
+        daily_path = self._daily_path(day, team_key)
         document = load_json(daily_path, {})
         digest = self._daily_document_digest(document) if document else None
         receipt = self._load_daily_sync_receipts().get(f"{day}/{team_key}", {})
@@ -443,7 +612,7 @@ class LocalRotalogRunner:
             try:
                 if not day or not team_key:
                     raise ValueError("Pendência sem data ou equipe válida")
-                daily_path = self.output_dir / "rotalog" / "equipes" / "daily" / day / f"{team_key}.json.gz"
+                daily_path = self._daily_path(day, team_key)
                 document = self._load_daily_with_recovery(daily_path, day, team_key)
                 if not self._valid_daily_recovery(document, day, team_key):
                     raise RuntimeError("Arquivo diário local ausente ou inválido")
@@ -589,12 +758,43 @@ class LocalRotalogRunner:
 
         previous = canonicalize_team_snapshots(previous)
 
+        # Migração progressiva: a primeira execução cria identidades permanentes a
+        # partir da torre já existente antes de observar possíveis veículos novos.
+        for previous_key, previous_document in previous.items():
+            conexao = previous_document.get("conexao") or {}
+            previous_members = previous_document.get("colaborador") or conexao.get("colaborador")
+            previous_at = (
+                previous_document.get("updatedAt")
+                or previous_document.get("updatedAtIso")
+                or datetime.now(TZ).isoformat()
+            )
+            previous_identity = self.team_registry.observe(
+                previous_key, previous_members, str(previous_at)
+            )
+            previous_document["teamId"] = previous_identity["teamId"]
+            previous_document["membersKey"] = previous_identity["membersKey"]
+            previous_document["identitySource"] = previous_identity["identitySource"]
+
         try:
-            teams = extrair_dados_tempo_real(snapshots_anteriores=previous)
+            unresolved_groups: list[dict] = []
+            teams = extrair_dados_tempo_real(
+                identificador_para_equipe=build_identifier_map(previous),
+                snapshots_anteriores=previous,
+                unresolved_groups=unresolved_groups,
+            )
             scraped_at = datetime.now(TZ)
             self._set_runtime_status("PROCESSANDO", "Processando equipes e gravando arquivos", started_at)
             timestamp = scraped_at.isoformat()
             day = scraped_at.date().isoformat()
+            write_json(
+                self.output_dir / "rotalog" / "diagnostics" / "unresolved-teams.json",
+                {
+                    "schemaVersion": 1,
+                    "collectedAt": timestamp,
+                    "count": len(unresolved_groups),
+                    "teams": unresolved_groups,
+                },
+            )
             updates = {}
             ignored = 0
             local_events = []
@@ -604,16 +804,28 @@ class LocalRotalogRunner:
                 team_key = normalize_team_key(team.get("equipe_codigo"))
                 if not team_key:
                     continue
+                identity = self.team_registry.observe(
+                    team_key,
+                    team.get("colaborador"),
+                    timestamp,
+                )
+                team["team_id"] = identity["teamId"]
+                team["members_key"] = identity["membersKey"]
+                team["identity_source"] = identity["identitySource"]
                 document = build_rotalog_document(
                     team, self.empresa, team_key, timestamp, queue_counts(team)
                 )
 
-                daily_path = self.output_dir / "rotalog" / "equipes" / "daily" / day / f"{team_key}.json.gz"
-                previous_daily = self._load_daily_with_recovery(daily_path, day, team_key)
-                merged_daily = merge_daily_document(previous_daily, document, day)
+                operational_day = self._operational_date(document, day)
+                daily_path = self._daily_path(operational_day, team_key)
+                previous_daily = self._load_daily_with_recovery(daily_path, operational_day, team_key)
+                merged_daily = merge_daily_document(previous_daily, document, operational_day)
+                self.team_registry.record_history(
+                    identity["teamId"], operational_day, team_key
+                )
 
                 changes = changed_fields(previous_daily, merged_daily) if previous_daily else {"novo": {}}
-                if previous_daily and not changes and previous_daily.get("date") == day:
+                if previous_daily and not changes and previous_daily.get("date") == operational_day:
                     ignored += 1
                     merged_daily["updatedAt"] = timestamp
                 else:
@@ -621,35 +833,12 @@ class LocalRotalogRunner:
 
                     # 1. Grava SEMPRE no disco local (fidelidade máxima da linha do tempo)
                     write_json(daily_path, merged_daily)
-
-                    # Se o turno fechou hoje mas iniciou na véspera, ou há dados da véspera, atualiza o diário anterior
-                    turno_info = merged_daily.get("jornada", {}).get("turno") or {}
-                    turnos_list = merged_daily.get("jornada", {}).get("turnos") or [turno_info]
-                    plantao_ant = next((t for t in turnos_list if t.get("tipo") == "PLANTAO_ANTERIOR" or (t.get("inicio") and str(t.get("inicio"))[:10] != day)), None)
-                    target_turno_ant = plantao_ant if plantao_ant else turno_info
-                    if target_turno_ant.get("status") == "FECHADO":
-                        ini_t = target_turno_ant.get("inicio")
-                        fim_t = target_turno_ant.get("fim")
-                        if ini_t and str(ini_t)[:10] != day and fim_t:
-                            prev_day = str(ini_t)[:10]
-                            prev_day_path = self.output_dir / "rotalog" / "equipes" / "daily" / prev_day / f"{team_key}.json.gz"
-                            if prev_day_path.exists():
-                                try:
-                                    prev_doc = self._load_daily_with_recovery(prev_day_path, prev_day, team_key)
-                                    # Depois que o diario anterior recebeu o fechamento do turno,
-                                    # ele fica imutavel. Isso evita regravar e reenviar o mesmo
-                                    # historico a cada alteracao da equipe no dia seguinte.
-                                    if prev_doc and not self._daily_history_is_finalized(prev_doc):
-                                        merged_prev = merge_daily_document(prev_doc, document, prev_day)
-                                        write_json(prev_day_path, merged_prev)
-                                        self._enqueue_daily_sync(prev_day, team_key, ["fechamento_turno"])
-                                except Exception as exc:
-                                    LOG.debug("Não foi possível atualizar diário da véspera para %s: %s", team_key, exc)
+                    self._update_timeline_index(merged_daily, day)
 
                     # 2. Persiste o evento antes do upload. Intervalos permanecem na torre.
                     sync_reasons = self._daily_sync_reasons(previous_daily, merged_daily)
                     self._enqueue_daily_sync(
-                        day,
+                        operational_day,
                         team_key,
                         sync_reasons,
                     )
@@ -667,17 +856,30 @@ class LocalRotalogRunner:
 
                 previous[team_key] = merged_daily
 
+            self.team_registry.save()
+
             index_equipes = {
-                team_k: compactar_equipe_para_index(doc)
+                team_k: compactar_equipe_para_index(
+                    doc,
+                    next((raw for raw in teams if normalize_team_key(raw.get("equipe_codigo")) == team_k), {}),
+                    day,
+                )
                 for team_k, doc in previous.items()
             }
+            executed_today = self._executed_today_by_team(list(index_equipes), day)
+            for team_k, tower_team in index_equipes.items():
+                tower_team["executadosHoje"] = executed_today.get(
+                    team_k, {"comercial": 0, "emergencia": 0}
+                )
+            tower_summary = self._tower_summary(index_equipes)
 
             # Grava o índice consolidado local (formato tempo real / torre de controle)
             write_json(self.index_path, {
-                "schemaVersion": 2,
+                "schemaVersion": 3,
                 "company": self.empresa,
+                "date": day,
                 "lastCollectedAt": timestamp,
-                "totalEquipes": len(index_equipes),
+                "summary": tower_summary,
                 "equipes": index_equipes,
             })
 
@@ -689,11 +891,15 @@ class LocalRotalogRunner:
             firebase_sync_status = "disabled"
             if self.firebase_enabled and self.firebase_store:
                 try:
-                    firebase_sync_status = self._sync_index(index_equipes, timestamp)
+                    firebase_sync_status = self._sync_index(index_equipes, timestamp, tower_summary)
                     firebase_uploaded = firebase_sync_status == "uploaded"
                 except Exception as exc:
                     firebase_sync_status = "pending"
                     LOG.error("Erro ao salvar snapshot consolidado no Firebase Storage: %s", exc)
+                try:
+                    self._sync_team_registry()
+                except Exception as exc:
+                    LOG.error("Cadastro permanente de equipes pendente de sincronização: %s", exc)
 
             finished_at = datetime.now(TZ)
             duration_total = round(time.perf_counter() - started_clock, 3)

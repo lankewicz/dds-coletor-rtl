@@ -130,7 +130,7 @@ def write_json(path: Path, value: typing.Any, compress: bool | None = None) -> N
 
     if should_compress:
         raw_bytes = json.dumps(value, ensure_ascii=False, indent=2, default=str).encode("utf-8")
-        compressed_bytes = gzip.compress(raw_bytes, compresslevel=6)
+        compressed_bytes = gzip.compress(raw_bytes, compresslevel=9)
         with temporary.open("wb") as stream:
             stream.write(compressed_bytes)
             stream.flush()
@@ -275,7 +275,7 @@ class RotalogGcsSnapshotStore:
                 indent=2,
                 default=_json_cache_default,
             ).encode("utf-8")
-            compressed = gzip.compress(raw)
+            compressed = gzip.compress(raw, compresslevel=9)
             self._count_write()
             blob.upload_from_string(
                 compressed,
@@ -318,7 +318,7 @@ class RotalogGcsSnapshotStore:
                         indent=2,
                         default=_json_cache_default,
                     ).encode("utf-8")
-                    compressed = gzip.compress(raw)
+                    compressed = gzip.compress(raw, compresslevel=9)
                     self._count_write()
                     blob.upload_from_string(
                         compressed,

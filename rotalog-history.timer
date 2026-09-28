@@ -1,5 +1,5 @@
 [Unit]
-Description=Agenda coleta historica diaria do Rotalog as 05:30
+Description=Agenda historico D-1 e atualizacao de equipes/profissionais as 05:30
 
 [Timer]
 OnCalendar=*-*-* 05:30:00 America/Sao_Paulo
@@ -9,4 +9,3 @@ Unit=rotalog-history.service
 
 [Install]
 WantedBy=timers.target
-

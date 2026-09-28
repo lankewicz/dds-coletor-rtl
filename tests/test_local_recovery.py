@@ -61,7 +61,7 @@ class LocalRecoveryTests(unittest.TestCase):
         with patch("main.extrair_dados_tempo_real", return_value=[]):
             result = self.runner.run_once()
         self.assertEqual(result["status"], "success", result)
-        self.assertEqual(load_json(index_path, {})["totalEquipes"], 1)
+        self.assertEqual(len(load_json(index_path, {})["equipes"]), 1)
         self.assertEqual(len(list(index_path.parent.glob("index.json.gz.corrupt-*"))), 1)
 
     def test_corrupt_index_is_preserved_without_valid_remote_copy(self):

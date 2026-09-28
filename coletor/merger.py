@@ -198,6 +198,24 @@ def compact_service(team_key: str, day: str, service: dict[str, typing.Any]) -> 
         "sequencia": service.get("sequencia") or None,
         "baseDay": base_day,
         "camposEstimados": list(service.get("camposEstimados") or []),
+        "transitions": list(service.get("transitions") or []),
+    }
+    dates = sorted({
+        str(value)[:10]
+        for value in horarios.values()
+        if value and len(str(value)) >= 10
+    })
+    result["calendarDates"] = dates
+    observed = {
+        str(item.get("status") or item.get("statusAtual") or "").upper()
+        for item in result["transitions"] if isinstance(item, dict)
+    }
+    if status_atual:
+        observed.add(str(status_atual).upper())
+    result["lifecycle"] = {
+        "deslocamentoObservado": "DESLOCAMENTO" in observed,
+        "execucaoObservada": "EXECUCAO" in observed,
+        "conclusaoObservada": "CONCLUSAO" in observed,
     }
     if fila_conclusao is not None and status_atual == "CONCLUSAO":
         result["filaNaConclusao"] = fila_conclusao
@@ -290,8 +308,16 @@ def merge_daily_document(
     previous = previous or {}
     if previous.get("teamKey") and previous["teamKey"] != team_key:
         raise ValueError("Historico pertence a outra equipe")
+    if previous.get("teamId") and current.get("teamId") and previous["teamId"] != current["teamId"]:
+        raise ValueError("Historico pertence a outra identidade permanente")
     if previous.get("date") and previous["date"] != day:
         raise ValueError("Historico pertence a outra data")
+
+    raw_turno = current.get("turno") or {}
+    current_shift_start = _iso_local(
+        raw_turno.get("inicio_iso") or raw_turno.get("inicioIso") or raw_turno.get("inicio"),
+        day,
+    )
 
     # Recupera serviços anteriores (compatível com v2 ordensServico.historico ou v1 services)
     records = []
@@ -311,6 +337,13 @@ def merge_daily_document(
     for field in ("ssExecutadas", "ssEmAndamento", "services", "bdoList"):
         for raw in current.get(field) or []:
             item = compact_service(team_key, day, raw)
+            service_start = item.get("inicioDeslocamento") or item.get("inicioExecucao")
+            if current_shift_start and service_start and str(service_start) < str(current_shift_start):
+                # A timeline pode continuar exibindo o plantão anterior. Ele permanece
+                # no arquivo da data operacional de origem e não é copiado para o novo turno.
+                continue
+            if current_shift_start and str(current_shift_start)[:10] == day:
+                item["baseDay"] = day
             item["observadoEm"] = current.get("updatedAtIso") or current.get("updatedAt")
             for meta in ("fonteProtocolo", "validacaoProtocolo", "protocoloBruto"):
                 if raw.get(meta) is not None:
@@ -410,7 +443,6 @@ def merge_daily_document(
         fila_na_abertura = prev_fila_abertura
     elif status_turno == "ABERTO":
         fila_na_abertura = {
-            "total": fila_total,
             "emergencia": fila_emergencia,
             "comercial": fila_comercial,
         }
@@ -451,14 +483,18 @@ def merge_daily_document(
     turnos_consolidados = sorted(turnos_map.values(), key=lambda t: str(t.get("inicio") or t.get("fim") or ""))
     artigo66_info = turno.get("artigo66") or (previous.get("jornada") or {}).get("artigo66")
 
-    return {
-        "schemaVersion": 2,
+    result = {
+        "schemaVersion": 3,
         "company": current.get("empresa") or previous.get("company") or previous.get("empresa"),
         "companyKey": company_key(
             current.get("empresa") or previous.get("company") or previous.get("empresa")
         ),
         "teamKey": team_key,
+        "teamId": current.get("teamId") or previous.get("teamId"),
+        "membersKey": current.get("membersKey") or previous.get("membersKey"),
+        "identitySource": current.get("identitySource") or previous.get("identitySource"),
         "date": day,
+        "operationalDate": day,
         "updatedAt": current.get("updatedAtIso") or current.get("updatedAt"),
         "timezone": str(LOCAL_TZ),
         "version": daily_version,
@@ -477,6 +513,10 @@ def merge_daily_document(
                 "fim": fim_turno,
                 "duracaoMinutos": duracao_minutos,
                 "filaNaAbertura": fila_na_abertura,
+                "vehicleCodeAtShiftOpen": (
+                    ((previous.get("jornada") or {}).get("turno") or {}).get("vehicleCodeAtShiftOpen")
+                    or team_key
+                ),
             },
             "turnos": turnos_consolidados,
             "artigo66": artigo66_info,
@@ -491,3 +531,30 @@ def merge_daily_document(
             "historico": historico,
         },
     }
+    for turno_item in result["jornada"]["turnos"]:
+        inicio = turno_item.get("inicio")
+        if inicio:
+            turno_item["vehicleCodeAtShiftOpen"] = turno_item.get("vehicleCodeAtShiftOpen") or team_key
+            turno_item["turnoId"] = turno_item.get("turnoId") or (
+                f"{team_key}_{str(inicio)[:19].replace('-', '').replace(':', '').replace('T', '_')}"
+            )
+            turno_item["operationalDate"] = str(inicio)[:10]
+            dates = {str(inicio)[:10]}
+            if turno_item.get("fim"):
+                dates.add(str(turno_item["fim"])[:10])
+            turno_item["calendarDates"] = sorted(dates)
+            turno_item["atravessouMeiaNoite"] = len(dates) > 1
+    for service in result["ordensServico"]["historico"]:
+        start = str(service.get("inicioDeslocamento") or service.get("inicioExecucao") or "")
+        matching = next((
+            item for item in reversed(result["jornada"]["turnos"])
+            if item.get("inicio") and start >= str(item["inicio"])
+            and (not item.get("fim") or start <= str(item["fim"]))
+        ), None)
+        if matching:
+            service["turnoId"] = matching.get("turnoId")
+            service["operationalDate"] = matching.get("operationalDate")
+    result["shifts"] = result["jornada"]["turnos"]
+    result["breaks"] = result["jornada"]["intervalos"]
+    result["services"] = result["ordensServico"]["historico"]
+    return result

@@ -20,10 +20,11 @@ class StorageRegressionTests(unittest.TestCase):
             },
         }
 
-    def test_compacting_twice_preserves_counters_and_timestamp(self):
+    def test_compacting_twice_preserves_current_projection(self):
         compact = compactar_equipe_para_index(self.document())
-        self.assertEqual(compact["ordensServico"]["totalConcluidos"], 1)
-        self.assertEqual(compact["jornada"]["totalIntervalos"], 1)
+        self.assertNotIn("historico", compact["ordensServico"])
+        self.assertNotIn("turnosRecentes", compact["jornada"])
+        self.assertEqual(compact["executadosHoje"], {"comercial": 0, "emergencia": 0})
         self.assertEqual(compactar_equipe_para_index(compact), compact)
 
     def test_interval_end_change_without_new_interval(self):
@@ -55,10 +56,11 @@ class StorageRegressionTests(unittest.TestCase):
         new["ordensServico"]["historico"][0]["observadoEm"] = "10:00"
         self.assertEqual(changed_fields(old, new), {})
 
-    def test_full_document_empty_history_overrides_stale_counter(self):
+    def test_tower_does_not_publish_redundant_total_counter(self):
         doc = self.document()
         doc["ordensServico"].update(historico=[], totalConcluidos=10)
-        self.assertEqual(compactar_equipe_para_index(doc)["ordensServico"]["totalConcluidos"], 0)
+        compact = compactar_equipe_para_index(doc)
+        self.assertNotIn("totalConcluidos", compact["ordensServico"])
 
     def test_corrupt_local_files_and_gzip_roundtrip(self):
         with tempfile.TemporaryDirectory() as directory:

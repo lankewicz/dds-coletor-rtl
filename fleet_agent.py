@@ -1,4 +1,4 @@
-"""Agente one-shot que publica heartbeat e aplica comandos de deploy da frota."""
+"""Agente one-shot que publica exclusivamente o heartbeat da frota."""
 
 from __future__ import annotations
 
@@ -399,32 +399,6 @@ def run_once() -> int:
     node_id = default_node_id()
     store = FleetStore.from_environment(ROOT)
     publish_heartbeat(store, node_id)
-    if os.getenv("FLEET_COMMANDS_ENABLED", "false").strip().lower() not in {"1", "true", "yes"}:
-        return 0
-    commands = store.pending_commands(node_id)
-    if not commands:
-        return 0
-    command = commands[0]
-    command_id = str(command.get("commandId") or "")
-    try:
-        action = command.get("action")
-        if action != "deploy":
-            raise RuntimeError(f"Ação não permitida ou desconhecida: {action!r}")
-        deploy(store, command, node_id)
-    except Exception as exc:
-        save_result(
-            store,
-            command_id,
-            node_id,
-            status="failed",
-            detail=str(exc),
-            runningCommit=current_commit(),
-            completedAt=utc_now_iso(),
-            traceback=traceback.format_exc(limit=8),
-        )
-        publish_heartbeat(store, node_id, force=True, status="error", detail=str(exc))
-        return 1
-    publish_heartbeat(store, node_id, force=True)
     return 0
 
 

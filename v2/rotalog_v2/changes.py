@@ -17,6 +17,9 @@ STATUS_LABELS = {
     "AVAILABLE": "DISPONÍVEL",
     "OFFLINE_WITH_ACTIVITY": "OFFLINE COM ATIVIDADE",
     "UNKNOWN": "DESCONHECIDO",
+    "ABERTO": "ABERTO",
+    "FECHADO": "FECHADO",
+    "DESCONHECIDO": "DESCONHECIDO",
 }
 
 
@@ -85,7 +88,7 @@ def detect_changes(previous: dict[str, Any], current: dict[str, Any]) -> dict[st
             continue
         changes: list[dict[str, Any]] = []
         for transition in (team.get("shift") or {}).get("newTransitions") or []:
-            kind = "SHIFT_OPENED" if transition.get("type") == "OPEN" else "SHIFT_CLOSED"
+            kind = "SHIFT_OPENED" if transition.get("type") in {"OPEN", "ABERTURA"} else "SHIFT_CLOSED"
             label = "turno aberto" if kind == "SHIFT_OPENED" else "turno fechado"
             changes.append({
                 "kind": kind,

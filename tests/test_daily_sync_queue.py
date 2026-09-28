@@ -69,24 +69,33 @@ class DailySyncQueueTests(unittest.TestCase):
             {"uploaded": 0, "failed": 0, "pending": 1},
         )
 
-    def test_event_policy_covers_open_completion_and_close_leaving_corrections_local(self):
+    def test_event_policy_covers_open_new_completion_and_close_only(self):
         opened = self.document
         self.assertEqual(self.runner._daily_sync_reasons({}, opened), ["turno_aberto"])
 
         completed = copy.deepcopy(opened)
-        completed["ordensServico"]["historico"] = [{"protocolo": "12345678", "fimExecucao": "10:00"}]
+        completed["ordensServico"]["historico"] = [{
+            "serviceId": "E3733_service-1",
+            "statusAtual": "CONCLUSAO",
+            "protocolo": "12345678",
+            "fimExecucao": "10:00",
+        }]
         self.assertEqual(
             self.runner._daily_sync_reasons(opened, completed),
             ["servico_concluido"],
         )
 
-        # Ajustes e correções de OS permanecem locais (sem fila para nuvem)
         corrected = copy.deepcopy(completed)
         corrected["ordensServico"]["historico"][0]["fimExecucao"] = "10:15"
-        self.assertEqual(
-            self.runner._daily_sync_reasons(completed, corrected),
-            [],
-        )
+        self.assertEqual(self.runner._daily_sync_reasons(completed, corrected), [])
+
+        redirected = copy.deepcopy(opened)
+        redirected["ordensServico"]["historico"] = [{
+            "serviceId": "E3733_service-2",
+            "statusAtual": "REDIRECIONADO",
+            "protocolo": "87654321",
+        }]
+        self.assertEqual(self.runner._daily_sync_reasons(opened, redirected), [])
 
         closed = copy.deepcopy(corrected)
         closed["jornada"]["turno"]["status"] = "FECHADO"

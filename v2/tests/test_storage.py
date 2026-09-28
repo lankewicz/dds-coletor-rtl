@@ -137,7 +137,7 @@ class StorageTests(unittest.TestCase):
         snapshot = {
             "collectedAt": "2026-09-24T12:00:00-03:00",
             "teams": {"E3733": {
-                "shift": {"status": "OPEN", "openedAt": "2026-09-24T08:00:00-03:00"},
+                "shift": {"status": "ABERTO", "openedAt": "2026-09-24T08:00:00-03:00"},
                 "completedServices": [
                     {"protocol": "50900000", "startAt": "2026-09-24T07:30:00-03:00"},
                     {"protocol": "50900001", "startAt": "2026-09-24T09:00:00-03:00"},
@@ -152,6 +152,8 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(tower["teams"]["E3733"]["shiftServices"], tower["shiftServices"])
         self.assertEqual(tower["teams"]["E3733"]["queue"], {"emergency": 7, "commercial": 2})
         self.assertEqual(tower["queue"], {"emergency": 7, "commercial": 2})
+        self.assertEqual(tower["teams"]["E3733"]["estadoConsolidado"], "ABERTO")
+        self.assertEqual(tower["teams"]["E3733"]["jornada"]["turno"]["status"], "ABERTO")
 
 
 if __name__ == "__main__":
