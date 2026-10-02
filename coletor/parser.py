@@ -118,6 +118,23 @@ def _convert_ms_to_hora(ms: int | str | None) -> str:
         return ""
 
 
+def _corrigir_inicio_execucao_ativa(
+    service: dict[str, typing.Any], scraped_at: datetime.datetime
+) -> None:
+    if str(service.get("status") or "").upper() != "EXECUCAO":
+        return
+    try:
+        started_at = datetime.datetime.fromisoformat(str(service.get("inicioIso") or ""))
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=LOCAL_TZ)
+        else:
+            started_at = started_at.astimezone(LOCAL_TZ)
+    except ValueError:
+        return
+    if started_at.date() < scraped_at.date():
+        service["inicioExecucao"] = scraped_at.isoformat()
+
+
 def parse_group_string(group_raw: str) -> dict[str, str]:
     """Parseia strings de grupo como:
     - 'E3733-CA127 BRUNNO PEDRO (online)'
@@ -790,7 +807,7 @@ def _forcar_cliques_timeline_tempo_real(
             "javax.faces.ViewState": view_state,
         }
         try:
-            r = session.post(url_tempo_real, data=payload, headers=headers, verify=False, timeout=8)
+            r = session.post(url_tempo_real, data=payload, headers=headers, timeout=8)
             if r.status_code == 200:
                 popups = re.findall(
                     r"voarParaCoordenadaZoom\(\s*\[(-?\d+\.\d+),\s*(-?\d+\.\d+)\],\s*\d+,\s*['\"](.*?)['\"]\s*\)",
@@ -909,7 +926,7 @@ def extrair_dados_tempo_real(
     for tentativa in range(1, max_tentativas + 1):
         try:
             session = crawler.criar_sessao_autenticada()
-            resp = session.get(URL_TEMPO_REAL, verify=False, timeout=60)
+            resp = session.get(URL_TEMPO_REAL, timeout=60)
             if resp.status_code == 200:
                 break
         except Exception as e:
@@ -921,6 +938,7 @@ def extrair_dados_tempo_real(
         raise RuntimeError(f"Falha ao acessar Rotalog Tempo Real: HTTP {resp.status_code if resp else 'No Response'}")
 
     html = resp.text
+    scraped_at = datetime.datetime.now(LOCAL_TZ)
     soup = BeautifulSoup(html, "html.parser")
 
     scripts = soup.find_all("script")
@@ -1141,7 +1159,7 @@ def extrair_dados_tempo_real(
     # Enriquecimento com snapshot anterior
     _enriquecer_com_snapshot_anterior(resultado, snapshots_anteriores or {})
 
-    hoje_local = datetime.datetime.now(LOCAL_TZ).date()
+    hoje_local = scraped_at.date()
     data_minima_tempo_real = hoje_local - datetime.timedelta(days=1)
 
     def _servico_recente_sem_protocolo(srv: dict[str, typing.Any]) -> bool:
@@ -1211,6 +1229,10 @@ def extrair_dados_tempo_real(
                             srv["fonteProtocolo"] = "POPUP"
     except Exception as exc:
         logger.warning("Falha ao executar cliques forçados na timeline: %s", exc)
+
+    for eq in resultado:
+        for service in eq.get("ss_em_andamento", []):
+            _corrigir_inicio_execucao_ativa(service, scraped_at)
 
     # Expurgar serviços ignorados identificados pelos popups
     if servicos_ignorados:

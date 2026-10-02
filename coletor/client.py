@@ -5,9 +5,6 @@ from __future__ import annotations
 import logging
 import os
 import requests
-import urllib3
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +12,15 @@ URL_BASE = "https://www.copel.com/rtlweb"
 URL_DASHBOARD = f"{URL_BASE}/paginas/dashboard"
 URL_LOGIN_ACTION = f"{URL_BASE}/paginas/j_security_check"
 URL_TEMPO_REAL = f"{URL_BASE}/paginas/tempoReal"
+
+
+def rotalog_tls_verify() -> bool | str:
+    """Retorna True por padrão, ou o caminho de uma CA corporativa configurada."""
+    ca_bundle = os.getenv("ROTALOG_CA_BUNDLE", "").strip()
+    if ca_bundle:
+        return ca_bundle
+    configured = os.getenv("ROTALOG_VERIFY_TLS", "true").strip().lower()
+    return configured not in {"0", "false", "no", "off"}
 
 
 class CrawlerRotalog:
@@ -31,6 +37,7 @@ class CrawlerRotalog:
     def criar_sessao_autenticada(self) -> requests.Session:
         """Cria e autentica uma sessão HTTP no portal Copel RTLWeb."""
         session = requests.Session()
+        session.verify = rotalog_tls_verify()
         session.headers.update({
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -41,11 +48,13 @@ class CrawlerRotalog:
         })
 
         # 1. Carrega o dashboard para obter os cookies iniciais (JSESSIONID)
-        session.get(URL_DASHBOARD, verify=False, timeout=30)
+        dashboard = session.get(URL_DASHBOARD, timeout=30)
+        dashboard.raise_for_status()
 
         # 2. Realiza o POST de autenticação
         payload = {"j_username": self.usuario, "j_password": self.senha}
-        resp = session.post(URL_LOGIN_ACTION, data=payload, verify=False, timeout=30)
+        resp = session.post(URL_LOGIN_ACTION, data=payload, timeout=30)
+        resp.raise_for_status()
         if resp.status_code != 200 or "j_security_check" in resp.text:
             raise PermissionError("Falha na autenticação do portal Copel RTLWeb. Verifique credenciais.")
 

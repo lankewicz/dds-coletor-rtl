@@ -8,6 +8,21 @@ TZ = ZoneInfo("America/Sao_Paulo")
 
 
 class TestTurnoLifecycle(unittest.TestCase):
+    def test_deslocamento_e_execucao_podem_ter_o_mesmo_horario(self):
+        from coletor.storage import compact_service
+
+        service = {
+            "status": "EXECUCAO",
+            "inicioIso": "2026-09-28T09:12:00-03:00",
+            "inicioDeslocamento": "09:12",
+            "inicioExecucao": "09:12",
+        }
+
+        compacted = compact_service("E3K59", "2026-09-28", service)
+
+        self.assertEqual(compacted["inicioDeslocamento"], "2026-09-28T09:12:00-03:00")
+        self.assertEqual(compacted["inicioExecucao"], "2026-09-28T09:12:00-03:00")
+
     def test_e3k59_fechamento_na_madrugada_pos_servico(self):
         """Caso E3K59: equipe trabalhou a noite toda e fechou às 03:55:47.
         Deve ser FECHADO com fim às 03:55:47, e NÃO abertura às 03:55."""

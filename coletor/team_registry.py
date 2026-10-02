@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import uuid
 import re
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .equipes import member_signature, normalize_team_key, valid_team_key
+from .file_lock import exclusive_file_lock
 from .storage_io import load_json, write_json
 
 
@@ -16,12 +18,24 @@ class TeamRegistry:
 
     def __init__(self, path: Path):
         self.path = path
-        loaded = load_json(path, {})
+        self._load()
+
+    def _load(self) -> None:
+        loaded = load_json(self.path, {})
         self.data: dict[str, Any] = loaded if isinstance(loaded, dict) else {}
         self.data.setdefault("schemaVersion", 1)
         self.data.setdefault("teams", {})
         self.data.setdefault("professionals", {})
         self.dirty = False
+
+    @contextmanager
+    def exclusive_update(self, timeout_seconds: float = 120.0) -> Iterator["TeamRegistry"]:
+        """Serializa uma atualização e recarrega o estado após obter o lock."""
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        with exclusive_file_lock(lock_path, timeout_seconds=timeout_seconds):
+            self._load()
+            yield self
+            self.save()
 
     @staticmethod
     def _new_team_id() -> str:

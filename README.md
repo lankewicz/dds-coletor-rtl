@@ -226,14 +226,20 @@ python main.py --historico --firebase
 python main.py --historico 2026-09-12 --firebase
 ```
 
-#### Agendamento diário às 05:30
+#### Reconciliação diária às 03:00
 
-O timer persistente coleta automaticamente o dia anterior às 05:30 no fuso
+O timer persistente atualiza os últimos sete dias completos às 03:00 no fuso
 `America/Sao_Paulo`. Se o Orange Pi estiver desligado nesse horário, o systemd
 executa a coleta pendente quando o equipamento voltar.
 
-Na mesma execução, os registros e nomes completos retornados pela tela de
-equipes enriquecem o cadastro permanente `rotalog/equipes/team-registry.json`.
+Nos domingos a janela aumenta para 30 dias; no dia 10 de cada mês, para 60 dias.
+Quando coincidem, somente a maior janela é executada. O dia atual fica fora da
+consulta. Cada dia consulta serviços e a tabela principal de equipes, mantendo
+as quilometragens oficiais atualizadas. Os nomes exibidos pela tabela enriquecem
+o cadastro permanente `rotalog/equipes/team-registry.json`. Matrículas e nomes
+completos são consultados individualmente após a paginação, com progresso por
+equipe no terminal. Essa etapa acrescentou cerca de 13 minutos por dia no teste
+com 108 equipes; a janela de 60 dias poderá levar aproximadamente 14 horas.
 O arquivo compactado remoto do cadastro é sincronizado pelo próximo ciclo do
 coletor somente quando seu conteúdo tiver mudado.
 
@@ -245,9 +251,40 @@ sudo systemctl enable --now rotalog-history.timer
 systemctl list-timers rotalog-history.timer
 ```
 
+### Fechamento mensal no dia 10
+
+Após atualizar os 60 dias, a rotina consulta o fechamento oficial do mês anterior
+uma vez, sem repetir a raspagem diária. O timer mensal aponta para o mesmo serviço
+da rotina diária, evitando duas execuções concorrentes. Basta ativar o timer diário.
+
+Na primeira passagem, falhas não interrompem os demais dias. Somente as falhas são
+repetidas, até dez tentativas totais por dia, com esperas de 1, 2, 4, 8 e 15 minutos
+(limitadas a 15 minutos). O progresso fica em
+`rotalog/sync/<empresa>/historico/reconciliacoes/`. Após interrupção, a mesma
+execução retoma apenas pendências. No dia seguinte, a nova janela e as pendências
+antigas são reunidas, inclusive quando saem da janela de 60 dias. Falhas de upload
+são tratadas na fila de envio, sem repetir consultas concluídas.
+
+Teste manual em dados isolados (a janela depende da data da execução):
+
+```bash
+python main.py --reconciliar-agendado --no-firebase --output-dir ~/dds-coletor-teste-data
+```
+
+Para correções com mais de 60 dias, continua disponível `--historico DATA
+--historico-fim DATA`. A janela móvel não alcança automaticamente meses anteriores.
+
+```bash
+sudo install -m 0644 rotalog-monthly.service /etc/systemd/system/rotalog-monthly.service
+sudo install -m 0644 rotalog-monthly.timer /etc/systemd/system/rotalog-monthly.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now rotalog-monthly.timer
+systemctl list-timers rotalog-monthly.timer
+```
+
 ### Fechamento Mensal e Varredura do Mês Anterior (Notas de Cobrança)
 
-Ao longo do mês, a fiscalização da Copel homologa pareceres de glosas. No **1º dia de cada mês**, o coletor executa automaticamente uma varredura do mês anterior e consolida um **ÚNICO arquivo mensal de fechamento**:
+Ao longo do mês, a fiscalização da Copel homologa pareceres de glosas. No **dia 10**, após a reconciliação dos 60 dias, é gerado um **ÚNICO arquivo mensal de fechamento**:
 
 * `dados/{empresa}/rotalog/quilometragem/mensal/AAAA-MM.json.gz`
 * Contém todos os protocolos homologados e a medição final consolidada por equipe para geração das notas de cobrança.
@@ -269,7 +306,6 @@ O coletor possui duas fontes oficiais distintas no portal RTLWeb da Copel, cada 
 * **Saída local**: 
   - `dados-local/rotalog/eventos/diario/AAAA-MM-DD.json.gz` (eventos brutos para auditoria)
   - `dados-local/rotalog/quilometragem/diario/AAAA-MM-DD.json.gz` (dados estruturados)
-  - `dados-local/rotalog/quilometragem/diario/AAAA-MM-DD-relatorio.html` (relatório imprimível / PDF)
 
 ```bash
 # Execução diária manual para uma data específica:
@@ -282,7 +318,6 @@ python main.py --historico 2026-09-14 --no-firebase
 * **Paginação**: Consulta o período do mês e navega por todas as páginas PrimeFaces (`form:tbEquipes`) via AJAX, consolidando todos os registros de fechamento.
 * **Saída local**:
   - `dados-local/rotalog/quilometragem/mensal/AAAA-MM.json.gz`
-  - `dados-local/rotalog/quilometragem/mensal/AAAA-MM-relatorio.html`
 
 ```bash
 # Execução mensal manual:
@@ -291,11 +326,31 @@ python main.py --mes 2026-08 --firebase
 python main.py --mes-anterior --firebase
 ```
 
-Abra o arquivo HTML gerado no navegador. Ambos os relatórios contam com visual limpo, subtotais por contrato (`4600026988` e `4600025149`), total geral e botão **Imprimir / Salvar PDF**.
+As coletas geram somente JSONs compactados. Os dados por contrato, equipe e serviço ficam disponíveis para uma futura consulta no visualizador de turnos. Não são gerados relatórios HTML diários ou mensais.
 
 ---
 
 ## 7. Instalação e Implantação no Orange Pi
+
+### Teste isolado antes da implantação
+
+Em uma cópia separada do projeto, prepare o ambiente virtual e execute o smoke
+test abaixo. Ele roda a suíte automatizada e coleta apenas o dia anterior em um
+diretório isolado, sempre com Firebase desativado. O script não instala, inicia
+ou reinicia serviços systemd.
+
+```bash
+cd /opt/dds-coletor-rtl-teste
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+chmod +x scripts/orangepi-smoke-test.sh
+./scripts/orangepi-smoke-test.sh /var/lib/dds-coletor-teste
+```
+
+O teste recusa caminhos conhecidos de produção e valida os dois arquivos GZIP
+gerados. Com TLS seguro (padrão), use `ROTALOG_CA_BUNDLE` caso o Orange Pi
+precise de uma cadeia de certificados corporativa. Não use o diretório de dados
+da instância ativa.
 
 ### Passo 1: Parar o serviço antigo
 ```bash

@@ -133,7 +133,6 @@ class LocalRotalogRunner:
         self.team_repo = None
         self.exec_log = None
 
-        self.last_monthly_sweep_day: str | None = None
         self.processing_led = ProcessingLed()
 
         if self.enable_firebase:
@@ -671,7 +670,8 @@ class LocalRotalogRunner:
         self._set_runtime_status("COLETANDO", "Coletando dados do ROTALOG", started_at)
         self.processing_led.processing()
         try:
-            return self._run_once()
+            with self.team_registry.exclusive_update():
+                return self._run_once()
         finally:
             self._set_runtime_status("AGUARDANDO", "Aguardando próximo ciclo")
             self.processing_led.idle()
@@ -681,22 +681,6 @@ class LocalRotalogRunner:
         started_at = datetime.now(TZ)
         daily_sync = {"uploaded": 0, "failed": 0, "pending": 0}
         self._take_storage_metrics()
-
-        # Automação: No 1º dia de cada mês, executa a varredura do mês anterior para fechar quilometragens
-        today_iso = started_at.date().isoformat()
-        if started_at.day == 1 and self.last_monthly_sweep_day != today_iso:
-            try:
-                LOG.info("Dia 1º detectado: iniciando varredura do mês anterior para fechamento de faturamento...")
-                res_mes = varrer_mes_anterior(
-                    output_dir=self.output_dir,
-                    empresa=self.empresa,
-                    enable_firebase=self.firebase_enabled,
-                    firebase_store=self.firebase_store,
-                )
-                LOG.info("Varredura mensal concluída com sucesso: %s", res_mes.get("month"))
-                self.last_monthly_sweep_day = today_iso
-            except Exception as exc:
-                LOG.error("Erro na varredura mensal automática: %s", exc)
 
         local_index, index_status = load_json_with_status(self.index_path, {})
         local_company = str(local_index.get("company") or "").strip() if local_index else ""
@@ -1024,11 +1008,22 @@ def executar_historico(
                 )
         except Exception as exc:
             LOG.error("Falha ao coletar histórico da data %s: %s", current.isoformat(), exc)
+            ultimo_res = {
+                "status": "error",
+                "date": current.isoformat(),
+                "error": str(exc),
+                "firebaseSynced": False,
+            }
         current += timedelta(days=1)
 
     if total_dias > 1:
         atualizar_status_terminal("Coleta de histórico concluída.", final=True)
         res_consolidado = {
+            "status": "success" if total_sucesso == total_dias else "error",
+            "error": (
+                None if total_sucesso == total_dias
+                else f"{total_dias - total_sucesso} de {total_dias} dia(s) falharam"
+            ),
             "date": f"{dt_inicio.isoformat()} a {dt_fim.isoformat()}",
             "durationSeconds": "-",
             "totalEquipes": ultimo_res.get("totalEquipes", 0),
@@ -1037,7 +1032,6 @@ def executar_historico(
             "totalKmAutorizadoFinal": round(total_km_aut_acum, 2),
             "totalKmRecuperadoParecer": 0.0,
             "localArquivoKm": f"dados-local/rotalog/quilometragem/diario/ ({total_sucesso} arquivos)",
-            "localRelatorioHtml": f"dados-local/rotalog/quilometragem/diario/ ({total_sucesso} relatórios)",
             "firebaseSynced": enable_firebase,
         }
         print(formatar_resumo_diario_terminal(res_consolidado), flush=True)
@@ -1054,10 +1048,11 @@ def executar_fechamento_mes(
     empresa: str = "ChicoEletro",
     enable_firebase: bool = False,
     progresso=None,
+    scheduled: bool = False,
 ) -> int:
     """Função separada para varredura completa de um mês (fechamento/notas de cobrança).
     
-    Coleta dados diários e mensais, gerando JSONs e relatórios HTML diários e mensal.
+    Coleta dados diários e mensais, gerando arquivos JSON compactados.
     """
     out_path = Path(output_dir).resolve()
     firebase_store = None
@@ -1087,6 +1082,7 @@ def executar_fechamento_mes(
                 enable_firebase=enable_firebase,
                 firebase_store=firebase_store,
                 coletar_diarios=True,
+                skip_if_complete=scheduled,
             )
         else:
             res = varrer_mes_anterior(
@@ -1096,6 +1092,7 @@ def executar_fechamento_mes(
                 enable_firebase=enable_firebase,
                 firebase_store=firebase_store,
                 coletar_diarios=True,
+                skip_if_complete=scheduled,
             )
 
         print(formatar_resumo_mensal_terminal(res), flush=True)
@@ -1133,6 +1130,10 @@ def main() -> int:
     parser.add_argument("--no-firebase", action="store_true", help="Força desativação do Firebase Storage (apenas local)")
     parser.add_argument("--once", action="store_true", help="Executa somente uma vez e finaliza")
     parser.add_argument(
+        "--reconciliar-agendado", action="store_true",
+        help="Atualiza 7 dias, 30 aos domingos ou 60 no dia 10 e retoma pendências",
+    )
+    parser.add_argument(
         "--list-leds",
         action="store_true",
         help="Lista LEDs disponíveis em /sys/class/leds e finaliza",
@@ -1155,6 +1156,11 @@ def main() -> int:
         help="Chave para rodar a varredura retroativa completa do mês anterior e consolidar faturamento/quilometragens",
     )
     parser.add_argument(
+        "--mes-anterior-agendado",
+        action="store_true",
+        help="Retoma às 03:00 o fechamento anterior e não repete um mês já concluído",
+    )
+    parser.add_argument(
         "--mes",
         default=None,
         help="Chave para rodar a varredura de um mês específico (formato AAAA-MM ou MM/AAAA)",
@@ -1170,13 +1176,25 @@ def main() -> int:
     else:
         enable_firebase = args.firebase or os.getenv("ROTALOG_UPLOAD_FIREBASE", "false").strip().lower() in ("true", "1", "yes")
 
+    if args.reconciliar_agendado:
+        from coletor.historico_agenda import reconciliar_historico
+
+        store = _init_firebase_storage(args.empresa)[0] if enable_firebase else None
+        result = reconciliar_historico(
+            Path(args.output_dir).resolve(), args.empresa,
+            enable_firebase=enable_firebase, firebase_store=store,
+        )
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        return 0 if result["status"] == "success" else 1
+
     # Chave para rodar a varredura do mês (fechamento de faturamento)
-    if args.mes_anterior or args.mes:
+    if args.mes_anterior or args.mes_anterior_agendado or args.mes:
         return executar_fechamento_mes(
             mes_str=args.mes or "anterior",
             output_dir=args.output_dir,
             empresa=args.empresa,
             enable_firebase=enable_firebase,
+            scheduled=args.mes_anterior_agendado,
         )
 
     # Chave para rodar a coleta de histórico diário separadamente

@@ -1,5 +1,5 @@
 [Unit]
-Description=DDS Rotalog - Reconciliacao diaria de servicos e equipes
+Description=DDS Rotalog - fechamento mensal recuperavel
 After=network-online.target
 Wants=network-online.target
 
