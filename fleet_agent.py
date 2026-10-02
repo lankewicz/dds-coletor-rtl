@@ -225,7 +225,7 @@ def heartbeat_interval_seconds(now: datetime | None = None) -> int:
 
 
 def local_heartbeat_interval_seconds() -> int:
-    return max(30, int(os.getenv("FLEET_LOCAL_HEARTBEAT_SECONDS", "120")))
+    return max(30, int(os.getenv("FLEET_LOCAL_HEARTBEAT_SECONDS", "60")))
 
 
 def _read_text(path: Path) -> str | None:

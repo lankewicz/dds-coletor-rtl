@@ -108,7 +108,7 @@ dds-coletor-rtl/
 
 ## Heartbeat e saúde dos equipamentos
 
-O agente atualiza o heartbeat e a saúde no arquivo local a cada 120 segundos. No
+O agente atualiza o heartbeat e a saúde no arquivo local a cada 60 segundos. No
 Firebase, publica a cada 30 minutos entre 07h e 20h e a cada 2 horas fora desse
 horário. Cada heartbeat inclui saúde local: temperatura, espaço em disco,
 memória disponível, carga, uptime, necessidade de reboot e o estado recente do

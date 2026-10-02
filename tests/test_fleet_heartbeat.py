@@ -57,7 +57,7 @@ class HeartbeatTests(unittest.TestCase):
         off_peak = datetime(2026, 9, 22, 3, tzinfo=timezone.utc)
         self.assertEqual(1800, fleet_agent.heartbeat_interval_seconds(peak))
         self.assertEqual(7200, fleet_agent.heartbeat_interval_seconds(off_peak))
-        self.assertEqual(120, fleet_agent.local_heartbeat_interval_seconds())
+        self.assertEqual(60, fleet_agent.local_heartbeat_interval_seconds())
 
     def test_health_summary_classifies_critical_temperature(self):
         health = fleet_agent.evaluate_health({
