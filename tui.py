@@ -44,7 +44,9 @@ from main import (
     get_adaptive_interval_seconds,
 )
 
-TZ = ZoneInfo(os.getenv("DDS_TIMEZONE", "America/Sao_Paulo"))
+# A interface operacional deve seguir sempre o horário oficial de Brasília.
+# Timestamps técnicos persistidos/enviados continuam em UTC.
+TZ = ZoneInfo("America/Sao_Paulo")
 DAILY_HISTORY_MAX = 5_000
 
 
