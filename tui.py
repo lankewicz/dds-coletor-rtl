@@ -211,7 +211,13 @@ def _format_health(health: dict) -> tuple[str, str, str]:
     )
     service = collector.get("serviceActive")
     service_text = "ATIVO" if service is True else "INATIVO" if service is False else "DESCONHECIDO"
-    last_upload = str(collector.get("lastIndexUploadAt") or "-").replace("T", " ")[:19]
+    last_upload_value = collector.get("lastIndexUploadAt")
+    last_upload_dt = parse_iso(str(last_upload_value)) if last_upload_value else None
+    last_upload = (
+        last_upload_dt.astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+        if last_upload_dt
+        else "-"
+    )
     issues = health.get("issues") or []
     issue_text = ", ".join(str(item.get("code") or item) for item in issues) or "nenhum"
     heartbeat_at = str(health.get("_heartbeatAt") or "-").replace("T", " ")[:19]

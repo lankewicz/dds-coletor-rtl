@@ -25,6 +25,7 @@ class TuiHealthTests(unittest.TestCase):
         self.assertIn("Coletor: ATIVO", lines[1])
         self.assertIn("Uptime: 1h 01m 01s", lines[1])
         self.assertIn("Carga: 3.0%/5.0%/7.5%", lines[1])
+        self.assertIn("Ultimo envio: 2026-09-22 13:12:22", lines[1])
         self.assertIn("Heartbeat local: 2026-09-22 16:15:00", lines[2])
         self.assertIn("Alertas: nenhum", lines[2])
 
