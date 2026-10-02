@@ -11,6 +11,7 @@ class TuiHealthTests(unittest.TestCase):
             "disk": {"usedPercent": 31.4},
             "memory": {"availablePercent": 62.5},
             "loadAverage": [0.12, 0.2, 0.3],
+            "cpuCount": 4,
             "uptimeSeconds": 3661,
             "collector": {
                 "serviceActive": True,
@@ -23,6 +24,7 @@ class TuiHealthTests(unittest.TestCase):
         self.assertIn("CPU: 54.2 C", lines[0])
         self.assertIn("Coletor: ATIVO", lines[1])
         self.assertIn("Uptime: 1h 01m 01s", lines[1])
+        self.assertIn("Carga: 3.0%/5.0%/7.5%", lines[1])
         self.assertIn("Heartbeat local: 2026-09-22 16:15:00", lines[2])
         self.assertIn("Alertas: nenhum", lines[2])
 

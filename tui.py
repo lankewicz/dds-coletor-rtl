@@ -196,7 +196,17 @@ def _format_health(health: dict) -> tuple[str, str, str]:
         else "indisponivel"
     )
     uptime_text = _format_duration(health.get("uptimeSeconds"))
-    load_text = "/".join(str(value) for value in load[:3]) if load else "indisponivel"
+    cpu_count = health.get("cpuCount") or os.cpu_count() or 1
+    try:
+        cpu_count = max(1, int(cpu_count))
+    except (TypeError, ValueError):
+        cpu_count = 1
+    load_percent = [float(value) / cpu_count * 100 for value in load[:3]]
+    load_text = (
+        "/".join(f"{value:.1f}%" for value in load_percent)
+        if load_percent
+        else "indisponivel"
+    )
     service = collector.get("serviceActive")
     service_text = "ATIVO" if service is True else "INATIVO" if service is False else "DESCONHECIDO"
     last_upload = str(collector.get("lastIndexUploadAt") or "-").replace("T", " ")[:19]

@@ -332,6 +332,7 @@ def collect_health(data_dir: Path, receipt: dict) -> dict:
         "disk": disk,
         "memory": memory,
         "loadAverage": [round(value, 2) for value in os.getloadavg()] if hasattr(os, "getloadavg") else [],
+        "cpuCount": os.cpu_count() or 1,
         "uptimeSeconds": uptime,
         "rebootRequired": Path("/var/run/reboot-required").exists(),
         "collector": {
