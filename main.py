@@ -153,6 +153,29 @@ class LocalRotalogRunner:
     def _daily_path(self, day: str, team_key: str) -> Path:
         return self.output_dir / "rotalog" / "equipes" / "daily" / day / f"{team_key}.json"
 
+    def _save_consolidated_daily(self, day: str, timestamp: str, documents: dict) -> Path:
+        """Preserva o diário completo de todas as equipes exclusivamente no disco local."""
+        path = self.index_path.parent.parent / "consolidated" / f"{day}.json"
+        saved, status = load_json_with_status(path, {})
+        if status == "corrupt":
+            raise RuntimeError(f"Diário consolidado local corrompido: {path}")
+        if saved.get("company") and company_key(saved["company"]) != self.company_key:
+            raise RuntimeError(f"Diário consolidado pertence a outra empresa: {path}")
+        equipes = saved.get("equipes", {})
+        if not isinstance(equipes, dict):
+            raise RuntimeError(f"Estrutura inválida do diário consolidado: {path}")
+        equipes.update(documents)
+        write_json(path, {
+            "schemaVersion": 1,
+            "company": self.empresa,
+            "date": day,
+            "timezone": str(TZ),
+            "lastCollectedAt": timestamp,
+            "totalEquipes": len(equipes),
+            "equipes": equipes,
+        })
+        return path
+
     def _legacy_daily_path(self, day: str, team_key: str) -> Path:
         return self._daily_path(day, team_key).with_suffix(".json.gz")
 
@@ -784,6 +807,8 @@ class LocalRotalogRunner:
             local_events = []
             cloud_events = []
 
+            prepared_daily = []
+
             for team in teams:
                 team_key = normalize_team_key(team.get("equipe_codigo"))
                 if not team_key:
@@ -807,6 +832,16 @@ class LocalRotalogRunner:
                 self.team_registry.record_history(
                     identity["teamId"], operational_day, team_key
                 )
+
+                prepared_daily.append((team_key, operational_day, daily_path, previous_daily, merged_daily))
+
+            # Salva todos os documentos completos antes de distribuí-los por equipe.
+            # Este caminho não participa das filas nem dos destinos de upload.
+            consolidated_path = self._save_consolidated_daily(
+                day, timestamp, {item[0]: item[4] for item in prepared_daily}
+            )
+
+            for team_key, operational_day, daily_path, previous_daily, merged_daily in prepared_daily:
 
                 changes = changed_fields(previous_daily, merged_daily) if previous_daily else {"novo": {}}
                 if previous_daily and not changes and previous_daily.get("date") == operational_day:
@@ -899,6 +934,7 @@ class LocalRotalogRunner:
                 "totalTeams": len(teams),
                 "updatedTeams": len(updates),
                 "ignoredTeams": ignored,
+                "localConsolidatedDaily": str(consolidated_path),
                 "firebaseUploaded": firebase_uploaded,
                 "firebaseSyncStatus": firebase_sync_status,
                 "dailySyncPending": daily_sync["pending"],

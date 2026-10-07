@@ -47,7 +47,7 @@ As regras de identidade, validação, migração de snapshots e resolução por 
 centralizadas em `coletor/equipes.py`.
 
 1. **Compactação Nativa GZIP (`.json.gz`)**:
-   - Todo o tráfego de rede e armazenamento em disco utiliza `.json.gz`.
+   - O tráfego de rede utiliza `.json.gz`; o diário consolidado local utiliza `.json` sem compactação.
    - O `index.json.gz` consolidado (todas as 100+ equipes) caiu de **785 KB para apenas 9.1 KB** (**~99% de economia**).
    - Cada arquivo de equipe compactado pesa entre **1.2 KB e 2.0 KB**.
 
@@ -66,6 +66,17 @@ centralizadas em `coletor/equipes.py`.
 ---
 
 ## 3. Estrutura de Arquivos
+
+O diário consolidado local fica em `rotalog/equipes/consolidated/AAAA-MM-DD.json`, sem compactação,
+ao lado da torre (`current`) e dos diários individuais (`daily`). Em cada coleta,
+ele é salvo antes da distribuição dos arquivos por equipe e contém os documentos
+completos, incluindo histórico de serviços, turnos e intervalos. O arquivo do dia
+é atualizado continuamente e mantém equipes já observadas que não apareçam em
+uma coleta posterior, inclusive após reiniciar o coletor. A data do arquivo é a
+data local da coleta; cada equipe preserva sua `operationalDate`, inclusive em
+turnos que atravessam a meia-noite. Dias anteriores ficam preservados. Esse
+consolidado é exclusivamente local, mesmo com `--firebase`, e não entra na fila
+de uploads. O caminho também aparece no log como `localConsolidatedDaily`.
 
 A confirmação do último índice enviado fica em `current/firebase-sync.json`, vinculada ao bucket e ao caminho remoto. Sem confirmação local, o primeiro ciclo envia o índice; ciclos sem mudanças dispensam o upload, inclusive após reiniciar. Falhas são tentadas novamente nos ciclos seguintes com os dados mais recentes. O índice local continua sendo atualizado em cada coleta. No Firebase, `updatedAtIso` indica a última publicação, não a última coleta. Os logs de execução permanecem somente no Orange Pi e são consumidos pela TUI.
 
@@ -87,6 +98,8 @@ dds-coletor-rtl/
 ├── dados-local/            # Armazenamento local (ignorado pelo git)
 │   └── rotalog/
 │       ├── equipes/
+│       │   ├── consolidated/
+│       │   │   └── AAAA-MM-DD.json            # Diário completo de todas as equipes, somente local
 │       │   ├── current/
 │       │   │   └── index.json.gz              # Torre de controle unificada (~9.1 KB)
 │       │   └── daily/
