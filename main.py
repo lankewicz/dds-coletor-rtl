@@ -837,9 +837,14 @@ class LocalRotalogRunner:
 
             # Salva todos os documentos completos antes de distribuí-los por equipe.
             # Este caminho não participa das filas nem dos destinos de upload.
-            consolidated_path = self._save_consolidated_daily(
-                day, timestamp, {item[0]: item[4] for item in prepared_daily}
+            consolidated_path = self.index_path.parent.parent / "consolidated" / f"{day}.json"
+            consolidated_updated = any(
+                self._daily_sync_reasons(item[3], item[4]) for item in prepared_daily
             )
+            if consolidated_updated:
+                self._save_consolidated_daily(
+                    day, timestamp, {item[0]: item[4] for item in prepared_daily}
+                )
 
             for team_key, operational_day, daily_path, previous_daily, merged_daily in prepared_daily:
 
@@ -935,6 +940,7 @@ class LocalRotalogRunner:
                 "updatedTeams": len(updates),
                 "ignoredTeams": ignored,
                 "localConsolidatedDaily": str(consolidated_path),
+                "localConsolidatedDailyUpdated": consolidated_updated,
                 "firebaseUploaded": firebase_uploaded,
                 "firebaseSyncStatus": firebase_sync_status,
                 "dailySyncPending": daily_sync["pending"],

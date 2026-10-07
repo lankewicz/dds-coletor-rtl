@@ -22,6 +22,7 @@ class ConsolidatedDailyTests(unittest.TestCase):
                 return original_write(path, value, *args, **kwargs)
 
             with patch("main.extrair_dados_tempo_real", return_value=teams), \
+                    patch.object(runner, "_daily_sync_reasons", return_value=["turno_aberto"]), \
                     patch("main.write_json", side_effect=record_write):
                 result = runner.run_once()
             self.assertEqual(result["status"], "success", result)
@@ -37,6 +38,34 @@ class ConsolidatedDailyTests(unittest.TestCase):
                 self.assertIn("turnos", document["jornada"])
                 self.assertLess(writes.index(consolidated_path), writes.index(individual))
             self.assertFalse(runner.daily_sync_queue_path.exists())
+
+    def test_only_history_events_refresh_the_consolidated_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            team = {"equipe_codigo": "E3733", "is_online": True}
+            with patch("main.extrair_dados_tempo_real", return_value=[team]):
+                runner = LocalRotalogRunner(root, "EmpresaTeste")
+                with patch.object(runner, "_daily_sync_reasons", return_value=[]):
+                    result = runner.run_once()
+                self.assertEqual(result["status"], "success", result)
+                path = Path(result["localConsolidatedDaily"])
+                self.assertFalse(path.exists())
+                self.assertFalse(result["localConsolidatedDailyUpdated"])
+                for reason in ("turno_aberto", "servico_concluido", "turno_fechado"):
+                    runner = LocalRotalogRunner(root, "EmpresaTeste")
+                    with patch.object(runner, "_daily_sync_reasons", return_value=[reason]):
+                        result = runner.run_once()
+                    self.assertEqual(result["status"], "success", result)
+                    self.assertTrue(result["localConsolidatedDailyUpdated"])
+                    contents = path.read_bytes()
+                    modified = path.stat().st_mtime_ns
+                    team["is_online"] = not team["is_online"]
+                    with patch.object(runner, "_daily_sync_reasons", return_value=[]):
+                        result = runner.run_once()
+                    self.assertEqual(result["status"], "success", result)
+                    self.assertFalse(result["localConsolidatedDailyUpdated"])
+                    self.assertEqual(path.read_bytes(), contents)
+                    self.assertEqual(path.stat().st_mtime_ns, modified)
 
     def test_missing_teams_restart_and_day_rollover(self):
         with tempfile.TemporaryDirectory() as directory:

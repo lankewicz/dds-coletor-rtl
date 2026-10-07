@@ -68,10 +68,11 @@ centralizadas em `coletor/equipes.py`.
 ## 3. Estrutura de Arquivos
 
 O diário consolidado local fica em `rotalog/equipes/consolidated/AAAA-MM-DD.json`, sem compactação,
-ao lado da torre (`current`) e dos diários individuais (`daily`). Em cada coleta,
+ao lado da torre (`current`) e dos diários individuais (`daily`). Quando alguma
+equipe abre ou fecha turno ou conclui um serviço,
 ele é salvo antes da distribuição dos arquivos por equipe e contém os documentos
 completos, incluindo histórico de serviços, turnos e intervalos. O arquivo do dia
-é atualizado continuamente e mantém equipes já observadas que não apareçam em
+é atualizado somente nesses eventos e mantém equipes já observadas que não apareçam em
 uma coleta posterior, inclusive após reiniciar o coletor. A data do arquivo é a
 data local da coleta; cada equipe preserva sua `operationalDate`, inclusive em
 turnos que atravessam a meia-noite. Dias anteriores ficam preservados. Esse
