@@ -279,3 +279,32 @@ configurar Funnel. A torre atual continua sendo a referência até validar tudo.
   expira para o sincronizador após 24h. Não habilitar composição permanente ainda.
 - Correção de conclusões preparada no Windows; validar o comportamento real no
   Orange após atualização. As exclusões anteriores de v2 continuam fora do commit.
+
+## Ajustes locais em 13/10/2026 — identidade de eventos e consolidado completo
+
+- Abertura/fechamento reconhecidos ficam em `observedShiftEvents` no diário.
+  O marcador usa o horário de origem do turno e normaliza fusos equivalentes.
+  Uma oscilação do mesmo turno não repete a publicação; um novo início continua
+  distinguindo um turno legítimo. Sem horário de origem, não há identidade forte.
+- Sem referência anterior, abertura/histórico são publicados como `estado_inicial`,
+  com resumo “Estado inicial”, em vez de inventar uma transição recente.
+- Diário individual ausente é recuperado do consolidado válido. Histórico
+  corrompido não é silenciosamente reinicializado.
+- O consolidado local agora acompanha qualquer mudança nos documentos completos,
+  incluindo intervalo, serviço, conexão, fila e marcadores. Metadados de mera
+  coleta/versão não obrigam regravação. A criação inicial de identidade pode
+  causar uma gravação adicional quando NEW_TEAM vira ACTIVE_VEHICLE.
+- Fila passa a ser preservada também no diário completo; mudanças de fila são
+  detectadas e gravadas, sem criar por si só evento de publicação na nuvem.
+- Na composição, eventos conhecidos têm marcadores por 48h; o feed continua com
+  janela de 24h. Cursor de equipes ausentes é preservado, sem publicar eventos
+  de equipes que não estão nos cards atuais.
+- Intervalos com horário usam identidade de origem; sem horário, uma mudança
+  exige duas observações consecutivas (atraso de até um ciclo adicional).
+  Oscilação persistente por duas coletas ainda pode representar mudança real ou
+  erro de origem; não há como distinguir os dois com certeza sem timestamps.
+- Se o journal desaparecer, a projeção pública válida recupera eventos e estados.
+  Journal/projeção corrompidos impedem recuperação silenciosa.
+- 205 testes passaram. Ajustes ainda locais no Windows, sem commit/push ou
+  atualização no Orange nesta etapa. Antes de ativar a torre, validar as fontes
+  reais e comparar os cards/eventos com o DDS.

@@ -460,6 +460,17 @@ class LocalRotalogRunner:
             legacy, legacy_status = load_json_with_status(path.with_suffix(".json.gz"), {})
             if legacy_status == "ok":
                 local, status = legacy, legacy_status
+        if status == "missing":
+            for archive_day in dict.fromkeys((datetime.now(TZ).date().isoformat(), day)):
+                archive = self.index_path.parent.parent / "consolidated" / f"{archive_day}.json"
+                consolidated, archive_status = load_json_with_status(archive, {})
+                if archive_status == "corrupt":
+                    raise RuntimeError("Consolidado corrompido; não reinicializar histórico ausente")
+                recovered = (consolidated.get("equipes") or {}).get(team_key, {})
+                if recovered and self._valid_daily_recovery(recovered, day, team_key):
+                    write_json(path, recovered)
+                    local, status = recovered, "ok"
+                    break
         if status != "corrupt":
             local_company = str(local.get("companyKey") or "").strip().lower() if local else ""
             if not local_company and local and local.get("company"):
@@ -492,15 +503,34 @@ class LocalRotalogRunner:
         return remote
 
     @staticmethod
+    def _shift_event_key(document: dict, kind: str):
+        turno = (document.get("jornada") or {}).get("turno") or {}
+        value = turno.get("inicio") or (turno.get("fim") if kind == "turno_fechado" else None)
+        if not value:
+            return None
+        text = str(value)
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if dt.tzinfo is not None:
+                text = str(dt.timestamp())
+        except ValueError:
+            pass
+        return hashlib.sha256((kind + "|" + text).encode()).hexdigest()
+
+    @staticmethod
     def _daily_sync_reasons(previous: dict, current: dict) -> list[str]:
         reasons = []
         prev_turno = ((previous.get("jornada") or {}).get("turno") or {})
         curr_turno = ((current.get("jornada") or {}).get("turno") or {})
         prev_status = str(prev_turno.get("status") or "").upper()
         curr_status = str(curr_turno.get("status") or "").upper()
-        if curr_status == "ABERTO" and prev_status != "ABERTO":
+        if not previous and (curr_status == "ABERTO" or (current.get("ordensServico") or {}).get("historico")):
+            return ["estado_inicial"]  # Publicar a referência, sem inventar transição recente.
+        same_opening = bool(prev_turno.get("inicio") and prev_turno.get("inicio") == curr_turno.get("inicio"))
+        same_closure = bool(prev_turno.get("fim") and prev_turno.get("fim") == curr_turno.get("fim"))
+        if curr_status == "ABERTO" and prev_status != "ABERTO" and not same_opening:
             reasons.append("turno_aberto")
-        if curr_status == "FECHADO" and prev_status == "ABERTO":
+        if curr_status == "FECHADO" and prev_status == "ABERTO" and not same_closure:
             reasons.append("turno_fechado")
 
         def completed(document):
@@ -542,7 +572,9 @@ class LocalRotalogRunner:
         if any(not any(same_completion(old, new) for old in previous_concluded)
                for new in completed(current)):
             reasons.append("servico_concluido")
-        return reasons
+        known = previous.get("observedShiftEvents") or {}
+        return [reason for reason in reasons if reason not in ("turno_aberto", "turno_fechado")
+                or LocalRotalogRunner._shift_event_key(current, reason) not in known]
 
     @staticmethod
     def _daily_history_is_finalized(document: dict) -> bool:
@@ -907,6 +939,19 @@ class LocalRotalogRunner:
                 daily_path = self._daily_path(operational_day, team_key)
                 previous_daily = self._load_daily_with_recovery(daily_path, operational_day, team_key)
                 merged_daily = merge_daily_document(previous_daily, document, operational_day)
+                merged_daily["fila"] = queue_counts(team)
+                known = dict(previous_daily.get("observedShiftEvents") or {})
+                recognized = self._daily_sync_reasons(previous_daily, merged_daily)
+                turno_status = ((merged_daily.get("jornada") or {}).get("turno") or {}).get("status")
+                if turno_status in ("ABERTO", "FECHADO"):
+                    # Seed observations as well as transitions: absence is not proof of a new event.
+                    recognized.append("turno_aberto" if turno_status == "ABERTO" else "turno_fechado")
+                for reason in recognized:
+                    if reason in ("turno_aberto", "turno_fechado"):
+                        key = self._shift_event_key(merged_daily, reason)
+                        if key:
+                            known[key] = True
+                merged_daily["observedShiftEvents"] = known
                 self.team_registry.record_history(
                     identity["teamId"], operational_day, team_key
                 )
@@ -916,8 +961,17 @@ class LocalRotalogRunner:
             # Salva todos os documentos completos antes de distribuí-los por equipe.
             # Este caminho não participa das filas nem dos destinos de upload.
             consolidated_path = self.index_path.parent.parent / "consolidated" / f"{day}.json"
-            consolidated_updated = any(
-                self._daily_sync_reasons(item[3], item[4]) for item in prepared_daily
+            existing_consolidated, consolidated_status = load_json_with_status(consolidated_path, {})
+            if consolidated_status == "corrupt":
+                raise RuntimeError("Diário consolidado local corrompido")
+            if existing_consolidated.get("company") and company_key(existing_consolidated["company"]) != self.company_key:
+                raise RuntimeError("Consolidado de outra empresa")
+            if not isinstance(existing_consolidated.get("equipes", {}), dict):
+                raise RuntimeError("Consolidado inválido")
+            consolidated_updated = consolidated_status == "missing" or any(
+                self._daily_document_digest(existing_consolidated.get("equipes", {}).get(item[0], {}))
+                != self._daily_document_digest(item[4])
+                for item in prepared_daily
             )
             if consolidated_updated:
                 self._save_consolidated_daily(
@@ -945,7 +999,7 @@ class LocalRotalogRunner:
                         sync_reasons,
                     )
 
-                    transition = summarize_team_transition(
+                    transition = "Estado inicial" if "estado_inicial" in sync_reasons else summarize_team_transition(
                         previous_daily,
                         merged_daily,
                         sync_reasons=sync_reasons,

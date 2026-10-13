@@ -173,3 +173,93 @@ class ComposerTests(unittest.TestCase):
         self.assertEqual([e["type"] for e in data["events"]], ["servico_execucao", "servico_conclusao"])
         again = TorreComposer(self.root, "ChicoEletro").publish(index(), sources(), docs, NOW+timedelta(minutes=4))
         self.assertEqual(data["events"], again["events"])
+
+    def test_opening_event_is_stable_after_restart(self):
+        self.composer.publish(index("FECHADO"), sources(), now=NOW)
+        opened = index()
+        opened["equipes"]["E3733"]["jornada"]["turno"]["inicio"] = (NOW+timedelta(minutes=1)).isoformat()
+        first = self.composer.publish(opened, sources(), now=NOW+timedelta(minutes=2))
+        again = TorreComposer(self.root, "ChicoEletro").publish(opened, sources(), now=NOW+timedelta(minutes=3))
+        self.assertEqual([e["type"] for e in first["events"]], ["turno_aberto"])
+        self.assertEqual(first["events"], again["events"])
+
+    def test_interval_events_repeat_only_when_state_changes(self):
+        normal = index()
+        paused = copy.deepcopy(normal)
+        paused["equipes"]["E3733"]["jornada"]["emIntervalo"] = True
+        self.composer.publish(normal, sources(), now=NOW)
+        first = self.composer.publish(paused, sources(), now=NOW+timedelta(minutes=1))
+        repeat = TorreComposer(self.root, "ChicoEletro").publish(paused, sources(), now=NOW+timedelta(minutes=2))
+        self.assertEqual(first["events"], [])
+        self.assertEqual([e["type"] for e in repeat["events"]], ["intervalo_inicio"])
+        resumed = self.composer.publish(normal, sources(), now=NOW+timedelta(minutes=3))
+        oscillated = self.composer.publish(paused, sources(), now=NOW+timedelta(minutes=4))
+        self.assertEqual([e["type"] for e in resumed["events"]], ["intervalo_inicio"])
+        self.assertEqual([e["type"] for e in oscillated["events"]],
+                         ["intervalo_inicio"])
+
+    def test_missing_journal_seeds_state_without_fake_events(self):
+        self.composer.publish(index(), sources(), now=NOW)
+        self.composer.journal.unlink()
+        closed = self.composer.publish(index("FECHADO"), sources(), now=NOW+timedelta(minutes=1))
+        self.assertEqual([event["type"] for event in closed["events"]], ["turno_fechado"])
+
+    def test_interval_source_identity_survives_oscillation(self):
+        base = index()
+        self.composer.publish(base, sources(), now=NOW)
+        paused = copy.deepcopy(base)
+        paused["equipes"]["E3733"]["jornada"]["emIntervalo"] = True
+        docs = {"E3733": {"jornada": {"intervalos": [{"inicio": (NOW+timedelta(minutes=1)).isoformat()}]}}}
+        first = self.composer.publish(paused, sources(), docs, NOW+timedelta(minutes=2))
+        self.assertEqual(first["events"][0]["timeSource"], "source")
+        self.composer.publish(base, sources(), docs, NOW+timedelta(minutes=3))
+        again = self.composer.publish(paused, sources(), docs, NOW+timedelta(minutes=4))
+        self.assertEqual([e["type"] for e in again["events"]], ["intervalo_inicio"])
+
+    def test_confirmed_interval_exit_and_second_real_interval(self):
+        normal = index()
+        paused = copy.deepcopy(normal)
+        paused["equipes"]["E3733"]["jornada"]["emIntervalo"] = True
+        self.composer.publish(normal, sources(), now=NOW)
+        for minute, snapshot in ((1, paused), (2, paused), (3, normal), (4, normal), (5, paused), (6, paused)):
+            result = TorreComposer(self.root, "ChicoEletro").publish(snapshot, sources(), now=NOW+timedelta(minutes=minute))
+        self.assertEqual([e["type"] for e in result["events"]],
+                         ["intervalo_inicio", "intervalo_fim", "intervalo_inicio"])
+
+    def test_missing_journal_preserves_existing_events(self):
+        self.composer.publish(index(), sources(), now=NOW)
+        closed = index("FECHADO")
+        result = self.composer.publish(closed, sources(), now=NOW+timedelta(minutes=1))
+        self.composer.journal.unlink()
+        recovered = self.composer.publish(closed, sources(), now=NOW+timedelta(minutes=2))
+        self.assertEqual(result["events"], recovered["events"])
+
+    def test_same_shift_closure_is_not_renewed_by_oscillation(self):
+        opened = index()
+        closed = index("FECHADO")
+        self.composer.publish(opened, sources(), now=NOW)
+        first = self.composer.publish(closed, sources(), now=NOW+timedelta(minutes=1))
+        self.composer.publish(opened, sources(), now=NOW+timedelta(minutes=2))
+        repeat = self.composer.publish(closed, sources(), now=NOW+timedelta(minutes=3))
+        self.assertEqual(first["events"], repeat["events"])
+
+    def test_missing_team_keeps_cursor_without_invalid_visible_events(self):
+        self.composer.publish(index(), sources(), now=NOW)
+        self.composer.publish(index("FECHADO"), sources(), now=NOW+timedelta(minutes=1))
+        empty = index()
+        empty["equipes"] = {}
+        src = sources()
+        src["catalog"]["data"]["teams"] = {}
+        src["daily"] = {}
+        gone = self.composer.publish(empty, src, now=NOW+timedelta(minutes=2))
+        self.assertEqual(gone["items"], [])
+        self.assertEqual(gone["events"], [])
+        returned = self.composer.publish(index("FECHADO"), sources(), now=NOW+timedelta(minutes=3))
+        self.assertEqual(returned["events"], [])
+
+    def test_closed_baseline_does_not_become_new_close_after_oscillation(self):
+        closed = index("FECHADO")
+        self.composer.publish(closed, sources(), now=NOW)
+        self.composer.publish(index(), sources(), now=NOW+timedelta(minutes=1))
+        after = self.composer.publish(closed, sources(), now=NOW+timedelta(minutes=2))
+        self.assertEqual(after["events"], [])

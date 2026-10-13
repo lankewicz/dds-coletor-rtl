@@ -71,7 +71,7 @@ class DailySyncQueueTests(unittest.TestCase):
 
     def test_event_policy_covers_open_new_completion_and_close_only(self):
         opened = self.document
-        self.assertEqual(self.runner._daily_sync_reasons({}, opened), ["turno_aberto"])
+        self.assertEqual(self.runner._daily_sync_reasons({}, opened), ["estado_inicial"])
 
         completed = copy.deepcopy(opened)
         completed["ordensServico"]["historico"] = [{
@@ -151,6 +151,54 @@ class DailySyncQueueTests(unittest.TestCase):
             rebuilt["items"][f"{self.day}/{self.team_key}"]["reasons"],
             ["fila_reconstruida"],
         )
+
+    def test_repeated_shift_states_do_not_repeat_upload_events(self):
+        for status in ("ABERTO", "FECHADO"):
+            doc = copy.deepcopy(self.document)
+            doc["jornada"]["turno"].update(status=status, inicio="2026-09-14T08:00:00-03:00")
+            updated = copy.deepcopy(doc)
+            updated["updatedAt"] = "2026-09-14T10:00:00-03:00"
+            self.assertEqual(self.runner._daily_sync_reasons(doc, updated), [])
+            write_json(self.daily_path, doc)
+            restarted = self.new_runner()
+            saved = restarted._load_daily_with_recovery(self.daily_path, self.day, self.team_key)
+            self.assertEqual(restarted._daily_sync_reasons(saved, updated), [])
+
+    def test_missing_history_and_shift_oscillation_remain_detection_risks(self):
+        opened = copy.deepcopy(self.document)
+        closed = copy.deepcopy(opened)
+        closed["jornada"]["turno"]["status"] = "FECHADO"
+        self.assertEqual(self.runner._daily_sync_reasons({}, opened), ["estado_inicial"])
+        self.assertEqual(self.runner._daily_sync_reasons({}, closed), [])
+        for old, new, reason in ((opened, closed, "turno_fechado"),
+                                 (closed, opened, "turno_aberto"), (opened, closed, "turno_fechado")):
+            self.assertEqual(self.runner._daily_sync_reasons(old, new), [reason])
+
+    def test_interval_changes_remain_local_and_stable_state_does_not_repeat(self):
+        from coletor.storage import summarize_team_transition
+        normal = copy.deepcopy(self.document)
+        normal["jornada"]["emIntervalo"] = False
+        paused = copy.deepcopy(normal)
+        paused["jornada"]["emIntervalo"] = True
+        self.assertEqual(summarize_team_transition(normal, paused), "Início de Intervalo")
+        self.assertEqual(summarize_team_transition(paused, normal), "Fim de Intervalo")
+        for old, new in ((normal, paused), (paused, normal), (paused, paused)):
+            self.assertEqual(self.runner._daily_sync_reasons(old, new), [])
+        self.assertNotIn(summarize_team_transition(paused, paused), ("Início de Intervalo", "Fim de Intervalo"))
+
+    def test_persisted_shift_markers_block_oscillation_but_allow_new_shift(self):
+        closed = copy.deepcopy(self.document)
+        closed["jornada"]["turno"].update(status="FECHADO", inicio="2026-09-14T08:00:00-03:00")
+        key = self.runner._shift_event_key(closed, "turno_fechado")
+        reopened = copy.deepcopy(closed)
+        reopened["jornada"]["turno"]["status"] = "ABERTO"
+        reopened["observedShiftEvents"] = {key: True}
+        write_json(self.daily_path, reopened)
+        restarted = self.new_runner()
+        saved = load_json(self.daily_path, {})
+        self.assertEqual(restarted._daily_sync_reasons(saved, closed), [])
+        closed["jornada"]["turno"]["inicio"] = "2026-09-14T14:00:00-03:00"
+        self.assertEqual(restarted._daily_sync_reasons(saved, closed), ["turno_fechado"])
 
 
 if __name__ == "__main__":

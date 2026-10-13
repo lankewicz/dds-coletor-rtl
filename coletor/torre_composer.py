@@ -154,16 +154,25 @@ def update_events(previous, items, services, now):
     old_states = previous.get("states", {})
     old_services = previous.get("services", {})
     previous_at = timestamp(previous["projection"]["composedAt"]) if previous else None
-    states = {item["teamKey"]: {"turnStatus": item["turnStatus"], "estado": item["estado"]} for item in items}
+    states = dict(old_states)
+    for item in items:
+        key = item["teamKey"]
+        states[key] = {**old_states.get(key, {}), "turnStatus": item["turnStatus"], "estado": item["estado"]}
+    known_events = {key: value for key, value in previous.get("knownEvents", {}).items()
+                    if timestamp(value) >= now - timedelta(hours=48)}
+    visible_keys = {item["teamKey"] for item in items}
     events = {event["id"]: event for event in previous.get("projection", {}).get("events", [])
-              if event["teamKey"] in states and timestamp(event["occurredAt"]) >= now - timedelta(hours=24)}
+              if event["teamKey"] in visible_keys and timestamp(event["occurredAt"]) >= now - timedelta(hours=24)}
 
-    def add(team, kind, real_at, details):
+    def add(team, kind, real_at, details, occurrence=None):
         stamp = to_utc_dt(real_at)
         if stamp and (stamp > now + timedelta(seconds=30) or (previous_at and stamp < previous_at)):
             return
         occurred = (stamp or now).isoformat()
-        event_id = identity([team, kind, occurred, details])
+        event_id = identity([team, kind, occurrence or occurred, details])
+        if event_id in known_events:
+            return
+        known_events[event_id] = occurred
         events[event_id] = {"id": event_id, "teamKey": team, "type": kind,
                             "occurredAt": occurred, "timeSource": "source" if stamp else "observation", **details}
 
@@ -171,26 +180,52 @@ def update_events(previous, items, services, now):
         key = item["teamKey"]
         old = old_states.get(key)
         if old is None:
+            # Baseline also remembers an already closed shift, without publishing an event.
+            if item["turnStatus"] == "FECHADO" and (item.get("turnoInicio") or item.get("turnoFim")):
+                occurrence = [item.get("turnoInicio"), item.get("turnoFim") or "observed-close"]
+                known_events[identity([key, "turno_fechado", occurrence, {}])] = now.isoformat()
             continue  # Primeira observação nunca inventa abertura/fechamento.
         if old["turnStatus"] == "ABERTO" and item["turnStatus"] == "FECHADO":
-            add(key, "turno_fechado", item.get("turnoFim"), {})
+            add(key, "turno_fechado", item.get("turnoFim"), {},
+                occurrence=[item.get("turnoInicio"), item.get("turnoFim") or "observed-close"]
+                if item.get("turnoInicio") or item.get("turnoFim") else None)
         elif old["turnStatus"] != "ABERTO" and item["turnStatus"] == "ABERTO":
-            add(key, "turno_aberto", item.get("turnoInicio"), {})
+            add(key, "turno_aberto", item.get("turnoInicio"), {}, occurrence=item.get("turnoInicio"))
         if old["estado"] != item["estado"] and "INTERVALO" in (old["estado"], item["estado"]):
-            add(key, "intervalo_inicio" if item["estado"] == "INTERVALO" else "intervalo_fim", None, {})
+            intervals = ((item.get("rotalogSnapshot") or {}).get("jornada") or {}).get("intervalos") or []
+            latest = max(intervals, key=lambda interval: str(interval.get("inicio") or "")) if intervals else {}
+            entering = item["estado"] == "INTERVALO"
+            real_at = latest.get("inicio" if entering else "fim")
+            kind = "intervalo_inicio" if entering else "intervalo_fim"
+            if real_at:
+                add(key, kind, real_at, {}, occurrence=[latest.get("inicio"), real_at])
+            else:
+                # Sem identidade de origem, exigir duas observações consecutivas.
+                pending = old.get("pendingInterval")
+                target = item["estado"] == "INTERVALO"
+                states[key]["confirmedInterval"] = old.get("confirmedInterval", old["estado"] == "INTERVALO")
+                states[key]["pendingInterval"] = target
+                states[key]["pendingIntervalAt"] = old.get("pendingIntervalAt") if pending == target else now.isoformat()
+        elif "pendingInterval" in old:
+            target = item["estado"] == "INTERVALO"
+            if old["pendingInterval"] == target and old.get("confirmedInterval") != target:
+                add(key, "intervalo_inicio" if target else "intervalo_fim", None, {},
+                    occurrence=old.get("pendingIntervalAt"))
+                states[key]["confirmedInterval"] = target
+            states[key].pop("pendingInterval", None)
     if previous:
         for key, service in services.items():
             old = old_services.get(key)
             timeline = service.get("timeline", {})
             known = (old or {}).get("timeline", {})
             for transition_id, transition in timeline.items():
-                if transition_id not in known and service["teamKey"] in states:
+                if transition_id not in known and service["teamKey"] in visible_keys:
                     add(service["teamKey"], "servico_" + transition["status"].lower(), transition["occurredAt"],
                         {"serviceId": service["serviceId"], "status": transition["status"]})
             if old is None and service["status"] == "CONCLUSAO" and not service["occurredAt"]:
                 continue  # Histórico sem horário não prova uma conclusão recente.
             if old is None or old["status"] != service["status"]:
-                if service["teamKey"] in states and not any(t["status"] == service["status"] for t in timeline.values()):
+                if service["teamKey"] in visible_keys and not any(t["status"] == service["status"] for t in timeline.values()):
                     add(service["teamKey"], "servico_" + service["status"].lower(), service["occurredAt"],
                         {"serviceId": service["serviceId"], "status": service["status"]})
     # Guardar cursores de serviços já observados evita duplicação em janelas/arquivos ausentes.
@@ -198,7 +233,7 @@ def update_events(previous, items, services, now):
     for key, service in services.items():
         cursor[key] = {**service, "timeline": {**old_services.get(key, {}).get("timeline", {}),
                                                **service.get("timeline", {})}}
-    return states, cursor, sorted(events.values(), key=lambda e: (e["occurredAt"], e["id"]))
+    return states, cursor, sorted(events.values(), key=lambda e: (e["occurredAt"], e["id"])), known_events
 
 
 class TorreComposer:
@@ -217,8 +252,25 @@ class TorreComposer:
             if previous:
                 validate_projection(previous["projection"], self.company)
             items, resolve = compose_cards(index, inputs, self.company, now)
-            services = service_observations(documents or index["equipes"], resolve)
-            states, cursor, events = update_events(previous, items, services, now)
+            local_documents = documents or index["equipes"]
+            services = service_observations(local_documents, resolve)
+            by_team = {resolve(key): doc for key, doc in local_documents.items()}
+            for item in items:
+                if item.get("rotalogSnapshot"):
+                    snapshot = dict(item["rotalogSnapshot"])
+                    snapshot["jornada"] = {**snapshot.get("jornada", {}), "intervalos":
+                        (by_team.get(item["teamKey"], {}).get("jornada") or {}).get("intervalos", [])}
+                    item["rotalogSnapshot"] = snapshot
+            if not previous and self.path.exists():
+                published, published_state = load_json_with_status(self.path, {})
+                if published_state != "ok":
+                    raise ValueError("Projeção anterior inválida; não reinicializar eventos")
+                validate_projection(published, self.company)
+                previous = {"projection": published, "services": services,
+                            "states": {item["teamKey"]: {"turnStatus": item["turnStatus"], "estado": item["estado"]}
+                                       for item in published["items"]},
+                            "knownEvents": {event["id"]: event["occurredAt"] for event in published["events"]}}
+            states, cursor, events, known_events = update_events(previous, items, services, now)
             collected = timestamp(index["lastCollectedAt"])
             age = (now-collected).total_seconds()
             sources = {**inputs["sources"], "rotalog": {"updatedAt": collected.isoformat(),
@@ -228,6 +280,6 @@ class TorreComposer:
                           "sources": sources, "items": items, "events": events, "summary": index.get("summary", {})}
             validate_projection(projection, self.company)
             # Journal primeiro: se a publicação falhar, a próxima tentativa recupera os eventos.
-            write_json(self.journal, {"projection": projection, "states": states, "services": cursor})
+            write_json(self.journal, {"projection": projection, "states": states, "services": cursor, "knownEvents": known_events})
             publish_projection(self.path, projection, self.company)
             return projection

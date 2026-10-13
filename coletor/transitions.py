@@ -96,6 +96,9 @@ def changed_fields(
                     "novo": curr_os["historico"],
                 }
 
+        for field in ("fila", "observedShiftEvents"):
+            if previous.get(field) != current.get(field):
+                changes[field] = {"anterior": previous.get(field), "novo": current.get(field)}
         return changes
 
     for field in TRACKED_FIELDS:

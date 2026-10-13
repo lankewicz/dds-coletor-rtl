@@ -39,33 +39,45 @@ class ConsolidatedDailyTests(unittest.TestCase):
                 self.assertLess(writes.index(consolidated_path), writes.index(individual))
             self.assertFalse(runner.daily_sync_queue_path.exists())
 
-    def test_only_history_events_refresh_the_consolidated_file(self):
+    def test_operational_changes_refresh_without_cloud_events(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             team = {"equipe_codigo": "E3733", "is_online": True}
+            runner = LocalRotalogRunner(root, "EmpresaTeste")
+            with patch("main.extrair_dados_tempo_real", return_value=[team]), \
+                    patch.object(runner, "_daily_sync_reasons", return_value=[]):
+                first = runner.run_once()
+                path = Path(first["localConsolidatedDaily"])
+                self.assertTrue(first["localConsolidatedDailyUpdated"])
+                contents = path.read_bytes()
+                second = runner.run_once()
+                # A segunda observação resolve NEW_TEAM -> ACTIVE_VEHICLE.
+                contents = path.read_bytes()
+                stable = runner.run_once()
+                self.assertFalse(stable["localConsolidatedDailyUpdated"])
+                self.assertEqual(path.read_bytes(), contents)
+                team["is_online"] = False
+                third = runner.run_once()
+                self.assertTrue(third["localConsolidatedDailyUpdated"])
+                self.assertFalse(load_json(path, {})["equipes"]["E3733"]["conexao"]["isOnline"])
+                daily = runner._daily_path(load_json(path, {})["equipes"]["E3733"]["date"], "E3733")
+                daily.unlink()
+                fourth = runner.run_once()
+                self.assertEqual(fourth["status"], "success")
+                self.assertEqual(load_json(daily, {})["teamKey"], "E3733")
+
+    def test_queue_only_changes_refresh_full_consolidated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = LocalRotalogRunner(Path(directory), "EmpresaTeste")
+            team = {"equipe_codigo": "E3733", "is_online": True, "ss_pendentes": []}
             with patch("main.extrair_dados_tempo_real", return_value=[team]):
-                runner = LocalRotalogRunner(root, "EmpresaTeste")
-                with patch.object(runner, "_daily_sync_reasons", return_value=[]):
-                    result = runner.run_once()
-                self.assertEqual(result["status"], "success", result)
-                path = Path(result["localConsolidatedDaily"])
-                self.assertFalse(path.exists())
-                self.assertFalse(result["localConsolidatedDailyUpdated"])
-                for reason in ("turno_aberto", "servico_concluido", "turno_fechado"):
-                    runner = LocalRotalogRunner(root, "EmpresaTeste")
-                    with patch.object(runner, "_daily_sync_reasons", return_value=[reason]):
-                        result = runner.run_once()
-                    self.assertEqual(result["status"], "success", result)
-                    self.assertTrue(result["localConsolidatedDailyUpdated"])
-                    contents = path.read_bytes()
-                    modified = path.stat().st_mtime_ns
-                    team["is_online"] = not team["is_online"]
-                    with patch.object(runner, "_daily_sync_reasons", return_value=[]):
-                        result = runner.run_once()
-                    self.assertEqual(result["status"], "success", result)
-                    self.assertFalse(result["localConsolidatedDailyUpdated"])
-                    self.assertEqual(path.read_bytes(), contents)
-                    self.assertEqual(path.stat().st_mtime_ns, modified)
+                first = runner.run_once()
+                team["ss_pendentes"] = [{"tipo": "EMERGENCIA"}]
+                second = runner.run_once()
+            self.assertEqual(second["status"], "success")
+            self.assertTrue(second["localConsolidatedDailyUpdated"])
+            saved = load_json(Path(first["localConsolidatedDaily"]), {})
+            self.assertEqual(saved["equipes"]["E3733"]["fila"]["emergencia"], 1)
 
     def test_missing_teams_restart_and_day_rollover(self):
         with tempfile.TemporaryDirectory() as directory:
