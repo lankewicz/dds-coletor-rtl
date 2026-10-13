@@ -261,3 +261,21 @@ configurar Funnel. A torre atual continua sendo a referência até validar tudo.
   publicação da torre ou ativação do Funnel nesta etapa.
 - Próximo: exportação periódica do cadastro no DDS, validar fontes e composição
   reais, instalar no Orange, configurar chave/Funnel e integrar a interface.
+
+## Ajustes em 13/10/2026 — conclusões e cadastro
+
+- Orange atualizado para e0dc06b e reiniciado pelo usuário; dois ciclos
+  bem-sucedidos confirmados com 95 equipes e uploads Firebase.
+- Detectada repetição da conclusão 51049390/E4A20 nos logs. Diário remoto
+  inspecionado contém apenas uma ocorrência; causa exata ainda requer validação.
+- Detecção de nova conclusão endurecida: mudança de serviceId não gera evento
+  novo quando protocolo/início identificam o mesmo serviço. Inícios com fusos
+  equivalentes são comparados pelo instante; serviços realmente distintos continuam
+  gerando evento. Teste de regressão incluído; 85 testes passaram.
+- Exportador corrigido para resolver imports do monitor e aceitar --credentials.
+- Cadastro DDS real exportado e publicado: 198 equipes em
+  dados/chicoeletro/dds/controle/cadastro/current.json.gz.
+- Publicação pontual: exportação periódica ainda precisa ser instalada; o cadastro
+  expira para o sincronizador após 24h. Não habilitar composição permanente ainda.
+- Correção de conclusões preparada no Windows; validar o comportamento real no
+  Orange após atualização. As exclusões anteriores de v2 continuam fora do commit.

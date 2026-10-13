@@ -503,30 +503,44 @@ class LocalRotalogRunner:
         if curr_status == "FECHADO" and prev_status == "ABERTO":
             reasons.append("turno_fechado")
 
-        def concluded_service_ids(document: dict) -> set[tuple[str, str]]:
-            history = (document.get("ordensServico") or {}).get("historico") or []
-            identities = set()
-            for index, service in enumerate(history):
-                if not isinstance(service, dict) or service.get("statusAtual") != "CONCLUSAO":
-                    continue
-                service_id = str(service.get("serviceId") or "").strip()
-                start = str(
-                    service.get("inicioDeslocamento") or service.get("inicioExecucao") or ""
-                ).strip()
-                protocol = str(service.get("protocolo") or "").strip()
-                if service_id:
-                    identities.add(("id", service_id))
-                elif start:
-                    identities.add(("start", start))
-                elif protocol:
-                    identities.add(("protocol", protocol))
-                else:
-                    identities.add(("position", str(index)))
-            return identities
+        def completed(document):
+            return [{**service, "_syncPosition": position}
+                    for position, service in enumerate((document.get("ordensServico") or {}).get("historico") or [])
+                    if isinstance(service, dict) and service.get("statusAtual") == "CONCLUSAO"]
 
-        previous_concluded = concluded_service_ids(previous)
-        current_concluded = concluded_service_ids(current)
-        if current_concluded - previous_concluded:
+        def normalized_time(value):
+            text = str(value or "").strip()
+            if not text:
+                return ""
+            try:
+                dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                return dt.timestamp() if dt.tzinfo is not None else text
+            except ValueError:
+                return text
+
+        def same_completion(old, new):
+            old_id, new_id = (str(item.get("serviceId") or "").strip() for item in (old, new))
+            if old_id and old_id == new_id:
+                return True
+            old_protocol, new_protocol = (str(item.get("protocolo") or "").strip() for item in (old, new))
+            old_start, new_start = (normalized_time(item.get("inicioDeslocamento") or item.get("inicioExecucao"))
+                                    for item in (old, new))
+            if old_protocol and old_protocol == new_protocol:
+                if old_start and new_start:
+                    return old_start == new_start
+                old_end, new_end = (normalized_time(item.get("fimExecucao") or item.get("retorno"))
+                                   for item in (old, new))
+                return bool(old_end and old_end == new_end)
+            # Compatibilidade com diários antigos sem protocolo/identidade.
+            if not old_protocol and not new_protocol and old_start and old_start == new_start:
+                return True
+            if not any((old_id, new_id, old_protocol, new_protocol, old_start, new_start)):
+                return old["_syncPosition"] == new["_syncPosition"]
+            return False
+
+        previous_concluded = completed(previous)
+        if any(not any(same_completion(old, new) for old in previous_concluded)
+               for new in completed(current)):
             reasons.append("servico_concluido")
         return reasons
 

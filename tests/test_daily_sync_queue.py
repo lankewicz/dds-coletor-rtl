@@ -104,6 +104,20 @@ class DailySyncQueueTests(unittest.TestCase):
         self.assertNotIn("turno_fechado", self.runner._daily_sync_reasons({}, closed))
         self.assertEqual(self.runner._daily_sync_reasons({}, {"jornada": {"turno": {"status": "FECHADO"}}}), [])
 
+    def test_corrected_service_id_does_not_repeat_same_completion(self):
+        previous = copy.deepcopy(self.document)
+        previous["ordensServico"]["historico"] = [{
+            "serviceId": "E3733_old", "protocolo": "51049390", "statusAtual": "CONCLUSAO",
+            "inicioDeslocamento": "2026-09-14T09:56:00-03:00", "fimExecucao": "2026-09-14T10:21:00-03:00",
+        }]
+        current = copy.deepcopy(previous)
+        current["ordensServico"]["historico"][0].update(
+            serviceId="E3733_new", inicioDeslocamento="2026-09-14T12:56:00Z")
+        self.assertEqual(self.runner._daily_sync_reasons(previous, current), [])
+        current["ordensServico"]["historico"][0].update(
+            inicioDeslocamento="2026-09-14T11:00:00-03:00", fimExecucao="2026-09-14T11:20:00-03:00")
+        self.assertIn("servico_concluido", self.runner._daily_sync_reasons(previous, current))
+
     def test_closed_daily_history_is_finalized_and_open_history_is_not(self):
         open_history = {"jornada": {"turno": {"status": "ABERTO"}}}
         closed_history = {"jornada": {"turno": {"status": "FECHADO"}}}
