@@ -144,6 +144,33 @@ class LocalRotalogRunner:
                     self.team_registry.dirty = True
                     self.team_registry.save()
 
+        self.torre_inputs = None
+        if os.getenv("TORRE_INPUTS_ENABLED", "false").strip().lower() in ("true", "1", "yes"):
+            from coletor.torre_inputs import GcsInputs, TorreInputsSync
+            input_store = self.firebase_store or _init_firebase_storage(self.empresa)[0]
+            if input_store is None:
+                raise RuntimeError("Storage indisponível para sincronizar entradas da torre")
+            if input_store._client_factory:
+                input_client = input_store._client_factory()
+            else:
+                from google.cloud import storage
+                input_client = storage.Client()
+            self.torre_inputs = TorreInputsSync(
+                self.output_dir, self.empresa, GcsInputs(input_client, input_store.bucket_name),
+                prefix=os.getenv("TORRE_DDS_CONTROL_PREFIX"),
+                interval=int(os.getenv("TORRE_INPUTS_INTERVAL_SECONDS", "300")),
+                days=int(os.getenv("TORRE_DDS_HISTORY_DAYS", "25")),
+                catalog_max_age=int(os.getenv("TORRE_CATALOG_MAX_AGE_SECONDS", "86400")),
+            )
+        self.torre_composer = None
+        if os.getenv("TORRE_COMPOSE_ENABLED", "false").strip().lower() in ("true", "1", "yes"):
+            if self.torre_inputs is None:
+                raise ValueError("TORRE_COMPOSE_ENABLED exige TORRE_INPUTS_ENABLED")
+            from coletor.torre_composer import TorreComposer
+            self.torre_composer = TorreComposer(
+                self.output_dir, self.empresa,
+                rotalog_max_age=int(os.getenv("TORRE_ROTALOG_MAX_AGE_SECONDS", "1200")),
+            )
         self._set_runtime_status("AGUARDANDO", "Aguardando próximo ciclo")
 
     @property
@@ -689,12 +716,49 @@ class LocalRotalogRunner:
 
     def run_once(self) -> dict:
         """Executa um ciclo mantendo o LED vermelho até a última gravação local."""
+        input_status = None
+        if self.torre_inputs is not None:
+            try:
+                input_status = self.torre_inputs.sync(now=datetime.now(TZ))
+            except Exception as exc:
+                input_status = {"available": False, "stale": True, "errorType": type(exc).__name__}
         started_at = datetime.now(TZ)
         self._set_runtime_status("COLETANDO", "Coletando dados do ROTALOG", started_at)
         self.processing_led.processing()
         try:
             with self.team_registry.exclusive_update():
-                return self._run_once()
+                result = self._run_once()
+                if input_status is not None:
+                    result["torreInputs"] = input_status
+                if self.torre_composer is not None:
+                    try:
+                        now = datetime.now(TZ)
+                        index, index_status = load_json_with_status(self.index_path, {})
+                        if index_status != "ok":
+                            raise ValueError("Índice local indisponível")
+                        index["collectionFailed"] = result.get("status") != "success"
+                        documents = {}
+                        for offset in (1, 0):
+                            day = (now - timedelta(days=offset)).date().isoformat()
+                            consolidated_path = self.index_path.parent.parent / "consolidated" / f"{day}.json"
+                            consolidated, history_status = load_json_with_status(consolidated_path, {})
+                            if history_status == "corrupt":
+                                raise ValueError("Histórico local corrompido")
+                            if consolidated and consolidated.get("company") != self.empresa:
+                                raise ValueError("Histórico local de outra empresa")
+                            for team, document in consolidated.get("equipes", {}).items():
+                                previous_orders = (documents.get(team, {}).get("ordensServico") or {})
+                                current_orders = document.get("ordensServico") or {}
+                                history = list(previous_orders.get("historico") or []) + list(current_orders.get("historico") or [])
+                                documents[team] = {**document, "ordensServico": {**current_orders, "historico": history}}
+                        projection = self.torre_composer.publish(
+                            index, self.torre_inputs.snapshot(now), documents or index["equipes"], now,
+                        )
+                        result["torreProjection"] = {"available": True, "stale": projection["stale"],
+                                                     "items": len(projection["items"]), "events": len(projection["events"])}
+                    except Exception as exc:
+                        result["torreProjection"] = {"published": False, "errorType": type(exc).__name__}
+                return result
         finally:
             self._set_runtime_status("AGUARDANDO", "Aguardando próximo ciclo")
             self.processing_led.idle()

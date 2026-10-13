@@ -27,6 +27,23 @@ class StorageRegressionTests(unittest.TestCase):
         self.assertEqual(compact["executadosHoje"], {"comercial": 0, "emergencia": 0})
         self.assertEqual(compactar_equipe_para_index(compact), compact)
 
+    def test_queue_uses_raw_pending_list_and_handles_empty_list(self):
+        doc = self.document()
+        doc["fila"] = {"comercial": 9, "emergencia": 8}
+        current = {"ss_pendentes": [{"tipo": "COMERCIAL"}, {"tipo": "EMERGENCIA"}],
+                   "ssPendentesComercialCount": 99}
+        self.assertEqual(compactar_equipe_para_index(doc, current)["fila"],
+                         {"comercial": 1, "emergencia": 1})
+        self.assertEqual(compactar_equipe_para_index(doc, {"ss_pendentes": []})["fila"],
+                         {"comercial": 0, "emergencia": 0})
+
+    def test_queue_preserves_previous_values_when_snapshot_has_no_queue(self):
+        doc = self.document()
+        doc["fila"] = {"comercial": 9, "emergencia": 8}
+        self.assertEqual(compactar_equipe_para_index(doc, {"isOnline": True})["fila"], doc["fila"])
+        self.assertEqual(compactar_equipe_para_index(doc, {"ssPendentesComercialCount": 2})["fila"],
+                         {"comercial": 2, "emergencia": 0})
+
     def test_interval_end_change_without_new_interval(self):
         old = self.document()
         new = copy.deepcopy(old)

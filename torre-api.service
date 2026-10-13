@@ -1,0 +1,20 @@
+[Unit]
+Description=API de leitura da torre DDS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=orangepi
+Group=orangepi
+WorkingDirectory=/home/orangepi/dds-coletor-rtl
+EnvironmentFile=/home/orangepi/dds-coletor-rtl/.torre-api.env
+ExecStart=/home/orangepi/dds-coletor-rtl/.venv-3.14/bin/python torre_api.py --output-dir /home/orangepi/dds-coletor-rtl/dados-local
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

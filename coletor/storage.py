@@ -177,7 +177,9 @@ def compactar_equipe_para_index(
         executados[key] += 1
 
     fila = dict(document.get("fila") or {"comercial": 0, "emergencia": 0})
-    if current:
+    if "ss_pendentes" in current:
+        fila = queue_counts(current)
+    elif "ssPendentesComercialCount" in current or "ssPendentesEmergenciaCount" in current:
         fila = {
             "comercial": int(current.get("ssPendentesComercialCount") or 0),
             "emergencia": int(current.get("ssPendentesEmergenciaCount") or 0),
