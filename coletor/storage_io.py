@@ -124,6 +124,8 @@ def load_json(path: Path, fallback: typing.Any) -> typing.Any:
 
 
 def write_json(path: Path, value: typing.Any, compress: bool | None = None) -> None:
+    from .data_storage import guard_write
+    guard_write(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     should_compress = compress if compress is not None else path.name.endswith(".gz")
@@ -141,6 +143,7 @@ def write_json(path: Path, value: typing.Any, compress: bool | None = None) -> N
             stream.flush()
             os.fsync(stream.fileno())
 
+    guard_write(path)
     temporary.replace(path)
 
 

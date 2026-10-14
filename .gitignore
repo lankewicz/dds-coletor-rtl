@@ -3,6 +3,7 @@ venv/
 __pycache__/
 *.pyc
 .env
+.storage.env
 *.json
 !requirements.txt
 serviceAccountKey.json

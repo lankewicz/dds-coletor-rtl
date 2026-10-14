@@ -1345,6 +1345,12 @@ def main() -> int:
         print(json.dumps(list_system_leds(), ensure_ascii=False, indent=2))
         return 0
 
+    from coletor.data_storage import resolve_storage, activate_storage, assert_available
+    selected_storage = resolve_storage(Path(args.output_dir), args.empresa, project_root=ROOT)
+    activate_storage(selected_storage)
+    args.output_dir = selected_storage.data_dir
+    LOG.info("Armazenamento: %s", json.dumps(selected_storage.payload(), ensure_ascii=False))
+
     if args.no_firebase:
         enable_firebase = False
     else:
@@ -1388,6 +1394,7 @@ def main() -> int:
 
     runner = LocalRotalogRunner(Path(args.output_dir).resolve(), args.empresa, enable_firebase=enable_firebase)
     while True:
+        assert_available(selected_storage)
         result = runner.run_once()
         print(json.dumps(result, ensure_ascii=False), flush=True)
         if args.once:

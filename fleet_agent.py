@@ -350,9 +350,15 @@ def collect_health(data_dir: Path, receipt: dict) -> dict:
 
 def publish_heartbeat(store, node_id, *, force=False, status="online", detail=""):
     data_dir = Path(os.getenv("FLEET_DATA_DIR", str(ROOT / "dados-local")))
+    from coletor.data_storage import resolve_storage, activate_storage
+    storage = resolve_storage(data_dir, os.getenv("DDS_EMPRESA_PADRAO", "ChicoEletro"), project_root=ROOT)
+    activate_storage(storage)
+    data_dir = Path(storage.data_dir)
     receipt = load_json(data_dir / "rotalog/equipes/current/firebase-sync.json", {})
     state_path = data_dir / "rotalog/fleet" / f"{node_id}-heartbeat.json"
     state = load_json(state_path, {})
+    previous_storage = (state.get("health") or {}).get("storage")
+    storage_changed = bool(previous_storage and previous_storage != storage.payload())
     now = datetime.now(timezone.utc)
     valid_state = (
         state.get("nodeId") == node_id
@@ -361,15 +367,17 @@ def publish_heartbeat(store, node_id, *, force=False, status="online", detail=""
     )
     previous_local = parse_iso(state.get("heartbeatAt")) if valid_state else None
     local_elapsed = (now - previous_local).total_seconds() if previous_local else None
-    local_due = force or local_elapsed is None or not (0 <= local_elapsed < local_heartbeat_interval_seconds())
+    local_due = force or storage_changed or local_elapsed is None or not (0 <= local_elapsed < local_heartbeat_interval_seconds())
 
     if local_due:
+        health = collect_health(data_dir, receipt)
+        health["storage"] = storage.payload()
         payload = build_node_payload(
             node_id,
             running_commit=current_commit(),
             status=status,
             detail=detail,
-            health=collect_health(data_dir, receipt),
+            health=health,
             last_index_upload_at=receipt.get("uploadedAt"),
         )
         state = {
@@ -382,7 +390,7 @@ def publish_heartbeat(store, node_id, *, force=False, status="online", detail=""
 
     previous_remote = parse_iso(state.get("remoteHeartbeatAt")) if valid_state else None
     remote_elapsed = (now - previous_remote).total_seconds() if previous_remote else None
-    remote_due = force or remote_elapsed is None or not (0 <= remote_elapsed < heartbeat_interval_seconds(now))
+    remote_due = force or storage_changed or remote_elapsed is None or not (0 <= remote_elapsed < heartbeat_interval_seconds(now))
     if not remote_due:
         return
 

@@ -68,6 +68,8 @@ def create_handler(root, key, company, origins):
             except ValueError:
                 return self.error(401)
             try:
+                from coletor.data_storage import guard_write
+                guard_write(files[path])  # Verifica o mesmo volume também para leitura.
                 target = files[path]
                 if target.suffix == ".gz":
                     with gzip.open(target, "rb") as stream:
@@ -113,4 +115,9 @@ if __name__ == "__main__":
     origins = set(filter(None, (v.strip() for v in os.environ.get("TORRE_ALLOWED_ORIGINS", "").split(","))))
     if len(key.encode()) < 32 or not company or not origins or any(not v.startswith("https://") for v in origins):
         raise SystemExit("Configurar chave forte, empresa e origens HTTPS antes de iniciar")
+    from coletor.data_storage import resolve_storage, activate_storage
+    selection = resolve_storage(Path(args.output_dir), company, project_root=Path(__file__).resolve().parent,
+                                writable=False)
+    activate_storage(selection)
+    args.output_dir = selection.data_dir
     ThreadingHTTPServer(("127.0.0.1", args.port), create_handler(args.output_dir, key, company, origins)).serve_forever()
