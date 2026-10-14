@@ -141,6 +141,8 @@ class TuiState:
         self.device_health: dict = {}
         self.device_health_updated_at: datetime | None = None
         self.storage: dict = {}
+        self.show_details = False
+        self.details_scroll = 0
 
     def get_interval(self, now: datetime | None = None) -> int:
         if self.interval_seconds is not None:
@@ -589,6 +591,83 @@ def _format_columns(items: list[str], width: int, col_width: int = 35) -> list[s
     return lines
 
 
+def _compact_summary(last: dict, health: dict, last_success: dict | None = None) -> list[tuple[str, int]]:
+    """Três linhas operacionais; diagnóstico completo fica no painel de detalhes."""
+    stamp = parse_iso(last.get("finishedAt") or last.get("startedAt"))
+    when = stamp.astimezone(TZ).strftime("%H:%M:%S") if stamp else "-"
+    result = "OK" if last.get("status") == "success" else "FALHA" if last else "AGUARDANDO"
+    sync = last.get("firebaseSyncStatus")
+    cloud = ("LOCAL" if sync == "disabled" else "SEM MUDANCA" if sync == "unchanged"
+             else "OK" if last.get("firebaseUploaded") or sync == "uploaded" else "PENDENTE" if last else "-")
+    pending, failed = last.get("dailySyncPending", 0), last.get("dailySyncFailed", 0)
+    first = (f"Coleta {when} {result} {_format_duration(last.get('durationSeconds'))}"
+             f" | Nuvem {cloud} | {last.get('updatedTeams', '-')}/{last.get('totalTeams', '-')} eq"
+             f" | Fila {pending} / falhas {failed}")
+    disk, smart, memory = health.get("disk") or {}, (health.get("disk") or {}).get("smart") or {}, health.get("memory") or {}
+    mode = (health.get("storage") or {}).get("mode")
+    disk_label = "SSD" if mode == "ssd" else "Cartao/local" if mode == "card" else "Disco"
+    free = _format_bytes(disk["freeBytes"]) if disk.get("freeBytes") is not None else "?"
+    cpu = f"{health['temperatureC']:.0f}C" if health.get("temperatureC") is not None else "?"
+    ram = f"{memory['availablePercent']:.0f}%" if memory.get("availablePercent") is not None else "?"
+    overall = {"healthy": "OK", "warning": "ATENCAO", "critical": "CRITICO"}.get(health.get("overall"), "?")
+    second = f"Saude {overall} | CPU {cpu} | RAM {ram} livre | {disk_label} {free} livre"
+    if mode == "ssd":
+        smart_label = {"passed": "OK", "warning": "ATENCAO", "failing": "FALHA", "unavailable": "N/D"}.get(smart.get("status"), "N/D")
+        # SMART antes da capacidade: permanece visível também em terminais estreitos.
+        second = f"Saude {overall} | SMART {smart_label} | CPU {cpu} | RAM {ram} livre | SSD {free} livre"
+        if smart.get("temperatureC") is not None:
+            second += f" ({smart['temperatureC']}C)"
+    issues = sorted(health.get("issues") or [], key=lambda item: item.get("severity") != "critical")
+    alerts = [str(item.get("code") or item) for item in issues]
+    if disk.get("error") and "STORAGE_UNAVAILABLE" not in alerts:
+        alerts.insert(0, "ARMAZENAMENTO INDISPONIVEL")
+    if smart.get("status") == "unavailable":
+        alerts.append("SMART indisponivel")
+    if pending or failed:
+        alerts.insert(0, f"Sincronizacao: {pending} pendentes / {failed} falhas")
+    if last.get("error"):
+        alerts.insert(0, f"Coleta: {last['error']}")
+    success_stamp = parse_iso((last_success or {}).get("finishedAt"))
+    success_text = success_stamp.astimezone(TZ).strftime("%H:%M:%S") if success_stamp else "-"
+    third = f"Alertas: {', '.join(alerts) or 'nenhum'} | Sucesso {success_text} | [d] Detalhes"
+    first_color = C_ERROR if result == "FALHA" else C_WARN if pending or failed or cloud == "PENDENTE" else C_OK
+    return [(first, first_color), (second, _health_color(health)),
+            (third, C_ERROR if health.get("overall") == "critical" or last.get("error") else C_WARN if alerts else C_DIM)]
+
+
+def _detail_lines(last: dict, health: dict) -> list[str]:
+    return [
+        "ULTIMA EXECUCAO",
+        f"Resultado: {last.get('status', '-')} | Inicio: {last.get('startedAt', '-')} | Fim: {last.get('finishedAt', '-')}",
+        f"Duracao: {last.get('durationSeconds', '-')}s | Raspagem: {last.get('scrapeDurationSeconds', '-')}s",
+        f"Equipes: {last.get('totalTeams', '-')} total | {last.get('updatedTeams', '-')} atualizadas | {last.get('ignoredTeams', '-')} sem alteracao",
+        f"Nuvem: {last.get('firebaseSyncStatus', '-')} | Enviado: {_format_bytes(last.get('bytesUploaded'))}",
+        f"Gravacoes: local {last.get('updatedTeams', 0)} | eventos {last.get('cloudEventWrites', 0)} | indice {last.get('cloudIndexWrites', 0)} | auditoria {last.get('cloudAuditWrites', 0)}",
+        f"Historicos: enviados {last.get('dailySyncUploaded', 0)} | pendentes {last.get('dailySyncPending', 0)} | falhas {last.get('dailySyncFailed', 0)}",
+        f"Erro: {last.get('error') or 'nenhum'}",
+        "", "SAUDE DO DISPOSITIVO", *_format_health(health),
+        "", "ARQUIVOS",
+        "equipes/current/index.json.gz | logs/execucoes.jsonl (rotacao diaria .jsonl.gz)",
+    ]
+
+
+def _render_details(screen, last: dict, health: dict, scroll: int) -> int:
+    import textwrap
+    height, width = screen.getmaxyx()
+    lines = []
+    for text in _detail_lines(last, health):
+        lines.extend(textwrap.wrap(text, max(1, width - 6)) or [""])
+    top, panel_height = 3, height - 4
+    _box(screen, top, 0, panel_height, width - 1, "DETALHES - EXECUCAO E DISPOSITIVO")
+    visible = panel_height - 2
+    offset = min(max(0, scroll), max(0, len(lines) - visible))
+    for row, text in enumerate(lines[offset:offset + visible], start=top + 1):
+        _line(screen, row, 2, text, width - 5, _cp(C_DEFAULT))
+    _line(screen, height - 1, 1, f"[d/Esc] Voltar  [Setas/PgUp/PgDn] Rolar  [q] Sair | {offset + 1}-{min(offset + visible, len(lines))}/{len(lines)}", width - 3, _cp(C_WARN))
+    screen.refresh()
+    return offset
+
+
 def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     height, width = screen.getmaxyx()
     if height < 18 or width < 75:
@@ -609,6 +688,9 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
             "device_health": dict(state.device_health),
             "device_health_updated_at": state.device_health_updated_at,
             "viewer_mode": state.viewer_mode,
+            "storage": dict(state.storage),
+            "show_details": state.show_details,
+            "details_scroll": state.details_scroll,
         }
     if runner is not None:
         data["runtime_status"] = _load_runtime_status(runner.output_dir)
@@ -646,17 +728,6 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     _line(screen, 1, width - 12, clock_str, 10, _cp(C_TITLE, curses.A_BOLD))
     screen.hline(2, 0, curses.ACS_HLINE, width - 1, _cp(C_TITLE))
 
-    # -- 2. Barra de Status de Alto Contraste (Banner) ---------------------
-    runtime = data.get("runtime_status") or {}
-    runtime_phase = str(runtime.get("phase") or "").upper()
-    runtime_message = str(runtime.get("message") or "").strip()
-    status_y = 3
-
-    if runtime_phase in {"COLETANDO", "PROCESSANDO"}:
-        status_text = f" STATUS: {runtime_phase}...  |  {runtime_message} "
-        status_color = C_STATUS_RUN
-    elif data["is_running"]:
-        status_text = f" STATUS: {data['status_message']} "
     # -- 2. Barra de Status com Alto Contraste -----------------------------
     runtime = data.get("runtime_status") or {}
     runtime_phase = str(runtime.get("phase") or "").upper()
@@ -705,90 +776,25 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     _line(screen, status_y, 8, status_tag, len(status_tag) + 1, _cp(tag_color, curses.A_BOLD))
     _line(screen, status_y, 8 + len(status_tag) + 1, f"|  {status_detail}", width - (10 + len(status_tag)), _cp(C_DEFAULT))
 
-    if last_success:
-        success_time = str(last_success.get("finishedAt") or last_success.get("startedAt") or "-")
-        _line(screen, status_y + 1, 0, "Ultima coleta com sucesso:", 27, _cp(C_DEFAULT))
-        _line(screen, status_y + 1, 28, f"{success_time[11:19]}", 10, _cp(C_OK, curses.A_BOLD))
-    else:
-        _line(screen, status_y + 1, 0, "Ultima coleta com sucesso: sem registro hoje", width, _cp(C_WARN))
+    last = data["last_result"] or {}
+    health = dict(data.get("device_health") or {})
+    health.setdefault("storage", data["storage"])
+    if data["show_details"]:
+        offset = _render_details(screen, last, health, data["details_scroll"])
+        with state.lock:
+            state.details_scroll = offset
+        return
 
-    # -- 3. Caixa: Última Execução -----------------------------------------
-    exec_top = status_y + 2
-    exec_h = 6
-    _box(screen, exec_top, 0, exec_h, width - 1, title="ULTIMA EXECUCAO", color=C_TITLE)
-    last = data["last_result"]
-    if last:
-        result_status = str(last.get("status", "-")).upper()
-        result_color = C_OK if result_status == "SUCCESS" else C_ERROR
-        _line(screen, exec_top + 1, 2, f"Resultado: {result_status}", 22, _cp(result_color, curses.A_BOLD))
-        res_meta = (
-            f"inicio: {str(last.get('startedAt', '-'))[11:19]}"
-            f"  |  fim: {str(last.get('finishedAt', '-'))[11:19]}"
-            f"  |  duracao: {last.get('durationSeconds', '-')}s (raspagem: {last.get('scrapeDurationSeconds', '-')}s)"
-        )
-        _line(screen, exec_top + 1, 24, res_meta, width - 26, _cp(C_DEFAULT))
-
-        fb_status = last.get("firebaseSyncStatus")
-        if fb_status == "disabled":
-            upload_flag, upload_color = "nuvem: DESATIVADA (LOCAL)", C_WARN
-        elif fb_status == "unchanged":
-            upload_flag, upload_color = "torre: SEM ALTERACAO", C_TITLE
-        elif last.get("firebaseUploaded") or fb_status == "uploaded":
-            upload_flag, upload_color = "nuvem: SINCRONIZADO OK", C_OK
-        else:
-            upload_flag, upload_color = "nuvem: PENDENTE", C_WARN
-
-        team_line = (
-            f"Equipes: {last.get('totalTeams', '-')} total"
-            f"  |  {last.get('updatedTeams', '-')} atualizadas"
-            f"  |  {last.get('ignoredTeams', '-')} sem alteracao  |  "
-        )
-        _line(screen, exec_top + 2, 2, team_line, width - 4, _cp(C_DEFAULT))
-        _line(screen, exec_top + 2, 2 + len(team_line), upload_flag, width - 4 - len(team_line), _cp(upload_color, curses.A_BOLD))
-
-        last_up = int(last.get("bytesUploaded") or 0)
-        last_local_writes = int(last.get("updatedTeams") or 0)
-        gravacoes_info = (
-            f"Gravacoes: Local {last_local_writes} | Eventos {last.get('cloudEventWrites', last.get('dailySyncUploaded', 0))}"
-            f" | Indice {last.get('cloudIndexWrites', 1 if last.get('firebaseUploaded') else 0)}"
-            f" | Auditoria 0 (local) | Heartbeat separado | {_format_bytes(last_up)}"
-        )
-        _line(screen, exec_top + 3, 2, gravacoes_info, width - 4, _cp(C_DEFAULT))
-
-        if last.get("error"):
-            _line(screen, exec_top + 4, 2, f"Erro: {last['error']}", width - 4, _cp(C_ERROR, curses.A_BOLD))
-        else:
-            daily_sync_info = (
-                f"Historicos Nuvem:  enviados: {last.get('dailySyncUploaded', 0)}"
-                f"  |  pendentes: {last.get('dailySyncPending', 0)}"
-                f"  |  falhas: {last.get('dailySyncFailed', 0)}"
-            )
-            _line(screen, exec_top + 4, 2, daily_sync_info, width - 4, _cp(C_DIM))
-    else:
-        _line(screen, exec_top + 1, 2, "Aguardando registros do servico em execucoes.jsonl...", width - 4, _cp(C_DIM))
-
-    # -- 4. Caixa: Saúde do Dispositivo ------------------------------------
-    health = data.get("device_health") or {}
-    health_top = exec_top + exec_h
-    health_lines = _format_health(health) if health else ()
-    health_h = min(len(health_lines) + 2, max(5, height - health_top - 8)) if health else 5
-    health_color = _health_color(health)
-    _box(screen, health_top, 0, health_h, width - 1, title="SAUDE DO DISPOSITIVO", color=health_color)
-    if health:
-        _line(screen, health_top + 1, 2, health_lines[0], width - 4, _cp(health_color, curses.A_BOLD if health_color != C_OK else 0))
-        _line(screen, health_top + 2, 2, health_lines[1], width - 4, _cp(C_DEFAULT))
-        issues_attr = _cp(C_WARN, curses.A_BOLD) if (health.get("issues") or health_color != C_OK) else _cp(C_OK)
-        _line(screen, health_top + 3, 2, health_lines[2], width - 4, issues_attr)
-        for offset, text in enumerate(health_lines[3:], start=4):
-            if offset < health_h - 1:
-                _line(screen, health_top + offset, 2, text, width - 4, _cp(C_DEFAULT))
-    else:
-        _line(screen, health_top + 1, 2, "Coletando informacoes de saude...", width - 4, _cp(C_DIM))
+    # Resumo fixo de três linhas; todo o restante da altura fica para eventos.
+    summary_top, summary_h = 4, 5
+    _box(screen, summary_top, 0, summary_h, width - 1, title="RESUMO OPERACIONAL  [d] DETALHES")
+    for offset, (text, color) in enumerate(_compact_summary(last, health, last_success), start=1):
+        _line(screen, summary_top + offset, 2, text, width - 4, _cp(color))
 
     # -- 5 e 6. Eventos Operacionais e Histórico Diário --------------------
     bottom_reserved = 5
-    hist_top = max(health_top + health_h, height - bottom_reserved)
-    events_top = health_top + health_h
+    hist_top = height - bottom_reserved
+    events_top = summary_top + summary_h
     events_h = hist_top - events_top
 
     if events_h >= 3:
@@ -857,24 +863,26 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     err_color = _cp(C_ERROR, curses.A_BOLD) if errors > 0 else _cp(C_DIM)
     _line(screen, hist_top + 1, 32, f"Erros: {errors}", 12, err_color)
     _line(screen, hist_top + 1, 44, f"Media: {_format_duration(average)}", 16, _cp(C_DEFAULT))
-    _line(screen, hist_top + 1, 60, f"|  {cloud_daily}", width - 62, _cp(C_DEFAULT))
-    _line(screen, hist_top + 2, 2, "Arquivos: equipes/current/index.json.gz  |  logs/execucoes.jsonl (rotacao diaria .jsonl.gz)", width - 4, _cp(C_DIM))
+    _line(screen, hist_top + 2, 2, cloud_daily, width - 4, _cp(C_DIM))
 
     # -- 7. Barra de Rodapé / Teclas com Alto Contraste ------------------
     footer_y = height - 1
     _fill(screen, footer_y, 0, width - 1, _cp(C_DEFAULT))
 
     if is_viewer:
-        items = [("h", "Historico (ontem)"), ("m", "Fechar mes anterior"), ("c", "Limpar tela"), ("q", "Sair")]
+        items = [("d", "Detalhes"), ("h", "Historico (ontem)"), ("m", "Fechar mes anterior"), ("c", "Limpar tela"), ("q", "Sair")]
     else:
-        items = [("r", "Executar agora"), ("h", "Historico (ontem)"), ("m", "Fechar mes anterior"), ("c", "Limpar tela"), ("q", "Sair")]
+        items = [("d", "Detalhes"), ("r", "Executar agora"), ("h", "Historico (ontem)"), ("m", "Fechar mes anterior"), ("c", "Limpar tela"), ("q", "Sair")]
+    if width < 120:
+        labels = {"d": "Detalhes", "r": "Agora", "h": "Hist.", "m": "Mes", "c": "Limpar", "q": "Sair"}
+        items = [(key, labels[key]) for key, _ in items]
 
     cur_x = 1
     for key_char, label in items:
         badge = f"[{key_char}]"
         _line(screen, footer_y, cur_x, badge, len(badge), _cp(C_WARN, curses.A_BOLD))
         cur_x += len(badge) + 1
-        desc = f"{label}    "
+        desc = f"{label}  "
         _line(screen, footer_y, cur_x, desc, len(desc), _cp(C_DEFAULT))
         cur_x += len(desc)
 
@@ -900,6 +908,19 @@ def _curses_main(screen, runner: LocalRotalogRunner | None, state: TuiState, out
             key = screen.getch()
             if key in (ord("q"), ord("Q")):
                 break
+            if key in (ord("d"), ord("D")):
+                with state.lock:
+                    state.show_details = not state.show_details
+                    state.details_scroll = 0
+            if state.show_details:
+                with state.lock:
+                    if key == 27:
+                        state.show_details = False
+                    elif key in (getattr(curses, "KEY_DOWN", -1), getattr(curses, "KEY_NPAGE", -1)):
+                        state.details_scroll += 1 if key == getattr(curses, "KEY_DOWN", -1) else 10
+                    elif key in (getattr(curses, "KEY_UP", -1), getattr(curses, "KEY_PPAGE", -1)):
+                        state.details_scroll = max(0, state.details_scroll - (1 if key == getattr(curses, "KEY_UP", -1) else 10))
+                continue
             if key in (ord("r"), ord("R")) and not state.viewer_mode:
                 state.run_now.set()
             if key in (ord("c"), ord("C"), 12):  # 12 is Ctrl+L

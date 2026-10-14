@@ -102,6 +102,11 @@ Reabra o visualizador depois da atualização:
 
 O painel mostra SSD/cartão, pasta efetiva, espaço livre/capacidade, modelo, dispositivo
 e UUID. A capacidade refere-se ao volume de dados, não ao cartão que contém o sistema.
+Na tela principal, o resumo ocupa três linhas: coleta/sincronização, saúde/SMART
+e alertas. O painel de eventos começa na linha 10, deixando a maior parte da altura
+para as equipes. Pressione `d` para consultar os detalhes de execução, modelo, UUID,
+pastas e contadores do SSD. `d` ou Esc retorna aos eventos; setas e PgUp/PgDn rolam
+os detalhes em terminais menores. Falhas, pendências e alertas continuam no resumo.
 Heartbeat e último envio são exibidos em horário de Brasília. Heartbeats antigos
 recebem alerta; reabrir o TUI após trocar o armazenamento. O TUI não troca de disco
 durante a execução e avisa se o SSD selecionado desaparecer.
