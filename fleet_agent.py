@@ -251,6 +251,12 @@ def evaluate_health(health: dict) -> dict:
         elif used >= 85:
             issues.append({"code": "DISK_LOW", "severity": "warning", "value": used})
 
+    smart = disk.get("smart") or {}
+    if smart.get("status") == "failing":
+        issues.append({"code": "SSD_SMART_FAILING", "severity": "critical"})
+    elif smart.get("status") == "warning":
+        issues.append({"code": "SSD_SMART_WARNING", "severity": "warning"})
+
     total = memory.get("totalBytes")
     available = memory.get("availableBytes")
     if total and available is not None:
@@ -280,7 +286,7 @@ def evaluate_health(health: dict) -> dict:
     return health
 
 
-def collect_health(data_dir: Path, receipt: dict) -> dict:
+def collect_health(data_dir: Path, receipt: dict, *, storage=None) -> dict:
     temperatures = []
     thermal_root = Path("/sys/class/thermal")
     if thermal_root.is_dir():
@@ -292,16 +298,19 @@ def collect_health(data_dir: Path, receipt: dict) -> dict:
                 continue
             temperatures.append(round(value / 1000 if value > 1000 else value, 1))
 
-    disk = {}
-    try:
-        usage = shutil.disk_usage(data_dir)
-        disk = {
-            "freeBytes": usage.free,
-            "totalBytes": usage.total,
-            "usedPercent": round((usage.used / usage.total) * 100, 1) if usage.total else None,
-        }
-    except OSError:
-        disk = {"error": "storage_unavailable"}
+    if storage is not None:
+        from coletor.disk_health import collect_disk_health
+        disk = collect_disk_health(storage)
+    else:
+        try:
+            usage = shutil.disk_usage(data_dir)
+            disk = {
+                "freeBytes": usage.free,
+                "totalBytes": usage.total,
+                "usedPercent": round((usage.used / usage.total) * 100, 1) if usage.total else None,
+            }
+        except OSError:
+            disk = {"error": "storage_unavailable"}
 
     memory = {}
     meminfo = _read_text(Path("/proc/meminfo"))
@@ -370,7 +379,7 @@ def publish_heartbeat(store, node_id, *, force=False, status="online", detail=""
     local_due = force or storage_changed or local_elapsed is None or not (0 <= local_elapsed < local_heartbeat_interval_seconds())
 
     if local_due:
-        health = collect_health(data_dir, receipt)
+        health = collect_health(data_dir, receipt, storage=storage)
         health["storage"] = storage.payload()
         payload = build_node_payload(
             node_id,

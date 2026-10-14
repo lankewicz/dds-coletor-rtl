@@ -42,8 +42,8 @@ e publicar; perda do SSD gera erro. O coletor reavalia na próxima inicializaç�
 precisa ser reiniciada para selecionar o cartão. Não se garante recuperação automática
 do estado completo nem funcionamento contínuo da API nesta etapa.
 
-A TUI e ferramentas que leem arquivos diretamente ainda devem receber o **caminho
-físico** explicitamente; não foram redirecionadas. Logs de sistema continuam com a
+O TUI seleciona o armazenamento na abertura. Outras ferramentas que leem arquivos
+diretamente ainda devem receber o **caminho físico**. Logs de sistema continuam com a
 política existente do Linux. Um filesystem montado por UUID não elimina a necessidade
 de validação da montagem e da empresa.
 
@@ -90,3 +90,44 @@ Os comandos abaixo são referências para instalação, não foram executados re
 O código e as credenciais não são copiados ao SSD. A fonte `dados-local` no cartão
 permanece intacta. Não há espelhamento periódico para o cartão. Planejar o backup
 completo na nuvem antes de remover essa cópia ou depender da contingência.
+
+## TUI e saúde física do SSD
+
+O TUI resolve a configuração `.storage.env` na abertura, assim como o coletor.
+Reabra o visualizador depois da atualização:
+
+```bash
+.venv-3.14/bin/python tui.py --view
+```
+
+O painel mostra SSD/cartão, pasta efetiva, espaço livre/capacidade, modelo, dispositivo
+e UUID. A capacidade refere-se ao volume de dados, não ao cartão que contém o sistema.
+Heartbeat e último envio são exibidos em horário de Brasília. Heartbeats antigos
+recebem alerta; reabrir o TUI após trocar o armazenamento. O TUI não troca de disco
+durante a execução e avisa se o SSD selecionado desaparecer.
+
+O agente de frota consulta SMART junto da atualização do heartbeat local (normalmente
+a cada minuto); o TUI somente lê essa cópia, sem novas consultas ao disco/Firebase.
+Depois de atualizar o agente, é possível solicitar a próxima amostra com
+`sudo systemctl start fleet-agent.service` se ele estiver inativo.
+
+SMART exige `smartctl` (pacote `smartmontools`), suporte do adaptador USB e permissão
+do usuário do agente para consultar o disco físico. Não se alteram permissões, não
+se invoca sudo automaticamente e não se executam testes ou comandos de escrita no SSD.
+Sem essas condições, o painel informa `INDISPONIVEL` e a causa, mantendo a coleta.
+
+Quando disponíveis, são mostrados status SMART, temperatura do SSD (separada da CPU),
+horas ligadas, ciclos de energia, setores realocados/pendentes/incorrigíveis e erros
+CRC. Desgaste percentual é exibido para NVMe que forneça esse campo; não se inventa
+estimativa de vida útil para atributos ATA específicos do fabricante. Erros históricos
+geram atenção; falha SMART gera alerta crítico. SMART `OK` não garante ausência de falhas.
+
+Para diagnóstico inicial, confira `command -v smartctl` e execute uma leitura manual
+com `sudo smartctl -j -a /dev/sda`, substituindo pelo **disco físico atual**, não pela
+partição `/dev/sda1`. Essa consulta como root não concede acesso ao agente `orangepi`;
+se funcionar somente com sudo, falta configurar acesso restrito para o serviço.
+Alguns adaptadores precisam de `-d sat`; nesse caso, após confirmar o funcionamento,
+adicione `DDS_SMART_DEVICE_TYPE=sat` ao `.env` do agente. A identificação do disco é
+derivada da montagem atual e não fixa `/dev/sda`, permitindo intercambiar SSDs.
+
+Referência: [manual oficial do smartctl](https://github.com/smartmontools/smartmontools/blob/main/src/smartctl.8.in).

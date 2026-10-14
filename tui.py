@@ -37,6 +37,7 @@ load_dotenv(ROOT / ".env")
 from coletor.logs import JsonlTailReader
 from coletor.storage import load_json
 from coletor.fleet_control import default_node_id, parse_iso
+from coletor.data_storage import resolve_storage, activate_storage, assert_available, StorageSelection, guard_write
 from main import (
     LocalRotalogRunner,
     executar_fechamento_mes,
@@ -61,6 +62,7 @@ class _SafeStream:
         if not text:
             return
         try:
+            guard_write(self.log_path)
             if self._file is None:
                 self._file = open(self.log_path, "a", encoding="utf-8")
             self._file.write(text)
@@ -90,6 +92,7 @@ class _SafeStream:
 def _setup_tui_logging(output_dir: Path) -> Path:
     """Configura logging para arquivo sem cuspir linhas cruas no terminal curses."""
     log_dir = output_dir / "rotalog" / "logs"
+    guard_write(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     tui_log_file = log_dir / "tui.log"
 
@@ -137,6 +140,7 @@ class TuiState:
         self.runtime_status: dict = {}
         self.device_health: dict = {}
         self.device_health_updated_at: datetime | None = None
+        self.storage: dict = {}
 
     def get_interval(self, now: datetime | None = None) -> int:
         if self.interval_seconds is not None:
@@ -174,8 +178,8 @@ def _format_bytes(num_bytes: int | float | None) -> str:
     return f"{num:.1f} GB"
 
 
-def _format_health(health: dict) -> tuple[str, str, str]:
-    """Retorna as três linhas compactas exibidas no painel de saúde."""
+def _format_health(health: dict) -> tuple[str, ...]:
+    """Saúde do dispositivo e telemetria do disco, sem consultar sensores."""
     overall_labels = {
         "healthy": "SAUDAVEL",
         "warning": "ATENCAO",
@@ -184,6 +188,8 @@ def _format_health(health: dict) -> tuple[str, str, str]:
     overall = overall_labels.get(str(health.get("overall") or ""), "DESCONHECIDA")
     temperature = health.get("temperatureC")
     disk = health.get("disk") or {}
+    storage_mode = (health.get("storage") or {}).get("mode")
+    disk_label = "Disco SSD" if storage_mode == "ssd" else "Disco cartao/local" if storage_mode == "card" else "Disco"
     memory = health.get("memory") or {}
     load = health.get("loadAverage") or []
     collector = health.get("collector") or {}
@@ -220,13 +226,48 @@ def _format_health(health: dict) -> tuple[str, str, str]:
     )
     issues = health.get("issues") or []
     issue_text = ", ".join(str(item.get("code") or item) for item in issues) or "nenhum"
-    heartbeat_at = str(health.get("_heartbeatAt") or "-").replace("T", " ")[:19]
+    heartbeat_dt = parse_iso(health.get("_heartbeatAt"))
+    heartbeat_at = heartbeat_dt.astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S") if heartbeat_dt else "-"
 
     return (
-        f"Estado: {overall}  |  CPU: {temp_text}  |  Disco: {disk_text}  |  Memoria: {memory_text}",
+        f"Estado: {overall}  |  CPU: {temp_text}  |  {disk_label}: {disk_text}  |  Memoria: {memory_text}",
         f"Coletor: {service_text}  |  Uptime: {uptime_text}  |  Carga: {load_text}  |  Ultimo envio: {last_upload}",
         f"Heartbeat local: {heartbeat_at}  |  Alertas: {issue_text}",
+        *_format_storage(health),
     )
+
+
+def _format_storage(health: dict) -> tuple[str, ...]:
+    storage = health.get("storage") or {}
+    disk = health.get("disk") or {}
+    mode = {"ssd": "SSD", "card": "CARTAO / DIRETORIO LOCAL"}.get(storage.get("mode"), "DESCONHECIDO")
+    free = _format_bytes(disk["freeBytes"]) if disk.get("freeBytes") is not None else "indisponivel"
+    total = _format_bytes(disk["totalBytes"]) if disk.get("totalBytes") is not None else "indisponivel"
+    lines = [f"Dados: {mode}  |  Livre: {free} / {total}  |  {storage.get('data_dir') or disk.get('path') or '-'}"]
+    if storage.get("mode") == "ssd":
+        lines.append(f"SSD: {disk.get('model') or '-'}  |  {disk.get('device') or storage.get('device') or '-'}  |  UUID: {storage.get('uuid') or '-'}")
+        smart = disk.get("smart") or {}
+        labels = {"passed": "OK", "warning": "ATENCAO", "failing": "FALHA", "unavailable": "INDISPONIVEL"}
+        status = labels.get(smart.get("status"), "AGUARDANDO HEARTBEAT")
+        details = [f"SMART: {status}"]
+        if smart.get("reason"):
+            details.append(smart["reason"])
+        if smart.get("temperatureC") is not None:
+            details.append(f"SSD: {smart['temperatureC']} C")
+        if smart.get("powerOnHours") is not None:
+            details.append(f"Ligado: {smart['powerOnHours']} h")
+        if smart.get("wearUsedPercent") is not None:
+            details.append(f"Desgaste NVMe: {smart['wearUsedPercent']}%")
+        lines.append("  |  ".join(details))
+        counters = [("reallocatedSectors", "Realocados"), ("pendingSectors", "Pendentes"),
+                    ("uncorrectableSectors", "Incorretiveis"), ("crcErrors", "Erros CRC"),
+                    ("mediaErrors", "Erros de midia"), ("powerCycles", "Ciclos de energia")]
+        available = [f"{label}: {smart[key]}" for key, label in counters if smart.get(key) is not None]
+        if available:
+            lines.append("  |  ".join(available))
+    else:
+        lines.append(f"Selecao: {storage.get('reason') or '-'}")
+    return tuple(lines)
 
 
 def _entry_day(entry: dict) -> str | None:
@@ -254,6 +295,8 @@ def _worker(runner: LocalRotalogRunner, state: TuiState) -> None:
             state.next_run = None
 
         try:
+            if state.storage:
+                assert_available(StorageSelection(**state.storage))
             result = runner.run_once()
         except Exception as exc:
             now_str = datetime.now(TZ).isoformat()
@@ -340,6 +383,8 @@ def _viewer_worker(state: TuiState, output_dir: Path) -> None:
 
     while not state.stop.is_set():
         try:
+            if state.storage:
+                assert_available(StorageSelection(**state.storage))
             runtime_status = _load_runtime_status(output_dir)
             new_entries, rotated = reader.read_incremental()
             if rotated:
@@ -361,6 +406,11 @@ def _viewer_worker(state: TuiState, output_dir: Path) -> None:
                         _update_viewer_state_timing(state)
             with state.lock:
                 state.runtime_status = runtime_status
+        except OSError as exc:
+            with state.lock:
+                state.is_stale = True
+                state.runtime_status = {}
+                state.status_message = f"ARMAZENAMENTO INDISPONIVEL: {exc}; reabra o TUI apos recuperar o disco"
         except Exception:
             pass
 
@@ -373,9 +423,15 @@ def _health_worker(state: TuiState, output_dir: Path) -> None:
     heartbeat_path = output_dir / "rotalog" / "fleet" / f"{default_node_id()}-heartbeat.json"
     while not state.stop.is_set():
         try:
+            if state.storage:
+                assert_available(StorageSelection(**state.storage))
             heartbeat = load_json(heartbeat_path, {})
             health = dict(heartbeat.get("health") or {})
             heartbeat_at = heartbeat.get("heartbeatAt")
+            heartbeat_dt = parse_iso(heartbeat_at)
+            if heartbeat_dt and (datetime.now(TZ) - heartbeat_dt).total_seconds() > max(180, interval * 2):
+                health["overall"] = "warning" if health.get("overall") != "critical" else "critical"
+                health["issues"] = [*(health.get("issues") or []), {"code": "HEARTBEAT_DESATUALIZADO", "severity": "warning"}]
             if health:
                 health["_heartbeatAt"] = heartbeat_at
             else:
@@ -384,6 +440,11 @@ def _health_worker(state: TuiState, output_dir: Path) -> None:
                     "_heartbeatAt": heartbeat_at,
                     "issues": [{"code": "HEARTBEAT_LOCAL_INDISPONIVEL", "severity": "warning"}],
                 }
+            if state.storage and health.get("storage") != state.storage:
+                health["disk"] = {}
+                health["overall"] = "warning"
+                health["issues"] = [*(health.get("issues") or []), {"code": "AGUARDANDO_HEARTBEAT_ARMAZENAMENTO", "severity": "warning"}]
+            health["storage"] = dict(state.storage) or health.get("storage", {})
             with state.lock:
                 state.device_health = health
                 state.device_health_updated_at = parse_iso(heartbeat_at) or datetime.now(TZ)
@@ -391,6 +452,8 @@ def _health_worker(state: TuiState, output_dir: Path) -> None:
             with state.lock:
                 state.device_health = {
                     "overall": "warning",
+                    "storage": dict(state.storage),
+                    "disk": {"error": "storage_unavailable"},
                     "issues": [{"code": f"HEALTH_READ_ERROR: {exc}", "severity": "warning"}],
                 }
                 state.device_health_updated_at = datetime.now(TZ)
@@ -707,15 +770,18 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     # -- 4. Caixa: Saúde do Dispositivo ------------------------------------
     health = data.get("device_health") or {}
     health_top = exec_top + exec_h
-    health_h = 5
+    health_lines = _format_health(health) if health else ()
+    health_h = min(len(health_lines) + 2, max(5, height - health_top - 8)) if health else 5
     health_color = _health_color(health)
     _box(screen, health_top, 0, health_h, width - 1, title="SAUDE DO DISPOSITIVO", color=health_color)
     if health:
-        health_lines = _format_health(health)
         _line(screen, health_top + 1, 2, health_lines[0], width - 4, _cp(health_color, curses.A_BOLD if health_color != C_OK else 0))
         _line(screen, health_top + 2, 2, health_lines[1], width - 4, _cp(C_DEFAULT))
         issues_attr = _cp(C_WARN, curses.A_BOLD) if (health.get("issues") or health_color != C_OK) else _cp(C_OK)
         _line(screen, health_top + 3, 2, health_lines[2], width - 4, issues_attr)
+        for offset, text in enumerate(health_lines[3:], start=4):
+            if offset < health_h - 1:
+                _line(screen, health_top + offset, 2, text, width - 4, _cp(C_DEFAULT))
     else:
         _line(screen, health_top + 1, 2, "Coletando informacoes de saude...", width - 4, _cp(C_DIM))
 
@@ -928,7 +994,10 @@ def main() -> int:
     if args.peak_interval < 30 or args.offpeak_interval < 30:
         parser.error("--peak-interval e --offpeak-interval devem ser no mínimo 30")
 
-    output_dir = Path(args.output_dir).resolve()
+    storage = resolve_storage(Path(args.output_dir), args.empresa, project_root=ROOT, writable=not args.view)
+    activate_storage(storage)
+    assert_available(storage)
+    output_dir = Path(storage.data_dir)
     tui_log_file = _setup_tui_logging(output_dir)
 
     if args.no_firebase:
@@ -952,6 +1021,8 @@ def main() -> int:
             offpeak_interval=args.offpeak_interval,
             viewer_mode=False,
         )
+
+    state.storage = storage.payload()
 
     if curses is None:
         print(
