@@ -63,9 +63,18 @@ def read_smart(device: str) -> dict:
         if device_type not in ("auto", "sat", "sat,12", "sat,16", "scsi", "nvme"):
             return {"status": "unavailable", "reason": "DDS_SMART_DEVICE_TYPE invalido"}
         command += ["-d", device_type]
+    if os.getenv("DDS_SMART_USE_SUDO", "false").strip().lower() in ("true", "1", "yes"):
+        sudo = shutil.which("sudo")
+        if not sudo:
+            return {"status": "unavailable", "reason": "sudo nao instalado"}
+        # Apenas leitura; -n impede senha/prompt no agente systemd.
+        # A autorização fica em sudoers, com executável e argumentos exatos.
+        command = [sudo, "-n", *command]
     try:
         result = subprocess.run(command + [device], capture_output=True, text=True,
                                 timeout=8, check=False)
+        if not result.stdout.strip() and result.returncode:
+            return {"status": "unavailable", "reason": "consulta negada: conferir permissao/regra sudoers"}
         payload = json.loads(result.stdout)
         if not isinstance(payload, dict) or result.returncode < 0:
             raise ValueError("Resposta SMART invalida")

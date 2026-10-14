@@ -112,8 +112,9 @@ Depois de atualizar o agente, é possível solicitar a próxima amostra com
 `sudo systemctl start fleet-agent.service` se ele estiver inativo.
 
 SMART exige `smartctl` (pacote `smartmontools`), suporte do adaptador USB e permissão
-do usuário do agente para consultar o disco físico. Não se alteram permissões, não
-se invoca sudo automaticamente e não se executam testes ou comandos de escrita no SSD.
+do usuário do agente para consultar o disco físico. Não se alteram permissões;
+sudo só é usado com a opção explícita descrita abaixo. Não se executam testes
+ou comandos de escrita no SSD.
 Sem essas condições, o painel informa `INDISPONIVEL` e a causa, mantendo a coleta.
 
 Quando disponíveis, são mostrados status SMART, temperatura do SSD (separada da CPU),
@@ -131,3 +132,30 @@ adicione `DDS_SMART_DEVICE_TYPE=sat` ao `.env` do agente. A identificação do d
 derivada da montagem atual e não fixa `/dev/sda`, permitindo intercambiar SSDs.
 
 Referência: [manual oficial do smartctl](https://github.com/smartmontools/smartmontools/blob/main/src/smartctl.8.in).
+
+### Consulta SMART com permissão restrita
+
+Se a consulta funcionar somente como root, não incluir o usuário no grupo `disk`.
+É possível habilitar `DDS_SMART_USE_SUDO=true` no `.env`. O agente então executa
+`sudo -n smartctl ...`, que nunca solicita senha. Sem a autorização exata, SMART
+permanece indisponível e o coletor continua funcionando.
+
+Conferir `command -v smartctl` e o disco físico atual. Para `/usr/sbin/smartctl`
+e `/dev/sda`, a regra em `/etc/sudoers.d/90-dds-smart`, propriedade de root,
+permissão 0440, deve conter apenas:
+
+```sudoers
+orangepi ALL=(root) NOPASSWD: /usr/sbin/smartctl -j -a /dev/sda
+```
+
+Validar o arquivo antes de instalá-lo com `sudo visudo -cf <arquivo>`.
+Validar a leitura como orangepi com `sudo -n /usr/sbin/smartctl -j -a /dev/sda`.
+Não usar curingas nos argumentos nem liberar todo o executável. Se o dispositivo
+mudar para `/dev/sdb`, ou se for necessário `-d sat`, atualizar a regra para o novo
+comando exato. Esta regra restringe o comando/dispositivo; o UUID da seleção de
+armazenamento continua sendo validado pelo agente antes da consulta.
+
+Após atualizar o código/configuração, iniciar `fleet-agent.service` se estiver
+inativo e aguardar a leitura do heartbeat pelo TUI (até dois minutos).
+
+Referência: [manual do sudoers](https://www.sudo.ws/docs/man/1.9.14/sudoers.man.pdf).

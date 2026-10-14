@@ -59,6 +59,30 @@ class DiskHealthTests(unittest.TestCase):
     def test_timeout_keeps_health_available(self, run, which):
         self.assertEqual("unavailable", read_smart("/dev/sda")["status"])
 
+    @patch.dict("os.environ", {"DDS_SMART_USE_SUDO": "true", "DDS_SMART_DEVICE_TYPE": ""})
+    @patch("coletor.disk_health.shutil.which", side_effect=["/usr/sbin/smartctl", "/usr/bin/sudo"])
+    @patch("coletor.disk_health.subprocess.run")
+    def test_sudo_opt_in_is_noninteractive_and_read_only(self, run, which):
+        run.return_value = Mock(stdout=json.dumps({"smart_status": {"passed": True}}), returncode=0)
+        self.assertEqual("passed", read_smart("/dev/sda")["status"])
+        self.assertEqual(["/usr/bin/sudo", "-n", "/usr/sbin/smartctl", "-j", "-a", "/dev/sda"], run.call_args.args[0])
+
+    @patch.dict("os.environ", {"DDS_SMART_USE_SUDO": "true", "DDS_SMART_DEVICE_TYPE": ""})
+    @patch("coletor.disk_health.shutil.which", side_effect=["/usr/sbin/smartctl", "/usr/bin/sudo"])
+    @patch("coletor.disk_health.subprocess.run", return_value=Mock(stdout="", returncode=1))
+    def test_sudo_denied_returns_unavailable_without_retry(self, run, which):
+        result = read_smart("/dev/sda")
+        self.assertEqual("unavailable", result["status"])
+        self.assertIn("sudoers", result["reason"])
+        run.assert_called_once()
+
+    @patch.dict("os.environ", {"DDS_SMART_USE_SUDO": "true", "DDS_SMART_DEVICE_TYPE": ""})
+    @patch("coletor.disk_health.shutil.which", side_effect=["/usr/sbin/smartctl", None])
+    @patch("coletor.disk_health.subprocess.run")
+    def test_sudo_missing_does_not_execute(self, run, which):
+        self.assertEqual("sudo nao instalado", read_smart("/dev/sda")["reason"])
+        run.assert_not_called()
+
     @patch("coletor.disk_health.shutil.disk_usage")
     @patch("coletor.disk_health.assert_available", side_effect=StorageUnavailable("SSD retirado"))
     def test_removed_disk_does_not_measure_card_mountpoint(self, check, usage):
