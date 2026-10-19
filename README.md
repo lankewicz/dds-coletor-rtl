@@ -46,6 +46,23 @@ arquivos locais, índice e caminhos na nuvem usam sempre a equipe base.
 As regras de identidade, validação, migração de snapshots e resolução por tablet ou integrantes ficam
 centralizadas em `coletor/equipes.py`.
 
+Quando um diário do mesmo veículo e data diverge da identidade observada, a coleta
+continua com `identitySource: UNRESOLVED`, `teamId: null` e
+`identityResolution.status: PENDENTE`. Serviços, turnos e fila continuam sendo
+registrados por veículo, sem atribuição automática a outra identidade permanente.
+Somente nomes comuns às composições observadas são mantidos; os demais ficam como
+`NÃO IDENTIFICADO`. Os candidatos e as composições recebidas ficam no diagnóstico
+`identityResolution`. Essa pendência não é resolvida apenas pela repetição dos nomes
+em uma coleta posterior.
+
+Antes da primeira gravação com identificação pendente, o diário original é
+preservado em `rotalog/equipes/identity-history/<data>/<veículo>/<identificador>.json`.
+A referência no cadastro da identidade anterior passa a apontar para essa cópia;
+o diário incerto não é indexado como histórico da identidade nova. A cópia é local
+e não substitui uma política de backup. Trocas de empresa, veículo ou data no merge
+continuam bloqueadas. Observações antigas do índice não reatribuem veículos cujas
+identidades já existem no cadastro.
+
 1. **Compactação Nativa GZIP (`.json.gz`)**:
    - O tráfego de rede utiliza `.json.gz`; o diário consolidado local utiliza `.json` sem compactação.
    - O `index.json.gz` consolidado (todas as 100+ equipes) caiu de **785 KB para apenas 9.1 KB** (**~99% de economia**).

@@ -878,6 +878,11 @@ class LocalRotalogRunner:
         # Migração progressiva: a primeira execução cria identidades permanentes a
         # partir da torre já existente antes de observar possíveis veículos novos.
         for previous_key, previous_document in previous.items():
+            if previous_document.get("identitySource") == "UNRESOLVED":
+                continue
+            if previous_document.get("teamId") in self.team_registry.data.get("teams", {}):
+                # Uma observação antiga não deve reatribuir um veículo já atualizado.
+                continue
             conexao = previous_document.get("conexao") or {}
             previous_members = previous_document.get("colaborador") or conexao.get("colaborador")
             previous_at = (
@@ -938,7 +943,24 @@ class LocalRotalogRunner:
                 operational_day = self._operational_date(document, day)
                 daily_path = self._daily_path(operational_day, team_key)
                 previous_daily = self._load_daily_with_recovery(daily_path, operational_day, team_key)
-                merged_daily = merge_daily_document(previous_daily, document, operational_day)
+                if (previous_daily.get("teamId") and document.get("teamId")
+                        and previous_daily["teamId"] != document["teamId"]):
+                    import hashlib
+                    identity_key = hashlib.sha256(previous_daily["teamId"].encode()).hexdigest()[:24]
+                    archive = self.index_path.parent.parent / "identity-history" / operational_day / team_key / f"{identity_key}.json"
+                    archived, archive_status = load_json_with_status(archive, {})
+                    if archive_status == "missing":
+                        write_json(archive, previous_daily)
+                    elif archive_status != "ok" or archived.get("teamId") != previous_daily["teamId"]:
+                        raise RuntimeError(f"Cópia histórica de identidade inválida: {archive}")
+                    self.team_registry.record_history(
+                        previous_daily["teamId"], operational_day, team_key,
+                        path=archive.relative_to(self.index_path.parent.parent).as_posix(),
+                    )
+                    LOG.warning("Identificação pendente para %s: diário=%s, observado=%s; original preservado em %s",
+                                team_key, previous_daily["teamId"], document["teamId"], archive)
+                merged_daily = merge_daily_document(previous_daily, document, operational_day,
+                                                    allow_identity_uncertainty=True)
                 merged_daily["fila"] = queue_counts(team)
                 known = dict(previous_daily.get("observedShiftEvents") or {})
                 recognized = self._daily_sync_reasons(previous_daily, merged_daily)
@@ -952,9 +974,10 @@ class LocalRotalogRunner:
                         if key:
                             known[key] = True
                 merged_daily["observedShiftEvents"] = known
-                self.team_registry.record_history(
-                    identity["teamId"], operational_day, team_key
-                )
+                if merged_daily.get("teamId"):
+                    self.team_registry.record_history(
+                        merged_daily["teamId"], operational_day, team_key
+                    )
 
                 prepared_daily.append((team_key, operational_day, daily_path, previous_daily, merged_daily))
 

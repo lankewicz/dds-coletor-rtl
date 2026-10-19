@@ -103,9 +103,27 @@ class TuiLayoutTests(unittest.TestCase):
         text = "\n".join(self.render(state))
         self.assertIn("185b3d33-422b-493c-8d1a-ccd3b914f038", text)
         self.assertIn("11554", text)
-        self.assertIn("Erros CRC: 0", text)
+        self.assertRegex(text, r"Erros CRC:\s+0")
         self.assertIn("raspagem", text.lower())
         self.assertNotIn("EVENTOS DE EQUIPES", text)
+
+    def test_wide_details_use_two_columns_and_readable_times(self):
+        state = sample_state()
+        state.show_details = True
+        rows = self.render(state)
+        self.assertTrue(any("ULTIMA EXECUCAO" in row and "SINCRONIZACAO" in row for row in rows))
+        self.assertTrue(any("SAUDE DO DISPOSITIVO" in row and "ARMAZENAMENTO" in row for row in rows))
+        self.assertIn("14/10/2026 16:09:43", "\n".join(rows))
+        self.assertNotIn("2026-10-14T", "\n".join(rows))
+
+    def test_details_show_complete_error_in_red_before_panels(self):
+        last = {"status": "error", "error": "Falha ao processar E2269: " + "identidade divergente " * 8}
+        with patch("tui.curses", TERMINAL):
+            rows = tui._detail_rows(last, {}, 72)
+        first_blank = next(index for index, row in enumerate(rows) if not row)
+        error = [text for row in rows[:first_blank] for _, text, color in row if color == tui.C_ERROR]
+        self.assertEqual(" ".join(error), "FALHA NA COLETA: " + last["error"].strip())
+        self.assertTrue(rows[0][0][1].startswith("FALHA NA COLETA"))
 
     def test_narrow_details_wrap_and_clamp_scroll(self):
         state = sample_state()

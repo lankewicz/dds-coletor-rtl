@@ -189,6 +189,8 @@ def compactar_equipe_para_index(
         "schemaVersion": document.get("schemaVersion", 2),
         "teamKey": document.get("teamKey"),
         "teamId": document.get("teamId"),
+        "identitySource": "UNRESOLVED" if document.get("identitySource") == "UNRESOLVED" else None,
+        "identityResolution": document.get("identityResolution"),
         "operationalDate": document.get("operationalDate") or document.get("date"),
         "updatedAt": document.get("updatedAt"),
         "timezone": document.get("timezone", "America/Sao_Paulo"),

@@ -134,7 +134,7 @@ class TeamRegistry:
             "identitySource": source,
         }
 
-    def record_history(self, team_id: str, operational_date: str, vehicle_code: str) -> None:
+    def record_history(self, team_id: str, operational_date: str, vehicle_code: str, *, path: str | None = None) -> None:
         """Indexa o arquivo diário sem duplicar serviços dentro do cadastro."""
         team = self.data["teams"].get(team_id)
         if not team:
@@ -142,14 +142,16 @@ class TeamRegistry:
         reference = {
             "operationalDate": operational_date,
             "vehicleCode": normalize_team_key(vehicle_code),
-            "path": f"daily/{operational_date}/{normalize_team_key(vehicle_code)}.json",
+            "path": path or f"daily/{operational_date}/{normalize_team_key(vehicle_code)}.json",
         }
         history = team.setdefault("historyFiles", [])
         current = next((item for item in history
                         if item.get("operationalDate") == operational_date
                         and normalize_team_key(item.get("vehicleCode")) == reference["vehicleCode"]), None)
         if current:
-            current.update(reference)
+            if current != reference:
+                current.update(reference)
+                self.dirty = True
         else:
             history.append(reference)
             history.sort(key=lambda item: (str(item.get("operationalDate") or ""), str(item.get("vehicleCode") or "")))

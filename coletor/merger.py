@@ -344,12 +344,16 @@ def merge_daily_document(
     previous: dict[str, typing.Any] | None,
     current: dict[str, typing.Any],
     day: str,
+    *,
+    allow_identity_uncertainty: bool = False,
 ) -> dict[str, typing.Any]:
     team_key = _safe_team_key(current.get("teamKey") or current.get("equipe"))
     previous = previous or {}
     if previous.get("teamKey") and previous["teamKey"] != team_key:
         raise ValueError("Historico pertence a outra equipe")
-    if previous.get("teamId") and current.get("teamId") and previous["teamId"] != current["teamId"]:
+    identity_conflict = bool(previous.get("teamId") and current.get("teamId") and previous["teamId"] != current["teamId"])
+    unresolved = previous.get("identityResolution") if previous.get("identitySource") == "UNRESOLVED" else None
+    if identity_conflict and not allow_identity_uncertainty:
         raise ValueError("Historico pertence a outra identidade permanente")
     if previous.get("date") and previous["date"] != day:
         raise ValueError("Historico pertence a outra data")
@@ -572,6 +576,21 @@ def merge_daily_document(
             "historico": historico,
         },
     }
+    if identity_conflict or unresolved:
+        resolution = dict(unresolved or {})
+        candidates = set(resolution.get("candidateTeamIds") or [])
+        candidates.update(value for value in (previous.get("teamId"), current.get("teamId")) if value)
+        reported = set(resolution.get("reportedMembers") or [])
+        reported.update(value for value in (previous.get("membersKey"), current.get("membersKey")) if value)
+        # Só os nomes presentes em todas as composições são identificáveis.
+        common = set.intersection(*(set(value.split("|")) for value in reported)) if reported else set()
+        result.update(teamId=None, membersKey=None, identitySource="UNRESOLVED")
+        result["identityResolution"] = {
+            **resolution, "status": "PENDENTE", "reason": "CONFLICTING_TEAM_IDENTITIES",
+            "candidateTeamIds": sorted(candidates), "reportedMembers": sorted(reported),
+            "identifiedMembers": sorted(common),
+        }
+        result["conexao"]["colaborador"] = " ".join(sorted(common) + ["NÃO IDENTIFICADO"])
     for turno_item in result["jornada"]["turnos"]:
         inicio = turno_item.get("inicio")
         if inicio:

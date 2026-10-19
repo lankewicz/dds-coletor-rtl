@@ -49,6 +49,9 @@ def changed_fields(
 
     # Se o documento atual utiliza Schema v2:
     if "ordensServico" in current or "jornada" in current:
+        for field in ("teamId", "membersKey", "identitySource", "identityResolution"):
+            if previous.get(field) != current.get(field):
+                changes[field] = {"anterior": previous.get(field), "novo": current.get(field)}
         prev_conexao = previous.get("conexao") or {}
         curr_conexao = current.get("conexao") or {}
         for k in ("isOnline", "veiculo", "colaborador"):
