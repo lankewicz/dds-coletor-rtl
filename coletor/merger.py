@@ -69,16 +69,16 @@ def _extrair_data_base(service: dict[str, typing.Any], day: str) -> str:
     return day
 
 
-def _formatar_horarios_servico(service: dict[str, typing.Any], base_day: str) -> dict[str, str | None]:
+def _formatar_horarios_servico(service: dict[str, typing.Any], base_day: str, observed_at: str | None = None) -> dict[str, typing.Any]:
     raw_desloc = service.get("inicioDeslocamento") or service.get("inicioIso")
-    raw_exec = service.get("inicioExecucao") or service.get("inicioIso")
+    raw_exec = service.get("inicioExecucao")
     raw_fim = service.get("termino") or service.get("fimIso") or service.get("fimExecucao")
     raw_retorno = service.get("retorno")
 
     cur_day = datetime.date.fromisoformat(base_day)
     prev_dt: datetime.datetime | None = None
 
-    result: dict[str, str | None] = {
+    result: dict[str, typing.Any] = {
         "inicioDeslocamento": None,
         "inicioExecucao": None,
         "fimExecucao": None,
@@ -134,9 +134,9 @@ def _formatar_horarios_servico(service: dict[str, typing.Any], base_day: str) ->
             prev_dt = dt_val
             result[key] = dt_val.isoformat()
 
-    if result["inicioDeslocamento"] and result["inicioExecucao"]:
-        if result["inicioExecucao"] < result["inicioDeslocamento"]:
-            result["inicioExecucao"] = result["inicioDeslocamento"]
+    _validar_execucao(result, observed_at)
+    for discarded in result.get("horariosDescartados") or []:
+        discarded["valor"] = raw_exec
 
     if result["inicioExecucao"] and result["fimExecucao"]:
         if result["fimExecucao"] < result["inicioExecucao"]:
@@ -165,7 +165,37 @@ def _service_id(team_key: str, service: dict[str, typing.Any]) -> str:
     return f"{team_key}_{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
 
 
-def compact_service(team_key: str, day: str, service: dict[str, typing.Any]) -> dict[str, typing.Any]:
+def _validar_execucao(service: dict, observed_at: str | None = None) -> None:
+    """Valida execução sem inventar horários e alinha as transições derivadas."""
+    execution = _iso_local(service.get("inicioExecucao"))
+    departure = _iso_local(service.get("inicioDeslocamento"))
+    observed = _iso_local(observed_at) if observed_at else datetime.datetime.now(LOCAL_TZ).isoformat()
+    reason = None
+    if execution and departure and datetime.datetime.fromisoformat(execution) < datetime.datetime.fromisoformat(departure):
+        reason = "ANTERIOR_AO_DESLOCAMENTO"
+    elif execution and datetime.datetime.fromisoformat(execution) > datetime.datetime.fromisoformat(observed):
+        reason = "POSTERIOR_A_COLETA"
+    if reason:
+        service.setdefault("horariosDescartados", []).append({
+            "campo": "inicioExecucao", "valor": service["inicioExecucao"],
+            "motivo": reason, "observadoEm": observed,
+        })
+        service["inicioExecucao"] = None
+        execution = None
+    transitions = []
+    for transition in service.get("transitions") or []:
+        if not isinstance(transition, dict):
+            continue
+        if str(transition.get("status") or transition.get("statusAtual") or "").upper() == "EXECUCAO":
+            if not execution:
+                continue
+            dt = datetime.datetime.fromisoformat(execution)
+            transition = {**transition, "timestampMs": int(dt.timestamp() * 1000), "hora": dt.strftime("%H:%M")}
+        transitions.append(transition)
+    service["transitions"] = transitions
+
+
+def compact_service(team_key: str, day: str, service: dict[str, typing.Any], observed_at: str | None = None) -> dict[str, typing.Any]:
     lat = service.get("latitude")
     lon = service.get("longitude")
     if lat is None and isinstance(service.get("geolocalizacao"), dict):
@@ -181,7 +211,8 @@ def compact_service(team_key: str, day: str, service: dict[str, typing.Any]) -> 
 
     status_atual = service.get("status") or service.get("statusAtual")
     base_day = _extrair_data_base(service, day)
-    horarios = _formatar_horarios_servico(service, base_day)
+    observed_at = observed_at or service.get("observadoEm") or service.get("updatedAtIso")
+    horarios = _formatar_horarios_servico(service, base_day, observed_at)
 
     result = {
         "categoria": service.get("categoria"),
@@ -199,10 +230,13 @@ def compact_service(team_key: str, day: str, service: dict[str, typing.Any]) -> 
         "baseDay": base_day,
         "camposEstimados": list(service.get("camposEstimados") or []),
         "transitions": list(service.get("transitions") or []),
+        "horariosDescartados": list(service.get("horariosDescartados") or []) + list(horarios.get("horariosDescartados") or []),
     }
+    _validar_execucao(result, observed_at)
     dates = sorted({
         str(value)[:10]
-        for value in horarios.values()
+        for field, value in horarios.items()
+        if field in ("inicioDeslocamento", "inicioExecucao", "fimExecucao", "retorno")
         if value and len(str(value)) >= 10
     })
     result["calendarDates"] = dates
@@ -282,6 +316,13 @@ def _merge_service_records(team_key: str, records: list[dict[str, typing.Any]]) 
                 continue
             if value is not None and value != "" and (not stale or merged.get(field) in (None, "")):
                 merged[field] = value
+        if not stale and item.get("horariosDescartados") and not item.get("inicioExecucao"):
+            merged["inicioExecucao"] = None
+        merged["horariosDescartados"] = list(old.get("horariosDescartados") or [])
+        for discarded in item.get("horariosDescartados") or []:
+            if discarded not in merged["horariosDescartados"]:
+                merged["horariosDescartados"].append(discarded)
+        _validar_execucao(merged, merged.get("observadoEm"))
         if old.get("statusAtual") == "CONCLUSAO" and item.get("statusAtual") in ("EXECUCAO", "DESLOCAMENTO"):
             merged["statusAtual"] = "CONCLUSAO"
         tipos = list(old.get("historicoTipos") or [])
@@ -336,7 +377,7 @@ def merge_daily_document(
 
     for field in ("ssExecutadas", "ssEmAndamento", "services", "bdoList"):
         for raw in current.get(field) or []:
-            item = compact_service(team_key, day, raw)
+            item = compact_service(team_key, day, raw, current.get("updatedAtIso") or current.get("updatedAt"))
             service_start = item.get("inicioDeslocamento") or item.get("inicioExecucao")
             if current_shift_start and service_start and str(service_start) < str(current_shift_start):
                 # A timeline pode continuar exibindo o plantão anterior. Ele permanece
@@ -388,7 +429,7 @@ def merge_daily_document(
         if (srv.get("baseDay") == day or str(srv.get("inicioDeslocamento") or srv.get("inicioExecucao") or "")[:10] == day)
     ]
     activity_raw = current.get("atividadeAtual") or {}
-    current_service = compact_service(team_key, day, activity_raw) if activity_raw else None
+    current_service = compact_service(team_key, day, activity_raw, current.get("updatedAtIso") or current.get("updatedAt")) if activity_raw else None
 
     # Garantia de unicidade de atividade ativa
     active_in_list = [srv for srv in services if srv.get("statusAtual") in ("EXECUCAO", "DESLOCAMENTO")]

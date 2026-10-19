@@ -7,18 +7,18 @@ import json
 import tempfile
 from pathlib import Path
 from coletor.parser import (
-    _corrigir_inicio_execucao_ativa,
     carregar_servicos_ignorados,
     consolidar_turno_por_contexto,
 )
 import datetime
+from coletor.merger import compact_service
 from zoneinfo import ZoneInfo
 
 LOCAL_TZ = ZoneInfo("America/Sao_Paulo")
 
 
 class IgnoredServicesTests(unittest.TestCase):
-    def test_execucao_ativa_iniciada_ontem_usa_hora_da_coleta(self):
+    def test_execucao_ativa_iniciada_ontem_preserva_horario_real(self):
         scraped_at = datetime.datetime(2026, 9, 28, 10, 30, tzinfo=LOCAL_TZ)
         service = {
             "status": "EXECUCAO",
@@ -27,9 +27,9 @@ class IgnoredServicesTests(unittest.TestCase):
             "inicioExecucao": "22:00",
         }
 
-        _corrigir_inicio_execucao_ativa(service, scraped_at)
+        result = compact_service("E3X89", "2026-09-27", service, scraped_at.isoformat())
 
-        self.assertEqual(service["inicioExecucao"], scraped_at.isoformat())
+        self.assertEqual(result["inicioExecucao"], "2026-09-27T22:00:00-03:00")
         self.assertEqual(service["inicioDeslocamento"], "2026-09-27T21:30:00-03:00")
 
     def test_servico_concluido_nao_tem_inicio_execucao_reescrito(self):
@@ -40,9 +40,10 @@ class IgnoredServicesTests(unittest.TestCase):
             "inicioExecucao": "22:00",
         }
 
-        _corrigir_inicio_execucao_ativa(service, scraped_at)
+        result = compact_service("E3X89", "2026-09-27", service, scraped_at.isoformat())
 
         self.assertEqual(service["inicioExecucao"], "22:00")
+        self.assertEqual(result["inicioExecucao"], "2026-09-27T22:00:00-03:00")
 
     def test_carregar_servicos_ignorados_encontra_config(self):
         with tempfile.TemporaryDirectory() as directory:
