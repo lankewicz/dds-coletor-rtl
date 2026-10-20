@@ -84,6 +84,25 @@ identidades já existem no cadastro.
 
 ## 3. Estrutura de Arquivos
 
+### Organização da interface de terminal
+
+`tui.py` mantém o comando de entrada e os imports de compatibilidade. A implementação
+fica em `coletor/tui/`: `state.py` guarda o estado compartilhado; `workers.py` faz
+as leituras locais e executa os trabalhadores; `terminal.py` concentra curses, cores
+e primitivas; `formatting.py` formata valores; `view.py`, `details.py` e `panels.py`
+desenham as telas; `controller.py` trata a sessão e o teclado; `cli.py` configura os
+argumentos, armazenamento e logs. Os comandos de uso continuam iguais.
+
+Nos testes, o backend de terminal é substituído em `coletor.tui.terminal.curses`.
+Isso permite validar os mesmos renderizadores sem abrir um terminal real.
+
+A tecla `E` abre o panorama por Deslocamento, Execução, Intervalo, Sem execução,
+Fechado e Conclusões recentes. `Tab` seleciona um bloco; setas e PgUp/PgDn rolam
+somente esse bloco; `E` ou Esc retorna à tela principal. Em telas menores, apenas
+o bloco selecionado é mostrado. Sem execução exige turno aberto sem SS ativa e
+fora de intervalo, mostrando abertura e fila C/E. Conclusões recentes lê o arquivo
+local de eventos das últimas 24 horas: é histórico, independente do estado atual.
+
 ### Arquivo do quadro de eventos
 
 O coletor mantém `rotalog/events/current/index.json.gz` como projeção independente

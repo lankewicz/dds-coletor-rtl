@@ -8,6 +8,12 @@ from tui import _format_columns, _format_bytes
 
 
 class TeamTransitionsTests(unittest.TestCase):
+    def test_queue_update_does_not_claim_execution_started(self):
+        previous = {"fila": {"comercial": 2}, "ordensServico": {
+            "atual": {"statusAtual": "EXECUCAO", "protocolo": "51062916", "inicioExecucao": "06:49"}}}
+        current = {**previous, "fila": {"comercial": 3}}
+        self.assertEqual(summarize_team_transition(previous, current), "Dados atualizados (Execução)")
+
     def test_shift_start_and_end(self):
         doc_closed = {"jornada": {"turno": {"status": "FECHADO"}}}
         doc_open = {"jornada": {"turno": {"status": "ABERTO"}}}

@@ -106,6 +106,17 @@ class TuiLayoutTests(unittest.TestCase):
         self.assertIn("09:00:00", "\n".join(rows))
         self.assertNotIn("EVENTOS DE EQUIPES", "\n".join(rows))
 
+    def test_e_expanded_mode_shows_only_team_panel_on_wide_screen(self):
+        state = self.team_state()
+        state.active_panel = "teams"
+        state.teams_expanded = True
+        text = "\n".join(self.render(state, height=42, width=180))
+        self.assertIn("SITUACAO DAS EQUIPES", text)
+        for name in ("DESLOCAMENTO", "EXECUCAO", "INTERVALO", "SEM EXECUCAO", "FECHADO", "CONCLUSOES RECENTES"):
+            self.assertIn(name, text)
+        self.assertNotIn("EVENTOS DE EQUIPES", text)
+        self.assertIn("Voltar", text)
+
     def test_current_hour_does_not_use_collection_or_estimated_time(self):
         from datetime import datetime
         now = datetime.fromisoformat("2026-10-20T10:00:00-03:00")
@@ -116,9 +127,23 @@ class TuiLayoutTests(unittest.TestCase):
         self.assertEqual(rows[0][2], "09:10:00")
         self.assertEqual(rows[1][2], "—")
 
+    def test_current_teams_sort_by_full_timestamp_with_unknown_times_last(self):
+        from datetime import datetime
+        now = datetime.fromisoformat("2026-10-20T01:00:00-03:00")
+        def opened(value):
+            return {"jornada": {"turno": {"status": "ABERTO", "inicio": value}}}
+        rows = tui._team_current_rows({
+            "E2001": opened("2026-10-19T23:55:00-03:00"),
+            "E2002": opened("2026-10-20T00:10:00-03:00"),
+            "E2003": opened(None),
+            "E2004": opened("2026-10-20T02:00:00-03:00"),
+            "E2005": opened("2026-10-20T00:10:00-03:00"),
+        }, now)
+        self.assertEqual([row[0] for row in rows], ["E2002", "E2005", "E2001", "E2003", "E2004"])
+
     def render(self, state, height=42, width=180):
         screen = Screen(height, width)
-        with patch("tui.curses", TERMINAL):
+        with patch("coletor.tui.terminal.curses", TERMINAL):
             tui._render(screen, None, state)
         return screen.text()
 
@@ -161,7 +186,7 @@ class TuiLayoutTests(unittest.TestCase):
 
     def test_details_show_complete_error_in_red_before_panels(self):
         last = {"status": "error", "error": "Falha ao processar E2269: " + "identidade divergente " * 8}
-        with patch("tui.curses", TERMINAL):
+        with patch("coletor.tui.terminal.curses", TERMINAL):
             rows = tui._detail_rows(last, {}, 72)
         first_blank = next(index for index, row in enumerate(rows) if not row)
         error = [text for row in rows[:first_blank] for _, text, color in row if color == tui.C_ERROR]

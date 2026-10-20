@@ -305,7 +305,7 @@ def summarize_team_transition(
                 or prev_atual.get("longitude") != curr_atual.get("longitude")
             ):
                 return f"GPS ({c_label})"
-        return f"Em {c_label}"
+        return f"Dados atualizados ({c_label})"
 
     if curr_turno_status == "ABERTO":
         return "Livre"

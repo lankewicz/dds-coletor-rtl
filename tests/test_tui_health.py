@@ -70,10 +70,10 @@ class TuiHealthTests(unittest.TestCase):
         import tui
         selected = StorageSelection("ssd", "/mnt/ssd/data", "ChicoEletro", "uuid", "/mnt/ssd", "/dev/sda1")
         with patch("sys.argv", ["tui.py", "--view"]), \
-             patch("tui.resolve_storage", return_value=selected) as resolve, \
-             patch("tui.activate_storage"), patch("tui.assert_available"), \
-             patch("tui._setup_tui_logging", return_value=Path("tui.log")) as logs, \
-             patch("tui.curses") as terminal:
+             patch("coletor.tui.cli.resolve_storage", return_value=selected) as resolve, \
+             patch("coletor.tui.cli.activate_storage"), patch("coletor.tui.cli.assert_available"), \
+             patch("coletor.tui.cli._setup_tui_logging", return_value=Path("tui.log")) as logs, \
+             patch("coletor.tui.terminal.curses") as terminal:
             self.assertEqual(0, tui.main())
         logs.assert_called_once_with(Path(selected.data_dir))
         self.assertFalse(resolve.call_args.kwargs["writable"])
