@@ -73,6 +73,49 @@ def sample_state():
 
 
 class TuiLayoutTests(unittest.TestCase):
+    def team_state(self):
+        state = sample_state()
+        state.teams_error = None
+        state.teams_collected_at = "2026-10-20T09:30:00-03:00"
+        state.team_snapshots = {
+            f"E{2000+i}": {"jornada": {"turno": {"status": "ABERTO"}},
+                          "ordensServico": {"atual": {"statusAtual": "EXECUCAO", "inicioExecucao": "2026-10-20T09:00:00-03:00"}},
+                          "fila": {"comercial": i, "emergencia": 1}} for i in range(60)}
+        return state
+
+    def test_current_panel_uses_quarter_width_and_independent_scroll(self):
+        state = self.team_state()
+        rows = self.render(state)
+        self.assertIn("SITUACAO ATUAL", "\n".join(rows))
+        self.assertTrue(any("EVENTOS DE EQUIPES" in row and "SITUACAO ATUAL" in row for row in rows))
+        team_header = next(row for row in rows if "Situacao" in row and "Hora" in row)
+        self.assertGreaterEqual(team_header.index("Equipe"), 130)
+        self.assertIn("09:00:00", "\n".join(rows))
+        state.active_panel = "teams"
+        state.teams_scroll = 40
+        scrolled = "\n".join(self.render(state))
+        self.assertIn("E2040", scrolled)
+        self.assertNotIn("E2000", scrolled)
+        self.assertEqual(state.events_scroll, 0)
+
+    def test_narrow_terminal_can_switch_to_current_teams(self):
+        state = self.team_state()
+        state.active_panel = "teams"
+        rows = self.render(state, height=24, width=80)
+        self.assertIn("SITUACAO ATUAL", "\n".join(rows))
+        self.assertIn("09:00:00", "\n".join(rows))
+        self.assertNotIn("EVENTOS DE EQUIPES", "\n".join(rows))
+
+    def test_current_hour_does_not_use_collection_or_estimated_time(self):
+        from datetime import datetime
+        now = datetime.fromisoformat("2026-10-20T10:00:00-03:00")
+        rows = tui._team_current_rows({
+            "E2269": {"jornada": {"emIntervalo": True, "intervaloAtual": {"inicio": "2026-10-20T09:10:00-03:00"}}},
+            "E3552": {"ordensServico": {"atual": {"statusAtual": "EXECUCAO", "inicioExecucao": "2026-10-20T09:00:00-03:00", "camposEstimados": ["inicioExecucao"]}}},
+        }, now)
+        self.assertEqual(rows[0][2], "09:10:00")
+        self.assertEqual(rows[1][2], "—")
+
     def render(self, state, height=42, width=180):
         screen = Screen(height, width)
         with patch("tui.curses", TERMINAL):

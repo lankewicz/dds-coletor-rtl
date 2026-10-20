@@ -143,6 +143,12 @@ class TuiState:
         self.storage: dict = {}
         self.show_details = False
         self.details_scroll = 0
+        self.team_snapshots: dict = {}
+        self.teams_collected_at = None
+        self.teams_error = "Aguardando indice local"
+        self.active_panel = "events"
+        self.events_scroll = 0
+        self.teams_scroll = 0
 
     def get_interval(self, now: datetime | None = None) -> int:
         if self.interval_seconds is not None:
@@ -417,6 +423,27 @@ def _viewer_worker(state: TuiState, output_dir: Path) -> None:
             pass
 
         time.sleep(1.0)
+
+
+def _team_state_worker(state: TuiState, output_dir: Path) -> None:
+    """Atualiza apenas o índice local, preservando a última leitura em falhas."""
+    from coletor.storage import load_json_with_status
+    path = output_dir / "rotalog/equipes/current/index.json.gz"
+    while not state.stop.is_set():
+        try:
+            if state.storage:
+                assert_available(StorageSelection(**state.storage))
+            payload, status = load_json_with_status(path, {})
+            if status != "ok" or not isinstance(payload.get("equipes"), dict):
+                raise ValueError("Indice local indisponivel")
+            with state.lock:
+                state.team_snapshots = payload["equipes"]
+                state.teams_collected_at = payload.get("lastCollectedAt")
+                state.teams_error = None
+        except (OSError, ValueError) as exc:
+            with state.lock:
+                state.teams_error = str(exc)
+        state.stop.wait(2)
 
 
 def _health_worker(state: TuiState, output_dir: Path) -> None:
@@ -788,6 +815,79 @@ def _render_details(screen, last: dict, health: dict, scroll: int) -> int:
     return offset
 
 
+def _team_current_rows(snapshots: dict, now: datetime) -> list[tuple]:
+    rows = []
+    for key, doc in sorted(snapshots.items()):
+        journey = doc.get("jornada") or {}
+        shift = journey.get("turno") or {}
+        service = (doc.get("ordensServico") or {}).get("atual") or {}
+        value = None
+        if journey.get("emIntervalo"):
+            label, color = "Intervalo", C_ACCENT
+            intervals = [i for i in journey.get("intervalos") or [] if not i.get("fim")]
+            value = (journey.get("intervaloAtual") or {}).get("inicio") or (intervals[-1].get("inicio") if intervals else None)
+        elif service.get("statusAtual") in ("EXECUCAO", "DESLOCAMENTO"):
+            execution = service["statusAtual"] == "EXECUCAO"
+            label, color = ("Execucao", C_WARN) if execution else ("Desloc.", C_TITLE)
+            field = "inicioExecucao" if execution else "inicioDeslocamento"
+            if field not in (service.get("camposEstimados") or []):
+                value = service.get(field)
+        else:
+            label, color = {"ABERTO": ("Aberto", C_OK), "FECHADO": ("Fechado", C_DIM)}.get(shift.get("status"), ("Indef.", C_DIM))
+            value = shift.get("fim") if shift.get("status") == "FECHADO" else shift.get("inicio") if shift.get("status") == "ABERTO" else None
+        stamp = parse_iso(value) if value else None
+        hour = stamp.astimezone(TZ).strftime("%H:%M:%S") if stamp and stamp <= now else "—"
+        queue = doc.get("fila") or {}
+        pending = f"{queue.get('comercial', '—')}/{queue.get('emergencia', '—')}"
+        rows.append((key, label, hour, pending, color))
+    return rows
+
+
+def _render_operational_panels(screen, last, data, top, height, width, now):
+    split = width >= 144
+    show_teams = split or data["active_panel"] == "teams"
+    right_width = (width - 1) // 4 if split else width - 1
+    left_width = width - right_width - 2 if split else width - 1
+    offsets = {"events_scroll": data["events_scroll"], "teams_scroll": data["teams_scroll"]}
+    if split or not show_teams:
+        _box(screen, top, 0, height, left_width, "EVENTOS DE EQUIPES", C_TITLE if data["active_panel"] == "events" else C_DIM)
+        lines = []
+        events = last.get("events") or {}
+        for key, title, color in (("local", "LOCAL", C_WARN), ("cloud", "NUVEM", C_OK)):
+            entries = events.get(key) or []
+            if entries:
+                lines.append((f"{title} ({len(entries)} eventos)", color))
+                lines.extend((text, C_DEFAULT) for text in _format_columns(
+                    [f"{e['team']}: {e['action']}" for e in entries], left_width - 5, col_width=35))
+        if not lines:
+            lines = [("Nenhuma transicao de equipe no ultimo ciclo." if last else "Aguardando execucoes para exibir eventos.", C_DIM)]
+        visible = max(1, height - 3)
+        offset = min(max(0, data["events_scroll"]), max(0, len(lines) - visible))
+        offsets["events_scroll"] = offset
+        for row, (text, color) in enumerate(lines[offset:offset + visible], top + 1):
+            _line(screen, row, 2, text, left_width - 4, _cp(color))
+        _line(screen, top + height - 2, 2, f"{offset + 1}-{min(offset + visible, len(lines))}/{len(lines)}  Tab: quadro | Setas/Pg: rolar", left_width - 4, _cp(C_DIM))
+    if show_teams:
+        x = left_width + 1 if split else 0
+        _box(screen, top, x, height, right_width, "SITUACAO ATUAL", C_TITLE if data["active_panel"] == "teams" else C_DIM)
+        rows = _team_current_rows(data["team_snapshots"], now)
+        stamp = parse_iso(data["teams_collected_at"]) if data["teams_collected_at"] else None
+        stamp_text = stamp.astimezone(TZ).strftime("%H:%M:%S") if stamp else "—"
+        stale = stamp and now - stamp > timedelta(seconds=data["teams_stale_seconds"])
+        note = "Indice indisponivel" if data["teams_error"] else f"Desatualizado | {stamp_text}" if stale else f"{len(rows)} equipes | Coleta {stamp_text}"
+        _line(screen, top + 1, x + 2, note, right_width - 4, _cp(C_WARN if data["teams_error"] or stale else C_DIM))
+        _line(screen, top + 2, x + 2, f"{'Equipe':<8} {'Situacao':<9} {'Hora':<8} C/E", right_width - 4, _cp(C_TITLE, curses.A_BOLD))
+        visible = max(1, height - 5)
+        offset = min(max(0, data["teams_scroll"]), max(0, len(rows) - visible))
+        offsets["teams_scroll"] = offset
+        for row, (team, label, hour, queue, color) in enumerate(rows[offset:offset + visible], top + 3):
+            _line(screen, row, x + 2, f"{team:<8} {label:<9} {hour:<8} {queue}", right_width - 4, _cp(color))
+        if not rows:
+            _line(screen, top + 3, x + 2, "Sem equipes no indice" if not data["teams_error"] else "Aguardando indice local", right_width - 4, _cp(C_DIM))
+        _line(screen, top + height - 2, x + 2, f"{offset + 1 if rows else 0}-{min(offset + visible, len(rows))}/{len(rows)} | C/E: fila", right_width - 4, _cp(C_DIM))
+    return offsets
+
+
 def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     height, width = screen.getmaxyx()
     if height < 18 or width < 75:
@@ -811,6 +911,13 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
             "storage": dict(state.storage),
             "show_details": state.show_details,
             "details_scroll": state.details_scroll,
+            "team_snapshots": dict(state.team_snapshots),
+            "teams_collected_at": state.teams_collected_at,
+            "teams_error": state.teams_error,
+            "active_panel": state.active_panel,
+            "events_scroll": state.events_scroll,
+            "teams_scroll": state.teams_scroll,
+            "teams_stale_seconds": max(300, state.get_interval() * 2.5),
         }
     if runner is not None:
         data["runtime_status"] = _load_runtime_status(runner.output_dir)
@@ -917,61 +1024,14 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     events_top = summary_top + summary_h
     events_h = hist_top - events_top
 
-    if events_h >= 3:
+    if events_h >= 6:
+        offsets = _render_operational_panels(screen, last, data, events_top, events_h, width, now)
+        with state.lock:
+            state.events_scroll = offsets["events_scroll"]
+            state.teams_scroll = offsets["teams_scroll"]
+    elif events_h >= 3:
         _box(screen, events_top, 0, events_h, width - 1, title="EVENTOS DE EQUIPES", color=C_TITLE)
-        cur_y = events_top + 1
-        max_event_y = events_top + events_h - 1
-
-        if last:
-            events = last.get("events") or {}
-            local_events = events.get("local") or []
-            cloud_events = events.get("cloud") or []
-
-            if local_events or cloud_events:
-                if local_events and cur_y < max_event_y:
-                    _line(screen, cur_y, 2, f"LOCAL ({len(local_events)} equipes com transicao apenas local):", width - 4, _cp(C_WARN, curses.A_BOLD))
-                    cur_y += 1
-                    local_strs = [f"{e['team']}: {e['action']}" for e in local_events]
-                    local_rows = _format_columns(local_strs, width - 4, col_width=35)
-
-                    reserved_for_cloud = min(len(cloud_events) + 2, 4) if cloud_events else 0
-                    allowed_local_rows = max(1, max_event_y - cur_y - reserved_for_cloud)
-
-                    for row in local_rows[:allowed_local_rows]:
-                        if cur_y >= max_event_y:
-                            break
-                        _line(screen, cur_y, 4, row, width - 6, _cp(C_DEFAULT))
-                        cur_y += 1
-
-                    if len(local_rows) > allowed_local_rows and cur_y < max_event_y:
-                        items_per_row = max(1, (width - 4) // 38)
-                        remaining_local = len(local_events) - (allowed_local_rows * items_per_row)
-                        if remaining_local > 0:
-                            _line(screen, cur_y, 4, f"... e mais {remaining_local} equipes", width - 6, _cp(C_DIM))
-                            cur_y += 1
-
-                if cloud_events and cur_y < max_event_y:
-                    _line(screen, cur_y, 2, f"NUVEM ({len(cloud_events)} eventos sincronizados no Firebase):", width - 4, _cp(C_OK, curses.A_BOLD))
-                    cur_y += 1
-                    cloud_strs = [f"{e['team']}: {e['action']}" for e in cloud_events]
-                    cloud_rows = _format_columns(cloud_strs, width - 4, col_width=35)
-                    allowed_cloud_rows = max(1, max_event_y - cur_y)
-
-                    for row in cloud_rows[:allowed_cloud_rows]:
-                        if cur_y >= max_event_y:
-                            break
-                        _line(screen, cur_y, 4, row, width - 6, _cp(C_DEFAULT))
-                        cur_y += 1
-
-                    if len(cloud_rows) > allowed_cloud_rows and cur_y < max_event_y:
-                        items_per_row = max(1, (width - 4) // 38)
-                        remaining_cloud = len(cloud_events) - (allowed_cloud_rows * items_per_row)
-                        if remaining_cloud > 0:
-                            _line(screen, cur_y, 4, f"... e mais {remaining_cloud} eventos na nuvem", width - 6, _cp(C_DIM))
-            else:
-                _line(screen, cur_y, 2, "Nenhuma transicao de equipe no ultimo ciclo.", width - 4, _cp(C_DIM))
-        else:
-            _line(screen, cur_y, 2, "Aguardando execucoes para exibir eventos.", width - 4, _cp(C_DIM))
+        _line(screen, events_top + 1, 2, "Amplie a altura para consultar os quadros.", width - 4, _cp(C_DIM))
 
     # -- 6. Caixa: Histórico Diário ----------------------------------------
     _box(screen, hist_top, 0, 4, width - 1, title="HISTORICO DIARIO (HOJE)", color=C_TITLE)
@@ -996,6 +1056,10 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     if width < 120:
         labels = {"d": "Detalhes", "r": "Agora", "h": "Hist.", "m": "Mes", "c": "Limpar", "q": "Sair"}
         items = [(key, labels[key]) for key, _ in items]
+    if width < 144:
+        items = [("q", "Sair"), ("d", "Detalhes"), ("Tab", "Quadro"), ("e", "Equipes"), ("h", "Hist."), ("m", "Mes")]
+    else:
+        items = [("Tab", "Quadro"), ("e", "Equipes"), *items]
 
     cur_x = 1
     for key_char, label in items:
@@ -1022,6 +1086,8 @@ def _curses_main(screen, runner: LocalRotalogRunner | None, state: TuiState, out
     worker.start()
     health_worker = threading.Thread(target=_health_worker, args=(state, output_dir), daemon=True)
     health_worker.start()
+    teams_worker = threading.Thread(target=_team_state_worker, args=(state, output_dir), daemon=True)
+    teams_worker.start()
     try:
         while True:
             _render(screen, runner, state)
@@ -1040,6 +1106,19 @@ def _curses_main(screen, runner: LocalRotalogRunner | None, state: TuiState, out
                         state.details_scroll += 1 if key == getattr(curses, "KEY_DOWN", -1) else 10
                     elif key in (getattr(curses, "KEY_UP", -1), getattr(curses, "KEY_PPAGE", -1)):
                         state.details_scroll = max(0, state.details_scroll - (1 if key == getattr(curses, "KEY_UP", -1) else 10))
+                continue
+            if key in (9, ord("e"), ord("E")):
+                with state.lock:
+                    state.active_panel = "teams" if state.active_panel == "events" else "events"
+                continue
+            if key in (getattr(curses, "KEY_DOWN", -1), getattr(curses, "KEY_NPAGE", -1),
+                       getattr(curses, "KEY_UP", -1), getattr(curses, "KEY_PPAGE", -1)):
+                with state.lock:
+                    field = "teams_scroll" if state.active_panel == "teams" else "events_scroll"
+                    step = 10 if key in (getattr(curses, "KEY_NPAGE", -1), getattr(curses, "KEY_PPAGE", -1)) else 1
+                    if key in (getattr(curses, "KEY_UP", -1), getattr(curses, "KEY_PPAGE", -1)):
+                        step = -step
+                    setattr(state, field, max(0, getattr(state, field) + step))
                 continue
             if key in (ord("r"), ord("R")) and not state.viewer_mode:
                 state.run_now.set()

@@ -185,6 +185,12 @@ def compactar_equipe_para_index(
             "emergencia": int(current.get("ssPendentesEmergenciaCount") or 0),
         }
 
+    intervalo_atual = None
+    if jornada.get("emIntervalo"):
+        active = max((item for item in jornada.get("intervalos") or []
+                      if item.get("inicio") and not item.get("fim")),
+                     key=lambda item: str(item["inicio"]), default=None)
+        intervalo_atual = {"inicio": active["inicio"]} if active else jornada.get("intervaloAtual")
     return {
         "schemaVersion": document.get("schemaVersion", 2),
         "teamKey": document.get("teamKey"),
@@ -199,6 +205,7 @@ def compactar_equipe_para_index(
         "jornada": {
             "turno": turno,
             "emIntervalo": bool(jornada.get("emIntervalo")),
+            "intervaloAtual": intervalo_atual,
         },
         "ordensServico": {
             "atual": servico_atual,

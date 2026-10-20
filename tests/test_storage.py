@@ -8,6 +8,20 @@ from coletor.storage import changed_fields, compactar_equipe_para_index, load_js
 
 
 class StorageRegressionTests(unittest.TestCase):
+    def test_compact_index_preserves_only_active_interval_start(self):
+        doc = self.document()
+        doc["jornada"]["emIntervalo"] = True
+        doc["jornada"]["intervalos"] = [
+            {"inicio": "2026-10-20T09:00:00-03:00", "fim": "2026-10-20T09:10:00-03:00"},
+            {"inicio": "2026-10-20T12:00:00-03:00", "fim": None},
+        ]
+        compact = compactar_equipe_para_index(doc)
+        self.assertEqual(compact["jornada"]["intervaloAtual"], {"inicio": "2026-10-20T12:00:00-03:00"})
+        self.assertNotIn("intervalos", compact["jornada"])
+        self.assertEqual(compactar_equipe_para_index(compact), compact)
+        compact["jornada"]["emIntervalo"] = False
+        self.assertIsNone(compactar_equipe_para_index(compact)["jornada"]["intervaloAtual"])
+
     def document(self):
         return {
             "teamKey": "E3733",
