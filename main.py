@@ -1037,6 +1037,18 @@ class LocalRotalogRunner:
 
             self.team_registry.save()
 
+            from coletor.activity_feed import update_activity_feed, sync_activity_feed
+            feed_path = self.output_dir / "rotalog" / "events" / "current" / "index.json.gz"
+            feed_status, feed_error = "disabled", None
+            try:
+                feed = update_activity_feed(feed_path, self.empresa,
+                                            {item[0]: item[4] for item in prepared_daily}, scraped_at)
+                if self.firebase_enabled:
+                    feed_status = sync_activity_feed(feed_path, feed["payload"], self.firebase_store)
+            except Exception as exc:
+                feed_status, feed_error = "pending", str(exc)
+                LOG.error("Arquivo de eventos pendente: %s", exc)
+
             index_equipes = {
                 team_k: compactar_equipe_para_index(
                     doc,
@@ -1094,6 +1106,9 @@ class LocalRotalogRunner:
                 "totalTeams": len(teams),
                 "updatedTeams": len(updates),
                 "ignoredTeams": ignored,
+                "activityFeedPath": str(feed_path),
+                "activityFeedSyncStatus": feed_status,
+                "activityFeedError": feed_error,
                 "localConsolidatedDaily": str(consolidated_path),
                 "localConsolidatedDailyUpdated": consolidated_updated,
                 "firebaseUploaded": firebase_uploaded,

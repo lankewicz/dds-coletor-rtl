@@ -84,6 +84,32 @@ identidades já existem no cadastro.
 
 ## 3. Estrutura de Arquivos
 
+### Arquivo do quadro de eventos
+
+O coletor mantém `rotalog/events/current/index.json.gz` como projeção independente
+do quadro `Hora | Equipe | Tipo | Protocolo | Status`. O arquivo contém eventos
+disponíveis das últimas 24 horas, de todas as equipes, em ordem decrescente de
+`occurredAt`. Os protocolos ficam completos; ocultar o ano é responsabilidade
+da apresentação. O monitor existente ainda não foi alterado para consumir o arquivo.
+
+O documento tem `schemaVersion`, `company`, `timezone`, `windowHours`, `updatedAt`
+e `items`. Cada item tem `id`, `teamKey`, `type` (`C`, `E` ou `null`), `protocol`,
+`status`, `entityId`, `occurredAt` e `timeSource`. Turnos e intervalos não têm
+protocolo. Horários ausentes, futuros ou turnos com fim anterior ao início são
+excluídos. `inferred` identifica campos marcados como estimados no consolidado;
+`consolidated` significa horário recebido do diário, sem certificar sua origem real.
+
+Uma correção de horário substitui a mesma etapa pelo identificador do atendimento,
+sem deduplicar atendimentos distintos apenas pelo protocolo. Eventos de equipes
+temporariamente ausentes continuam no arquivo até vencerem a janela. O arquivo é
+preservado entre ciclos e reinicializações; o conteúdo só é gravado quando muda.
+
+Com Firebase habilitado, publica em `dados/{empresa}/rotalog/events/current/index.json.gz`,
+sob a mesma raiz configurada do índice. O recibo local `events/current/firebase-sync.json`
+evita uploads repetidos e só é atualizado após confirmação. Falhas são tentadas
+novamente no ciclo seguinte, sem interromper a coleta principal. Um arquivo local
+corrompido é preservado e o erro é informado em `activityFeedError`.
+
 O diário consolidado local fica em `rotalog/equipes/consolidated/AAAA-MM-DD.json`, sem compactação,
 ao lado da torre (`current`) e dos diários individuais (`daily`). Quando alguma
 equipe abre ou fecha turno ou conclui um serviço,
