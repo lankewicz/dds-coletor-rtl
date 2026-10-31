@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch, Mock
 
-from coleta_unica.main import Run, screen, progress_bar, active_time, estimate_remaining, eta_text
+from coleta_unica.main import Run, screen, progress_bar, active_time, estimate_remaining, eta_text, technical_pause_time
 from coleta_unica.scraper import Scraper
 from coleta_unica.test_identity_cache import record, HTML
 
@@ -27,6 +27,46 @@ class ProgressTests(unittest.TestCase):
         with patch('coleta_unica.main.time.monotonic', return_value=2100):
             run.toggle_pause()
         self.assertEqual(active_time(run.state, 2150), 150)
+
+    def test_technical_pause_is_excluded_from_active_time(self):
+        run = Run(SimpleNamespace(sem_tui=False))
+        run.state.update(pausa_tecnica_total=30, pausa_tecnica_inicio=run.state['inicio'] + 70)
+        now = run.state['inicio'] + 100
+        self.assertEqual(technical_pause_time(run.state, now), 60)
+        self.assertEqual(active_time(run.state, now), 40)
+        run.state['pausa_tecnica_inicio'] = None
+        run.state['pausa_tecnica_total'] = 60
+        self.assertEqual(active_time(run.state, now), 40)
+
+    def test_manual_pause_suspends_technical_pause_without_double_counting(self):
+        with patch('coleta_unica.main.time.monotonic', return_value=0):
+            run = Run(SimpleNamespace(sem_tui=False))
+        run.state.update(status='Pausa técnica', pausa_tecnica_inicio=10)
+        with patch('coleta_unica.main.time.monotonic', return_value=20):
+            run.toggle_pause()
+        self.assertEqual(run.state['pausa_tecnica_total'], 10)
+        self.assertIsNone(run.state['pausa_tecnica_inicio'])
+        self.assertEqual(active_time(run.state, 30), 10)
+        with patch('coleta_unica.main.time.monotonic', return_value=40):
+            run.toggle_pause()
+        self.assertEqual(run.state['pausado_total'], 20)
+        self.assertEqual(run.state['pausa_tecnica_inicio'], 40)
+        self.assertEqual(active_time(run.state, 50), 10)
+
+    def test_technical_pause_waits_for_configured_duration(self):
+        clock = [100.0]
+        args = SimpleNamespace(sem_tui=True)
+        with patch('coleta_unica.main.time.monotonic', side_effect=lambda: clock[0]), \
+                patch('coleta_unica.main.TECHNICAL_PAUSE_SECONDS', 1), \
+                patch('coleta_unica.main.check_storage'):
+            run = Run(args)
+            run.stop = SimpleNamespace(
+                is_set=lambda: False,
+                wait=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+            )
+            run.pause_between_days()
+        self.assertAlmostEqual(run.state['pausa_tecnica_total'], 1.0)
+        self.assertEqual(active_time(run.state, clock[0]), 0.0)
 
     def test_eta_waits_for_progress_and_finishes_at_zero(self):
         run = Run(SimpleNamespace(sem_tui=False))
@@ -88,5 +128,6 @@ class ProgressTests(unittest.TestCase):
             plain = re.sub(r'\x1b\[[0-9;]*m', '', colored)
             self.assertTrue(all(len(line) == 119 for line in plain.splitlines()))
             self.assertLessEqual(len(plain.splitlines()), 23)
-            for label in ('COMPLETO', 'DIÁRIO', 'EQUIPE', 'TOTAL ATIVO', 'E3W9E', 'Consultando diário', 'Reaproveitados'):
+            for label in ('COMPLETO', 'DIÁRIO', 'EQUIPE', 'TOTAL ATIVO', 'TÉCNICAS',
+                          'E3W9E', 'Consultando diário', 'Reaproveitados'):
                 self.assertIn(label, plain)

@@ -36,6 +36,12 @@ def diary_url(href):
     return url
 
 
+def matches_vehicle(actual, requested):
+    actual = actual.strip().upper()
+    requested = requested.strip().upper()
+    return actual == requested or re.fullmatch(re.escape(requested) + r'\(\d+\)', actual) is not None
+
+
 def parse_details(doc, record):
     vehicle = record.get('Veículo', '')
     title = doc.title.get_text(' ', strip=True) if doc.title else ''
@@ -232,7 +238,8 @@ class Scraper:
         if 'j_security_check' in response.text or soup(response.text).find('input', attrs={'type': 'password'}):
             raise PermissionError('Falha na autenticação do RTLWeb.')
 
-    def collect(self, day, archive):
+    def collect(self, day, archive, vehicle=''):
+        vehicle = vehicle.strip().upper()
         self.notify(etapa='Pesquisa', pagina=0, paginas=0, linhas=0)
         response = self.request('GET', URL)
         doc = soup(response.text)
@@ -246,7 +253,7 @@ class Scraper:
             raise RuntimeError('Botão Pesquisar ausente.')
         payload = {i['name']: i.get('value', '') for i in form.select('input[type=hidden][name]')}
         payload.update({name: day.strftime('%d/%m/%Y') for name in dates})
-        payload.update({'form': 'form', 'form:veiculo': '', 'form:contrato_input': '',
+        payload.update({'form': 'form', 'form:veiculo': vehicle, 'form:contrato_input': '',
                         button['name']: '', 'javax.faces.ViewState': state})
         action = urljoin(URL, form.get('action') or URL)
         if not action.startswith(BASE):
@@ -289,11 +296,21 @@ class Scraper:
                 self.notify(etapa=name.title(), pagina=page + 1, paginas=pages, linhas=len(records), total=count)
             if len(records) != count:
                 raise RuntimeError(f'Contagem divergente em {name}.')
+            if vehicle:
+                for record in records:
+                    actual_vehicle = record.get('Veículo') or record.get('Veiculo') or ''
+                    if not matches_vehicle(actual_vehicle, vehicle):
+                        raise RuntimeError(
+                            f'Filtro de veículo divergente em {name}: esperado {vehicle}, '
+                            f'recebido {actual_vehicle or "vazio"}.'
+                        )
             result[name] = records
             result['paginacao'][name] = {'total': count, 'paginas': pages, 'colunas': headers}
         # Abrir os diários depois da paginação evita invalidar a ViewState da listagem.
         result['detalhes'] = self.enrich(result['turnos'], archive)
         result['paginacao']['turnos']['colunas'] += list(DETAIL_FIELDS) + ['Detalhes fonte', 'Detalhes diário consultado']
         result['schemaVersion'] = SCHEMA_VERSION
+        if vehicle:
+            result['filtroVeiculo'] = vehicle
         result['completo'] = True
         return result

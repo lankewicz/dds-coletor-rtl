@@ -12,16 +12,19 @@ class ExecutionTimeTests(unittest.TestCase):
             path = Path(temp) / 'tempo.json'
             first = ExecutionTime(path)
             first.document['duracoesDias'] = [90]
-            first.checkpoint(100, 130, status='interrompida', force=True, closed=True)
+            first.checkpoint(100, 130, status='interrompida', force=True, closed=True,
+                             technical_pause=20)
             second = ExecutionTime(path)
             self.assertEqual(second.previous_active, 100)
             self.assertEqual(second.previous_elapsed, 130)
+            self.assertEqual(second.previous_technical_pause, 20)
             self.assertEqual(second.document['duracoesDias'], [90])
             second.checkpoint(50, 60, status='Concluído', force=True, closed=True)
             saved = json.loads(path.read_text(encoding='utf-8'))
             self.assertEqual(saved['ativoTotalSegundos'], 150)
             self.assertEqual(saved['decorridoTotalSegundos'], 190)
             self.assertEqual(saved['pausaTotalSegundos'], 40)
+            self.assertEqual(saved['pausaTecnicaTotalSegundos'], 20)
             self.assertEqual(len(saved['sessoes']), 2)
             self.assertTrue(all(s['fim'] for s in saved['sessoes']))
 

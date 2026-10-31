@@ -17,6 +17,9 @@ Abre uma TUI própria e consulta **cada dia de 01/01/2026 até ontem** no horár
 de São Paulo. Ao terminar o período, encerra: não há agendamento nem ciclo contínuo.
 Espaço pausa entre requisições; Q encerra. Uma requisição em andamento pode levar
 até o timeout de rede para terminar. Execute o mesmo comando para retomar.
+Após cada dia coletado, a ferramenta aguarda 60 segundos antes de iniciar o próximo,
+para liberar banda e CPU. A pausa técnica pode ser interrompida com Q e é suspensa
+enquanto a pausa manual estiver ativa.
 
 A TUI mostra três barras que acompanham a largura do terminal: **Completo**
 (dia X de Y e dias concluídos), **Diário** (equipe X de Y e equipes concluídas)
@@ -39,6 +42,8 @@ não entram no tempo ativo. A previsão fica suspensa durante a pausa e se ajust
 decorrido e as pausas, além das durações dos últimos dias para a previsão.
 O tempo em que o programa ficou fechado não entra na soma. A TUI mostra o tempo
 ativo da sessão, o total ativo de todas as sessões e as pausas acumuladas.
+O mostrador também separa o total de pausas técnicas; pausas manuais e técnicas
+são excluídas do tempo ativo e das estimativas de processamento.
 O histórico é atualizado durante o progresso (com intervalo mínimo de 15 segundos)
 e ao encerrar, inclusive por Q ou erro. Após queda inesperada, retoma a última
 medição gravada; o tempo posterior a esse registro pode não ser contabilizado.
@@ -51,7 +56,16 @@ Para conferir apenas o primeiro dia:
 ```
 
 Também aceita `--inicio AAAA-MM-DD`, `--fim AAAA-MM-DD`, `--saida CAMINHO`,
-`--env CAMINHO`, `--intervalo 0.5` e `--sem-tui`.
+`--veiculo CODIGO`, `--env CAMINHO`, `--intervalo 0.5` e `--sem-tui`.
+Com `--veiculo`, consulta somente o veículo informado e salva em
+`CAMINHO/equipes/CODIGO/AAAA-MM-DD`, sem misturar a exportação com uma coleta
+diária de todas as equipes. O diário completo permanece em `brutos/`, incluindo
+o conteúdo da timeline, detalhes dos serviços e dados do mapa retornados pelo portal.
+Dias sem turno para o veículo também são gravados como consultas completas, com
+zero turnos/eventos, para que períodos com dias sem atividade possam ser coletados
+sem interromper a execução. Se o portal retornar o veículo com sufixo numérico
+entre parênteses (por exemplo, `E3550(2)` ao filtrar `E3550`), ele permanece no
+mesmo conjunto de saída, com o código original preservado nos registros.
 Para instalar em um ambiente separado: `python -m pip install -r coleta_unica/requirements.txt`.
 
 Usa `ROTALOG_USUARIO` e `ROTALOG_SENHA` do ambiente, de `coleta_unica/.env`,

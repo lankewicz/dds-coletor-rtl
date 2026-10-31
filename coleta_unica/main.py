@@ -29,6 +29,7 @@ else:
     from storage import atomic_text, check_storage, configure_ssd
 
 HERE = Path(__file__).resolve().parent
+TECHNICAL_PAUSE_SECONDS = 60
 
 
 def atomic(path, text):
@@ -48,11 +49,12 @@ def save_day(folder, result):
     atomic(folder / 'dados.json', json.dumps(result, ensure_ascii=False, indent=2))
 
 
-def complete(folder, day):
+def complete(folder, day, vehicle=''):
     try:
         result = json.loads((folder / 'dados.json').read_text(encoding='utf-8'))
         return (result.get('completo') is True and result.get('data') == day.isoformat()
                 and result.get('schemaVersion') == SCHEMA_VERSION
+                and (result.get('filtroVeiculo') or '').upper() == vehicle.upper()
                 and len(result['resumo']) == 15
                 and all(all(key in row for key in DETAIL_FIELDS) and row['Agência Nome completo'] for row in result['turnos'])
                 and all(len(result[name]) == result['paginacao'][name]['total'] for name in ('turnos', 'eventos'))
@@ -101,6 +103,7 @@ def timing_session(run):
     with run.lock:
         run.state['ativo_anterior'] = history.previous_active
         run.state['decorrido_anterior'] = history.previous_elapsed
+        run.state['pausa_tecnica_anterior'] = history.previous_technical_pause
         run.state['duracoes_dias'] = history.document.get('duracoesDias', [])[-7:]
     run.history = history
     try:
@@ -127,8 +130,10 @@ class Run:
         self.state.update(dia_numero=0, equipes_total=None, equipes_feitas=0,
                           equipe_index=0, equipe='—', equipe_etapa=0,
                           equipe_acao='Aguardando leitura das tabelas', dia_validado=False,
-                          pausado_total=0.0, pausa_inicio=None, dia_inicio=None, duracoes_dias=[])
-        self.state.update(ativo_anterior=0.0, decorrido_anterior=0.0)
+                          pausado_total=0.0, pausa_inicio=None, pausa_tecnica_total=0.0,
+                          pausa_tecnica_inicio=None, dia_inicio=None, duracoes_dias=[])
+        self.state.update(ativo_anterior=0.0, decorrido_anterior=0.0,
+                          pausa_tecnica_anterior=0.0)
         self.history = None
         self.exit_code = 0
 
@@ -147,8 +152,10 @@ class Run:
         with self.lock:
             active = active_time(self.state, now)
             elapsed = max(0, now - self.state['inicio'])
+            technical_pause = technical_pause_time(self.state, now)
             self.history.document['duracoesDias'] = list(self.state['duracoes_dias'])
-        self.history.checkpoint(active, elapsed, status=status, force=force, closed=closed)
+        self.history.checkpoint(active, elapsed, status=status, force=force, closed=closed,
+                                technical_pause=technical_pause)
 
     def check(self):
         check_storage()
@@ -164,9 +171,55 @@ class Run:
                 self.state['pausado_total'] += now - self.state['pausa_inicio']
                 self.state['pausa_inicio'] = None
                 self.pause.clear()
+                if self.state['status'] == 'Pausa técnica':
+                    self.state['pausa_tecnica_inicio'] = now
             else:
+                self._accrue_technical_pause(now)
+                self.state['pausa_tecnica_inicio'] = None
                 self.state['pausa_inicio'] = now
                 self.pause.set()
+
+    def _accrue_technical_pause(self, now):
+        started = self.state['pausa_tecnica_inicio']
+        if started is not None:
+            self.state['pausa_tecnica_total'] += max(0.0, now - started)
+            self.state['pausa_tecnica_inicio'] = now
+
+    def pause_between_days(self):
+        with self.lock:
+            now = time.monotonic()
+            baseline = self.state['pausa_tecnica_total']
+            self.state.update(status='Pausa técnica',
+                              etapa=f'Aguardando {TECHNICAL_PAUSE_SECONDS} s para liberar recursos',
+                              pausa_tecnica_inicio=now)
+        if self.args.sem_tui:
+            print(f'Pausa técnica: {TECHNICAL_PAUSE_SECONDS} s entre dias', flush=True)
+        self.checkpoint_time(force=True)
+        try:
+            while True:
+                now = time.monotonic()
+                with self.lock:
+                    self._accrue_technical_pause(now)
+                    elapsed = self.state['pausa_tecnica_total'] - baseline
+                    remaining = TECHNICAL_PAUSE_SECONDS - elapsed
+                    manually_paused = self.pause.is_set()
+                    if remaining <= 0:
+                        self.state['pausa_tecnica_inicio'] = None
+                        break
+                if self.stop.is_set():
+                    raise Stopped()
+                check_storage()
+                self.stop.wait(.15 if manually_paused else min(.25, remaining))
+                self.checkpoint_time()
+        except Stopped:
+            with self.lock:
+                self._accrue_technical_pause(time.monotonic())
+                self.state['pausa_tecnica_inicio'] = None
+            self.checkpoint_time(force=True)
+            raise
+        if self.args.sem_tui:
+            print('Pausa técnica concluída', flush=True)
+        self.checkpoint_time(force=True)
 
     def work(self):
         scraper = None
@@ -180,7 +233,7 @@ class Run:
                     self.check()
                     folder = self.args.saida / day.isoformat()
                     self.update(dia=day.isoformat(), dia_numero=(day - self.args.inicio).days + 1)
-                    if complete(folder, day):
+                    if complete(folder, day, self.args.veiculo):
                         saved = json.loads((folder / 'dados.json').read_text(encoding='utf-8'))
                         count = len(saved['turnos'])
                         self.update(retomados=self.state['retomados'] + 1, dia_validado=True,
@@ -203,7 +256,10 @@ class Run:
                                                   verify=verify, delay=self.args.intervalo, notify=self.update,
                                                   identity_cache=identities)
                                 scraper.login()
-                            result = scraper.collect(day, lambda name, text: atomic(folder / 'brutos' / name, text))
+                            result = scraper.collect(
+                                day, lambda name, text: atomic(folder / 'brutos' / name, text),
+                                vehicle=self.args.veiculo,
+                            )
                             self.check()
                             self.update(etapa='Salvando arquivos do dia')
                             save_day(folder, result)
@@ -225,6 +281,8 @@ class Run:
                             for _ in range(20):
                                 self.check()
                                 self.stop.wait(.25)
+                    if day < self.args.fim:
+                        self.pause_between_days()
                     day += timedelta(days=1)
                 self.update(status='Concluído', etapa='Todos os dias gravados e validados')
         except Stopped:
@@ -250,7 +308,15 @@ def active_time(state, now):
     paused = state['pausado_total']
     if state['pausa_inicio'] is not None:
         paused += now - state['pausa_inicio']
+    paused += technical_pause_time(state, now)
     return max(0.0, now - state['inicio'] - paused)
+
+
+def technical_pause_time(state, now):
+    paused = state.get('pausa_tecnica_total', 0.0)
+    if state.get('pausa_tecnica_inicio') is not None:
+        paused += max(0.0, now - state['pausa_tecnica_inicio'])
+    return paused
 
 
 def estimate_remaining(state, total, active):
@@ -335,7 +401,7 @@ def screen(run, total, color=False):
     lines = [
         paired('  RTLWEB  /  COLETA ÚNICA 2026', f'● {paused.upper()}', 'header'),
         row(f'  PERÍODO  {run.args.inicio:%d/%m/%Y} → {run.args.fim:%d/%m/%Y}', 'muted'),
-        row(f'  SESSÃO  {elapsed_text(elapsed)}     TOTAL ATIVO  {elapsed_text(accumulated)}     PAUSAS  {elapsed_text(paused_total)}'),
+        row(f'  SESSÃO  {elapsed_text(elapsed)}     TOTAL ATIVO  {elapsed_text(accumulated)}     PAUSAS  {elapsed_text(paused_total)}     TÉCNICAS  {elapsed_text(s["pausa_tecnica_anterior"] + technical_pause_time(s, now))}'),
         row(' ' + eta_text(s, total, now), 'eta'),
         row(),
         paired(f'  01  COMPLETO  ·  Dia {s["dia_numero"]} de {total}', f'{100 * processed / total:.1f}%', 'total'),
@@ -402,6 +468,7 @@ def main(argv=None):
     parser.add_argument('--inicio', type=date.fromisoformat, default=date(2026, 1, 1), help='AAAA-MM-DD (padrão: 2026-01-01)')
     parser.add_argument('--fim', type=date.fromisoformat, default=datetime.now(ZoneInfo('America/Sao_Paulo')).date() - timedelta(days=1), help='AAAA-MM-DD (padrão: ontem em São Paulo)')
     parser.add_argument('--saida', type=Path, default=HERE / 'dados')
+    parser.add_argument('--veiculo', help='Coletar somente um veículo; os dados ficam em saida/equipes/VEICULO')
     parser.add_argument('--ssd-mount', type=Path, help='Linux: exigir que a saída permaneça neste SSD montado')
     parser.add_argument('--env', type=Path, default=HERE / '.env' if (HERE / '.env').exists() else HERE.parent / '.env')
     parser.add_argument('--intervalo', type=float, default=.5, help='Espera mínima entre requisições, em segundos')
@@ -409,6 +476,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.fim < args.inicio or args.intervalo < 0:
         parser.error('Período inválido ou intervalo negativo.')
+    if args.veiculo:
+        args.veiculo = args.veiculo.strip().upper()
+        if not args.veiculo.isascii() or not args.veiculo.replace('-', '').isalnum():
+            parser.error('Código de veículo inválido.')
+        args.saida = args.saida / 'equipes' / args.veiculo
     args.saida = args.saida.resolve()
     try:
         configure_ssd(args.ssd_mount, args.saida)
@@ -448,6 +520,7 @@ def main(argv=None):
             worker.join(.25)
     print(f'{run.state["status"]}: {run.state["dias"]} dias gravados, {run.state["retomados"]} retomados. {args.saida}')
     print(f'Tempo ativo acumulado: {elapsed_text(run.state["ativo_anterior"] + active_time(run.state, time.monotonic()))}')
+    print(f'Tempo de pausas técnicas acumulado: {elapsed_text(run.state["pausa_tecnica_anterior"] + technical_pause_time(run.state, time.monotonic()))}')
     if run.state['erro']:
         print(run.state['erro'], file=sys.stderr)
     return run.exit_code
