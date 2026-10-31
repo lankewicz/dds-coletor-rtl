@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from coletor.historico import (
     RotalogEquipesScraper, RotalogEventosScraper, deduplicar_eventos_consolidados, executar_coleta_historico_dia,
-    estruturar_quilometragem_diaria, estruturar_resumo_equipes, varrer_mes,
+    estruturar_eletricistas_diarios, estruturar_quilometragem_diaria, estruturar_resumo_equipes, varrer_mes,
 )
 from coletor.client import CrawlerRotalog
 
@@ -242,7 +242,14 @@ class RelatorioMensalTests(unittest.TestCase):
                 evento("4600026988", "15,50", "12,00", "9876543210"),
             ]
             eventos_factory.return_value = eventos_scraper
-            equipes_factory.return_value.raspar_dia.return_value = []
+            equipes_factory.return_value.raspar_dia.return_value = [{
+                **row_equipe("E3733"),
+                "Tablet": "CA231 *",
+                "Eletricista 1 Registro": "123456",
+                "Eletricista 1 Nome": "MATEUS COMPLETO",
+                "Eletricista 2 Registro": "654321",
+                "Eletricista 2 Nome": "GUILHERME COMPLETO",
+            }]
 
             result = executar_coleta_historico_dia(
                 datetime.date(2026, 9, 14),
@@ -258,6 +265,15 @@ class RelatorioMensalTests(unittest.TestCase):
             with gzip.open(result["localArquivoKm"], "rt", encoding="utf-8") as stream:
                 payload = json.load(stream)
             self.assertEqual("E3733", payload["servicos"][0]["equipe"])
+            with gzip.open(result["localArquivoEletricistas"], "rt", encoding="utf-8") as stream:
+                personnel = json.load(stream)
+            self.assertEqual(
+                Path(directory) / "rotalog" / "eletricistas" / "diario" / "2026-09-14.json.gz",
+                Path(result["localArquivoEletricistas"]),
+            )
+            self.assertEqual("CA231", personnel["registros"][0]["tablet"])
+            self.assertEqual("123456", personnel["registros"][0]["eletricistas"][0]["registro"])
+            self.assertEqual("GUILHERME COMPLETO", personnel["registros"][0]["eletricistas"][1]["nome"])
             self.assertEqual(15.5, payload["totalKmInformado"])
             self.assertEqual(12, payload["totalKmAutorizadoFinal"])
             self.assertNotIn("localRelatorioHtml", result)
@@ -333,12 +349,14 @@ class RelatorioMensalTests(unittest.TestCase):
                 atualizar_terminal=False,
             )
 
-            self.assertEqual(2, store.save_blob.call_count)
+            self.assertEqual(3, store.save_blob.call_count)
             paths = [call.args[0] for call in store.save_blob.call_args_list]
             self.assertIn("dados/empresa/rotalog/eventos/diario/2026-09-14.json.gz", paths)
             self.assertIn("dados/empresa/rotalog/quilometragem/diario/2026-09-14.json.gz", paths)
+            self.assertIn("dados/empresa/rotalog/eletricistas/diario/2026-09-14.json.gz", paths)
             self.assertTrue(result["firebaseRawSynced"])
             self.assertTrue(result["firebaseSynced"])
+            self.assertTrue(result["firebasePersonnelSynced"])
 
     def test_coleta_diaria_identica_nao_reenvia_arquivos(self):
         with tempfile.TemporaryDirectory() as directory, patch(
@@ -357,10 +375,12 @@ class RelatorioMensalTests(unittest.TestCase):
                 atualizar_terminal=False,
             )
 
-            self.assertEqual(2, store.save_blob.call_count)
+            self.assertEqual(3, store.save_blob.call_count)
             self.assertTrue(first["firebaseUploaded"])
             self.assertFalse(second["firebaseUploaded"])
             self.assertFalse(second["firebaseRawUploaded"])
+            self.assertTrue(first["firebasePersonnelUploaded"])
+            self.assertFalse(second["firebasePersonnelUploaded"])
 
     def test_falha_de_upload_diario_nao_repete_coleta_e_fica_na_fila(self):
         with tempfile.TemporaryDirectory() as directory, patch(
@@ -378,13 +398,13 @@ class RelatorioMensalTests(unittest.TestCase):
 
             self.assertEqual("success", result["status"])
             self.assertEqual("pending", result["syncStatus"])
-            self.assertEqual(2, result["uploadQueue"]["pending"])
-            self.assertEqual(2, result["uploadQueue"]["totalAttempts"])
+            self.assertEqual(3, result["uploadQueue"]["pending"])
+            self.assertEqual(3, result["uploadQueue"]["totalAttempts"])
             self.assertEqual("offline", result["uploadQueue"]["lastError"])
             self.assertIsNotNone(result["uploadQueue"]["oldestQueuedAt"])
             self.assertIsNotNone(result["uploadQueue"]["lastAttemptAt"])
             queue_path = Path(directory) / "rotalog/sync/empresa/historico/pending-uploads.json"
-            self.assertEqual(2, len(json.loads(queue_path.read_text(encoding="utf-8"))["items"]))
+            self.assertEqual(3, len(json.loads(queue_path.read_text(encoding="utf-8"))["items"]))
 
             store.save_blob.side_effect = None
             resumed = executar_coleta_historico_dia(
@@ -418,6 +438,26 @@ class RelatorioMensalTests(unittest.TestCase):
         )
         self.assertEqual(payload["detalhamentoServicos"]["totalKmInformado"], 10)
         self.assertEqual(payload["resumoEquipes"]["totais"]["kmInformado"], 69)
+
+    def test_indice_diario_de_eletricistas_preserva_matriculas_nomes_tablet_e_deduplica(self):
+        records = [
+            {"equipe": "e3k61", "tablet": "CA231", "eletricista1Registro": "123456",
+             "eletricista1Nome": "MATEUS COMPLETO", "eletricista2Registro": "654321",
+             "eletricista2Nome": "GUILHERME COMPLETO"},
+            {"equipe": "E3K61", "tablet": "", "eletricista1Registro": "123456",
+             "eletricista1Nome": "MATEUS COMPLETO"},
+        ]
+        compact = estruturar_eletricistas_diarios(records, "2026-10-23", "ChicoEletro")
+        self.assertEqual("2026-10-23", compact["data"])
+        self.assertEqual("ChicoEletro", compact["empresa"])
+        self.assertEqual([{
+            "equipe": "E3K61",
+            "tablet": "CA231",
+            "eletricistas": [
+                {"registro": "123456", "nome": "MATEUS COMPLETO"},
+                {"registro": "654321", "nome": "GUILHERME COMPLETO"},
+            ],
+        }], compact["registros"])
 
     def test_parser_da_tabela_equipes_usa_colunas_estaveis(self):
         html = "<div><table><tbody><tr>" + "".join(
@@ -454,4 +494,3 @@ class RelatorioMensalTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

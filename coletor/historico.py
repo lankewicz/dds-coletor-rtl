@@ -98,6 +98,7 @@ def salvar_arquivo_gzip(path: Path, payload: dict[str, typing.Any]) -> None:
 from coletor.historico_consolidacao import (
     deduplicar_eventos_consolidados,
     enriquecer_cadastro_permanente_equipes,
+    estruturar_eletricistas_diarios,
     estruturar_quilometragem_diaria,
     estruturar_resumo_equipes,
 )
@@ -181,8 +182,17 @@ def executar_coleta_historico_dia(
     # 2. Salva localmente em dados-local/rotalog/quilometragem/diario/AAAA-MM-DD.json.gz
     dir_km_local = output_dir / "rotalog" / "quilometragem" / "diario"
     local_km_path = dir_km_local / f"{day_iso}.json.gz"
+    payload_eletricistas = estruturar_eletricistas_diarios(
+        payload_km["resumoEquipes"]["registros"],
+        day_iso,
+        empresa,
+    )
+    local_eletricistas_path = (
+        output_dir / "rotalog" / "eletricistas" / "diario" / f"{day_iso}.json.gz"
+    )
     phase_started = time.perf_counter()
     salvar_arquivo_gzip(local_km_path, payload_km)
+    salvar_arquivo_gzip(local_eletricistas_path, payload_eletricistas)
     LOG.debug("Arquivo diário de quilometragem salvo: %s", local_km_path)
 
     phase_durations["arquivosRelatorioSeconds"] = round(time.perf_counter() - phase_started, 3)
@@ -192,6 +202,8 @@ def executar_coleta_historico_dia(
     firebase_raw_synced = False
     firebase_uploaded = False
     firebase_raw_uploaded = False
+    firebase_personnel_synced = False
+    firebase_personnel_uploaded = False
     upload_errors = []
     historical_queue = (
         output_dir / "rotalog" / "sync" / company_key(empresa) / "historico" / "pending-uploads.json"
@@ -216,6 +228,12 @@ def executar_coleta_historico_dia(
             f"{remote_root}/quilometragem/diario/{day_iso}.json.gz",
             output_dir / "rotalog" / "sync" / company_key(empresa) / "historico" / "quilometragem" / f"{day_iso}.json",
         )
+        personnel_key = f"eletricistas/{day_iso}"
+        _enqueue_historical_upload(
+            historical_queue, personnel_key, local_eletricistas_path,
+            f"{remote_root}/eletricistas/diario/{day_iso}.json.gz",
+            output_dir / "rotalog" / "sync" / company_key(empresa) / "historico" / "eletricistas" / f"{day_iso}.json",
+        )
         sync_result = (
             _flush_historical_uploads(historical_queue, firebase_store)
             if firebase_store and firebase_store.enabled
@@ -223,12 +241,17 @@ def executar_coleta_historico_dia(
         )
         raw_sync_status = sync_result["results"].get(raw_key)
         km_sync_status = sync_result["results"].get(km_key)
+        personnel_sync_status = sync_result["results"].get(personnel_key)
         firebase_raw_synced = raw_sync_status in {"uploaded", "unchanged"}
         firebase_synced = km_sync_status in {"uploaded", "unchanged"}
+        firebase_personnel_synced = personnel_sync_status in {"uploaded", "unchanged"}
         firebase_raw_uploaded = raw_sync_status == "uploaded"
         firebase_uploaded = km_sync_status == "uploaded"
-        if not firebase_raw_synced or not firebase_synced:
+        firebase_personnel_uploaded = personnel_sync_status == "uploaded"
+        if not firebase_raw_synced or not firebase_synced or not firebase_personnel_synced:
             upload_errors.append("envio diário pendente; arquivos locais preservados na fila")
+    else:
+        firebase_personnel_synced = False
 
     if atualizar_terminal:
         atualizar_status_terminal(
@@ -255,8 +278,11 @@ def executar_coleta_historico_dia(
         "totalKmOficialAutorizadoFinal": payload_km["resumoEquipes"]["totais"]["kmAutorizadoFinal"],
         "totalKmRecuperadoParecer": payload_km["resumoEquipes"]["totais"]["kmRecuperadoParecer"],
         "localArquivoKm": str(local_km_path),
+        "localArquivoEletricistas": str(local_eletricistas_path),
         "localArquivoEventosBrutos": str(raw_path),
         "firebaseSynced": firebase_synced,
+        "firebasePersonnelSynced": firebase_personnel_synced,
+        "firebasePersonnelUploaded": firebase_personnel_uploaded,
         "identityEnrichment": identity_enrichment,
         "firebaseRawSynced": firebase_raw_synced,
         "firebaseUploaded": firebase_uploaded,

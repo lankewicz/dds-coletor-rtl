@@ -32,6 +32,12 @@ class ExecutionTime:
                     active, elapsed = session['ativoSegundos'], session['decorridoSegundos']
                     if not all(isinstance(v, (int, float)) and math.isfinite(v) and v >= 0 for v in (active, elapsed)) or active > elapsed:
                         raise ValueError('Duração inválida')
+                    stages = session.get('etapasSegundos', {})
+                    if (not isinstance(stages, dict)
+                            or not all(isinstance(name, str) and isinstance(value, (int, float))
+                                       and math.isfinite(value) and value >= 0
+                                       for name, value in stages.items())):
+                        raise ValueError('Tempos por etapa inválidos')
                     technical_pause = session.get('pausaTecnicaSegundos', 0.0)
                     if (not isinstance(technical_pause, (int, float))
                             or not math.isfinite(technical_pause)
@@ -46,14 +52,15 @@ class ExecutionTime:
         self.previous_active = sum(s['ativoSegundos'] for s in self.document['sessoes'])
         self.previous_elapsed = sum(s['decorridoSegundos'] for s in self.document['sessoes'])
         self.previous_technical_pause = sum(s.get('pausaTecnicaSegundos', 0.0) for s in self.document['sessoes'])
+        self.previous_stage_times = dict(self.document['sessoes'][-1].get('etapasSegundos', {})) if self.document['sessoes'] else {}
         self.session = dict(inicio=timestamp(), fim=None, atualizadoEm=timestamp(),
                             ativoSegundos=0.0, decorridoSegundos=0.0, pausaSegundos=0.0,
-                            pausaTecnicaSegundos=0.0, status='em execução')
+                            pausaTecnicaSegundos=0.0, etapasSegundos={}, status='em execução')
         self.document['sessoes'].append(self.session)
         self.last_checkpoint = None
 
     def checkpoint(self, active, elapsed, status='em execução', force=False, closed=False,
-                   technical_pause=0.0):
+                   technical_pause=0.0, stage_times=None):
         now = time.monotonic()
         if not force and self.last_checkpoint is not None and now - self.last_checkpoint < 15:
             return
@@ -62,6 +69,7 @@ class ExecutionTime:
         technical_pause = min(max(0.0, technical_pause), elapsed - active)
         self.session.update(ativoSegundos=active, decorridoSegundos=elapsed,
                             pausaSegundos=elapsed - active, pausaTecnicaSegundos=technical_pause,
+                            etapasSegundos=dict(stage_times or {}),
                             atualizadoEm=timestamp(), status=status)
         if closed:
             self.session['fim'] = self.session['atualizadoEm']

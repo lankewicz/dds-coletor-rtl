@@ -160,6 +160,9 @@ dds-coletor-rtl/
 │   └── storage.py          # load_json/write_json nativos para .json.gz, diffing e GCS
 ├── dados-local/            # Armazenamento local (ignorado pelo git)
 │   └── rotalog/
+│       ├── eletricistas/
+│       │   └── diario/
+│       │       └── AAAA-MM-DD.json.gz      # Índice diário compacto por equipe (tablet e eletricistas)
 │       ├── equipes/
 │       │   ├── consolidated/
 │       │   │   └── AAAA-MM-DD.json            # Diário completo de todas as equipes, somente local
@@ -382,6 +385,7 @@ O coletor possui duas fontes oficiais distintas no portal RTLWeb da Copel, cada 
 * **Saída local**: 
   - `dados-local/rotalog/eventos/diario/AAAA-MM-DD.json.gz` (eventos brutos para auditoria)
   - `dados-local/rotalog/quilometragem/diario/AAAA-MM-DD.json.gz` (dados estruturados)
+  - `dados-local/rotalog/eletricistas/diario/AAAA-MM-DD.json.gz` (índice compacto de equipe, tablet, matrícula e nome)
 
 ```bash
 # Execução diária manual para uma data específica:

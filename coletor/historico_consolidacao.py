@@ -194,6 +194,46 @@ def estruturar_resumo_equipes(
     }
 
 
+def estruturar_eletricistas_diarios(
+    records: list[dict[str, typing.Any]],
+    target_day: str,
+    empresa: str,
+) -> dict[str, typing.Any]:
+    """Gera um índice pequeno de tablet e eletricistas por equipe para o monitor."""
+    by_team: dict[str, dict[str, typing.Any]] = {}
+    for row in records:
+        equipe = normalize_team_key(row.get("equipe"))
+        if not equipe:
+            continue
+        entry = by_team.setdefault(equipe, {
+            "equipe": equipe,
+            "tablet": "",
+            "eletricistas": [],
+        })
+        tablet = str(row.get("tablet") or "").replace("*", "").strip()
+        if tablet:
+            entry["tablet"] = tablet
+        known = {
+            (person["registro"], person["nome"])
+            for person in entry["eletricistas"]
+        }
+        for number in (1, 2):
+            registration = str(row.get(f"eletricista{number}Registro") or "").strip()
+            name = str(row.get(f"eletricista{number}Nome") or "").strip()
+            if not name:
+                continue
+            identity = (registration, name)
+            if identity not in known:
+                entry["eletricistas"].append({"registro": registration, "nome": name})
+                known.add(identity)
+    return {
+        "schemaVersion": 1,
+        "data": target_day,
+        "empresa": empresa,
+        "registros": [by_team[key] for key in sorted(by_team)],
+    }
+
+
 def enriquecer_cadastro_permanente_equipes(
     output_dir: Path,
     records: list[dict[str, typing.Any]],
