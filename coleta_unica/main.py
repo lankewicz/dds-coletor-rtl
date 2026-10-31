@@ -106,6 +106,7 @@ def timing_session(run):
         run.state['decorrido_anterior'] = history.previous_elapsed
         run.state['pausa_tecnica_anterior'] = history.previous_technical_pause
         run.state['duracoes_dias'] = history.document.get('duracoesDias', [])[-7:]
+        run.state['etapas_ultima_sessao'] = history.previous_stage_times
     run.history = history
     try:
         run.checkpoint_time(force=True)
@@ -113,6 +114,7 @@ def timing_session(run):
     finally:
         exception = sys.exc_info()[0]
         try:
+            run.finish_stage()
             run.checkpoint_time(force=True, closed=True,
                                 status=('interrompida' if issubclass(exception, Stopped) else 'erro') if exception else run.state['status'])
         finally:
@@ -134,17 +136,37 @@ class Run:
                           pausado_total=0.0, pausa_inicio=None, pausa_tecnica_total=0.0,
                           pausa_tecnica_inicio=None, dia_inicio=None, duracoes_dias=[])
         self.state.update(ativo_anterior=0.0, decorrido_anterior=0.0,
-                          pausa_tecnica_anterior=0.0)
+                          pausa_tecnica_anterior=0.0, etapa_atual=None,
+                          etapa_inicio_ativo=None, tempos_etapas={},
+                          etapas_ultima_sessao={})
         self.history = None
         self.exit_code = 0
 
     def update(self, **values):
         self.check()
         with self.lock:
+            if 'etapa' in values:
+                self._change_stage(values['etapa'], time.monotonic())
             self.state.update(values)
         self.checkpoint_time()
         if self.args.sem_tui:
             print(' | '.join(f'{k}: {v}' for k, v in values.items()), flush=True)
+
+    def _change_stage(self, stage, now):
+        if stage == self.state['etapa_atual']:
+            return
+        started = self.state['etapa_inicio_ativo']
+        previous = self.state['etapa_atual']
+        if previous is not None and started is not None:
+            elapsed = max(0.0, active_time(self.state, now) - started)
+            if elapsed > 0:
+                self.state['tempos_etapas'][previous] = self.state['tempos_etapas'].get(previous, 0.0) + elapsed
+        self.state['etapa_atual'] = stage
+        self.state['etapa_inicio_ativo'] = active_time(self.state, now) if stage is not None else None
+
+    def finish_stage(self):
+        with self.lock:
+            self._change_stage(None, time.monotonic())
 
     def checkpoint_time(self, force=False, closed=False, status='em execução'):
         if self.history is None:
@@ -154,9 +176,10 @@ class Run:
             active = active_time(self.state, now)
             elapsed = max(0, now - self.state['inicio'])
             technical_pause = technical_pause_time(self.state, now)
+            stage_times = stage_times_snapshot(self.state, now)
             self.history.document['duracoesDias'] = list(self.state['duracoes_dias'])
         self.history.checkpoint(active, elapsed, status=status, force=force, closed=closed,
-                                technical_pause=technical_pause)
+                                technical_pause=technical_pause, stage_times=stage_times)
 
     def check(self):
         check_storage()
@@ -190,8 +213,10 @@ class Run:
         with self.lock:
             now = time.monotonic()
             baseline = self.state['pausa_tecnica_total']
+            self._change_stage(
+                f'Aguardando {TECHNICAL_PAUSE_SECONDS} s para liberar recursos', now)
             self.state.update(status='Pausa técnica',
-                              etapa=f'Aguardando {TECHNICAL_PAUSE_SECONDS} s para liberar recursos',
+                              etapa=self.state['etapa_atual'],
                               pausa_tecnica_inicio=now)
         if self.args.sem_tui:
             print(f'Pausa técnica: {TECHNICAL_PAUSE_SECONDS} s entre dias', flush=True)
@@ -320,6 +345,16 @@ def technical_pause_time(state, now):
     return paused
 
 
+def stage_times_snapshot(state, now):
+    times = dict(state.get('tempos_etapas', {}))
+    stage = state.get('etapa_atual')
+    started = state.get('etapa_inicio_ativo')
+    if stage is not None and started is not None:
+        elapsed = max(0.0, active_time(state, now) - started)
+        times[stage] = times.get(stage, 0.0) + elapsed
+    return times
+
+
 def estimate_remaining(state, total, active):
     remaining = max(0, total - state['dias'] - state['retomados'])
     if not remaining:
@@ -368,6 +403,41 @@ def elapsed_text(seconds):
     return f'{hours:02d}:{minutes:02d}:{seconds:02d}'
 
 
+def stage_summary_lines(state, now, width):
+    labels = {
+        'Lendo profissionais já identificados': 'Cache',
+        'Autenticação': 'Login',
+        'Pesquisa': 'Pesq',
+        'Turnos': 'Turnos',
+        'Eventos': 'Eventos',
+        'Profissionais e agência': 'Prof/ag',
+        'Salvando arquivos do dia': 'Gravação',
+    }
+    times = stage_times_snapshot(state, now) or state.get('etapas_ultima_sessao', {})
+    items = []
+    for stage, seconds in times.items():
+        if seconds <= 0:
+            continue
+        label = 'Pausa técnica' if stage.startswith('Aguardando ') else labels.get(stage, stage)
+        duration = elapsed_text(seconds) if width >= 80 else elapsed_text(seconds)[:-3]
+        items.append(f'{label}={duration}')
+
+    lines = []
+    current = '  ETAPAS'
+    for item in items:
+        candidate = f'{current} {item}'
+        if len(candidate) <= width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = f'  {item}'
+    if current.strip():
+        lines.append(current)
+    if not items:
+        lines.append('  ETAPAS: aguardando coleta')
+    return lines
+
+
 def screen(run, total, color=False):
     with run.lock:
         s = dict(run.state)
@@ -404,11 +474,9 @@ def screen(run, total, color=False):
         row(f'  PERÍODO  {run.args.inicio:%d/%m/%Y} → {run.args.fim:%d/%m/%Y}', 'muted'),
         row(f'  SESSÃO  {elapsed_text(elapsed)}     TOTAL ATIVO  {elapsed_text(accumulated)}     PAUSAS  {elapsed_text(paused_total)}     TÉCNICAS  {elapsed_text(s["pausa_tecnica_anterior"] + technical_pause_time(s, now))}'),
         row(' ' + eta_text(s, total, now), 'eta'),
-        row(),
         paired(f'  01  COMPLETO  ·  Dia {s["dia_numero"]} de {total}', f'{100 * processed / total:.1f}%', 'total'),
         bar(processed, total, 'total'),
         row(f'  {processed} dias concluídos     {s["dias"]} gravados agora     {s["retomados"]} já concluídos', 'muted'),
-        row(),
     ]
     teams = s['equipes_total']
     if teams is None:
@@ -423,12 +491,12 @@ def screen(run, total, color=False):
         paired(daily_label, daily_percentage, 'daily'),
         bar(s['equipes_feitas'] if teams else int(s['dia_validado']), teams or 1, 'daily'),
         row(f'  {s["equipes_feitas"]} equipes concluídas  ·  {s["etapa"]}  ·  Página {s["pagina"]} de {s["paginas"]}  ·  Linhas {s["linhas"]}', 'muted'),
-        row(),
         paired(f'  03  EQUIPE  ·  {s["equipe"]}', f'Etapa {s["equipe_etapa"]} de 3', 'team'),
         bar(s['equipe_etapa'], 3, 'team'),
         row(f'  {s["equipe_acao"]}  ·  Diários consultados: {s["detalhes_consultados"]}  ·  Reaproveitados: {s["detalhes_reutilizados"]}', 'muted'),
-        row(),
-        row('─' * width, 'track'),
+    ]
+    lines.extend(row(line, 'muted') for line in stage_summary_lines(s, now, width))
+    lines += [
         row(f'  SAÍDA  {run.args.saida}', 'muted'),
         row(f'  AVISO  {s["erro"] or "—"}', 'error' if s['erro'] else 'muted'),
         row('  [ESPAÇO] Pausar / continuar     [Q] Encerrar e retomar depois', 'keys'),
@@ -522,6 +590,14 @@ def main(argv=None):
     print(f'{run.state["status"]}: {run.state["dias"]} dias gravados, {run.state["retomados"]} retomados. {args.saida}')
     print(f'Tempo ativo acumulado: {elapsed_text(run.state["ativo_anterior"] + active_time(run.state, time.monotonic()))}')
     print(f'Tempo de pausas técnicas acumulado: {elapsed_text(run.state["pausa_tecnica_anterior"] + technical_pause_time(run.state, time.monotonic()))}')
+    print('Tempos por etapa na última coleta:')
+    stage_times = run.state['tempos_etapas'] or run.state['etapas_ultima_sessao']
+    visible_stage_times = {stage: seconds for stage, seconds in stage_times.items() if seconds > 0}
+    if visible_stage_times:
+        for stage, seconds in sorted(visible_stage_times.items(), key=lambda item: (-item[1], item[0])):
+            print(f'  {stage}: {elapsed_text(seconds)}')
+    else:
+        print('  Nenhuma etapa registrada.')
     if run.state['erro']:
         print(run.state['erro'], file=sys.stderr)
     return run.exit_code

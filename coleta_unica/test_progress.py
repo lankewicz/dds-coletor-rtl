@@ -6,7 +6,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch, Mock
 
-from coleta_unica.main import Run, screen, progress_bar, active_time, estimate_remaining, eta_text, technical_pause_time
+from coleta_unica.main import (
+    Run, screen, progress_bar, active_time, estimate_remaining, eta_text,
+    stage_times_snapshot, technical_pause_time,
+)
 from coleta_unica.scraper import Scraper
 from coleta_unica.test_identity_cache import record, HTML
 
@@ -68,6 +71,23 @@ class ProgressTests(unittest.TestCase):
         self.assertAlmostEqual(run.state['pausa_tecnica_total'], 1.0)
         self.assertEqual(active_time(run.state, clock[0]), 0.0)
 
+    def test_stage_times_accumulate_and_exclude_pauses(self):
+        clock = [0.0]
+        with patch('coleta_unica.main.time.monotonic', side_effect=lambda: clock[0]), \
+                patch('coleta_unica.main.check_storage'):
+            run = Run(SimpleNamespace(sem_tui=False))
+            run.update(etapa='Pesquisa')
+            clock[0] = 10
+            run.toggle_pause()
+            clock[0] = 110
+            run.toggle_pause()
+            clock[0] = 130
+            run.update(etapa='Eventos')
+            clock[0] = 150
+            run.finish_stage()
+        self.assertEqual(run.state['tempos_etapas'], {'Pesquisa': 30, 'Eventos': 20})
+        self.assertEqual(stage_times_snapshot(run.state, clock[0]), {'Pesquisa': 30, 'Eventos': 20})
+
     def test_eta_waits_for_progress_and_finishes_at_zero(self):
         run = Run(SimpleNamespace(sem_tui=False))
         run.state.update(retomados=20, dia_inicio=0)
@@ -98,6 +118,38 @@ class ProgressTests(unittest.TestCase):
             self.assertEqual(bars[2].count('█'), (columns - 1) // 3)
         self.assertEqual(progress_bar(10, 10, 80), '█' * 80)
         self.assertEqual(progress_bar(0, 0, 80), '░' * 80)
+
+    def test_screen_shows_stage_times_as_they_accumulate(self):
+        run = Run(SimpleNamespace(inicio=date(2026, 1, 1), fim=date(2026, 1, 2),
+                                  saida=Path('dados'), sem_tui=False))
+        run.state.update(dias=1, dia_numero=1, dia='2026-01-01', dia_validado=True,
+                         etapa='Pausa técnica',
+                         tempos_etapas={
+                             'Lendo profissionais já identificados': 61,
+                             'Autenticação': 61,
+                             'Pesquisa': 61,
+                             'Turnos': 61,
+                             'Eventos': 61,
+                             'Profissionais e agência': 61,
+                             'Salvando arquivos do dia': 61,
+                             'Aguardando 60 s para liberar recursos': 61,
+                         })
+        with patch('coleta_unica.main.shutil.get_terminal_size',
+                   return_value=os.terminal_size((120, 24))):
+            rendered = screen(run, 2)
+        for stage in ('Cache=00:01:01', 'Login=00:01:01', 'Pesq=00:01:01',
+                      'Turnos=00:01:01', 'Eventos=00:01:01', 'Prof/ag=00:01:01',
+                      'Gravação=00:01:01', 'Pausa técnica=00:01:01'):
+            self.assertIn(stage, rendered)
+        self.assertIn('Dia 1 de 2', rendered)
+        with patch('coleta_unica.main.shutil.get_terminal_size',
+                   return_value=os.terminal_size((30, 24))):
+            narrow = screen(run, 2)
+        self.assertLessEqual(len(narrow.splitlines()), 23)
+        for stage in ('Cache=00:01', 'Login=00:01', 'Pesq=00:01',
+                      'Turnos=00:01', 'Eventos=00:01', 'Prof/ag=00:01',
+                      'Gravação=00:01', 'Pausa técnica=00:01'):
+            self.assertIn(stage, narrow)
 
     def test_team_progress_advances_after_success_not_before_request(self):
         events = []

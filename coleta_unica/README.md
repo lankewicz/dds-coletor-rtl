@@ -44,6 +44,9 @@ O tempo em que o programa ficou fechado não entra na soma. A TUI mostra o tempo
 ativo da sessão, o total ativo de todas as sessões e as pausas acumuladas.
 O mostrador também separa o total de pausas técnicas; pausas manuais e técnicas
 são excluídas do tempo ativo e das estimativas de processamento.
+A TUI mostra o tempo ativo acumulado por etapa, atualizado ao longo da coleta e
+visível ao fim de cada dia. Ao encerrar, o terminal lista o resumo completo da
+sessão; os valores também ficam no histórico em `etapasSegundos`.
 O histórico é atualizado durante o progresso (com intervalo mínimo de 15 segundos)
 e ao encerrar, inclusive por Q ou erro. Após queda inesperada, retoma a última
 medição gravada; o tempo posterior a esse registro pode não ser contabilizado.
