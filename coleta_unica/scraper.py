@@ -239,7 +239,7 @@ class Scraper:
             raise PermissionError('Falha na autenticação do RTLWeb.')
 
     def collect(self, day, archive, vehicle=''):
-        vehicle = vehicle.strip().upper()
+        vehicle = (vehicle or '').strip().upper()
         self.notify(etapa='Pesquisa', pagina=0, paginas=0, linhas=0)
         response = self.request('GET', URL)
         doc = soup(response.text)

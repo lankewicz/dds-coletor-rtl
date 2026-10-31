@@ -4,9 +4,10 @@ import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest.mock import Mock
 
 from coleta_unica.main import complete, output_lock, save_day
-from coleta_unica.scraper import partial, rows, soup, table_spec, parse_details, diary_url, matches_vehicle, SCHEMA_VERSION
+from coleta_unica.scraper import Scraper, partial, rows, soup, table_spec, parse_details, diary_url, matches_vehicle, SCHEMA_VERSION
 
 
 class ExportTests(unittest.TestCase):
@@ -62,6 +63,7 @@ class ExportTests(unittest.TestCase):
             self.assertFalse(complete(folder, day))
             save_day(folder, result)
             self.assertTrue((folder / 'eventos.csv').read_bytes().startswith(b'\xef\xbb\xbf'))
+            self.assertTrue(complete(folder, day, None))
             result['filtroVeiculo'] = 'E001'
             (folder / 'dados.json').write_text(json.dumps(result), encoding='utf-8')
             self.assertTrue(complete(folder, day, 'e001'))
@@ -118,6 +120,15 @@ class ExportTests(unittest.TestCase):
         self.assertFalse(matches_vehicle('E35500', 'E3550'))
         self.assertFalse(matches_vehicle('E3550-A', 'E3550'))
         self.assertFalse(matches_vehicle('E3550(2)', 'E3550(3)'))
+
+    def test_collection_accepts_no_vehicle_filter(self):
+        scraper = Scraper('test', 'test', delay=0)
+        scraper.request = Mock(side_effect=RuntimeError('request reached'))
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'request reached'):
+                scraper.collect(date(2026, 1, 1), lambda *args: None, vehicle=None)
+        finally:
+            scraper.close()
 
 
 if __name__ == '__main__':

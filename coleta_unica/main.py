@@ -52,9 +52,10 @@ def save_day(folder, result):
 def complete(folder, day, vehicle=''):
     try:
         result = json.loads((folder / 'dados.json').read_text(encoding='utf-8'))
+        vehicle = (vehicle or '').upper()
         return (result.get('completo') is True and result.get('data') == day.isoformat()
                 and result.get('schemaVersion') == SCHEMA_VERSION
-                and (result.get('filtroVeiculo') or '').upper() == vehicle.upper()
+                and (result.get('filtroVeiculo') or '').upper() == vehicle
                 and len(result['resumo']) == 15
                 and all(all(key in row for key in DETAIL_FIELDS) and row['Agência Nome completo'] for row in result['turnos'])
                 and all(len(result[name]) == result['paginacao'][name]['total'] for name in ('turnos', 'eventos'))
