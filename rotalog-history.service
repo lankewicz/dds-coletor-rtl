@@ -1,5 +1,5 @@
 [Unit]
-Description=DDS Rotalog - Reconciliacao diaria de servicos e equipes
+Description=DDS Rotalog - Coleta unica e reconciliacao diaria
 After=network-online.target
 Wants=network-online.target
 
@@ -10,6 +10,6 @@ Group=orangepi
 WorkingDirectory=/home/orangepi/dds-coletor-rtl
 EnvironmentFile=/home/orangepi/dds-coletor-rtl/.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/orangepi/dds-coletor-rtl/.venv-3.14/bin/python main.py --reconciliar-agendado --firebase --output-dir /home/orangepi/dds-coletor-rtl/dados-local
-TimeoutStartSec=24h
+ExecStart=/home/orangepi/dds-coletor-rtl/.venv-3.14/bin/python -m scripts.rotalog_daily_pipeline
+TimeoutStartSec=0
 Nice=5

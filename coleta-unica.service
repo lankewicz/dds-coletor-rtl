@@ -1,0 +1,15 @@
+[Unit]
+Description=DDS Rotalog - coleta única RTLWeb (execução manual)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=orangepi
+Group=orangepi
+WorkingDirectory=/home/orangepi/dds-coletor-rtl
+EnvironmentFile=/home/orangepi/dds-coletor-rtl/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/env bash /home/orangepi/dds-coletor-rtl/coleta_unica/iniciar-orange.sh --sem-tui
+TimeoutStartSec=0
+Nice=5

@@ -259,7 +259,7 @@ class Run:
                     self.check()
                     folder = self.args.saida / day.isoformat()
                     self.update(dia=day.isoformat(), dia_numero=(day - self.args.inicio).days + 1)
-                    if complete(folder, day, self.args.veiculo):
+                    if not self.args.refazer and complete(folder, day, self.args.veiculo):
                         saved = json.loads((folder / 'dados.json').read_text(encoding='utf-8'))
                         count = len(saved['turnos'])
                         self.update(retomados=self.state['retomados'] + 1, dia_validado=True,
@@ -539,6 +539,7 @@ def main(argv=None):
     parser.add_argument('--saida', type=Path, default=HERE / 'dados')
     parser.add_argument('--veiculo', help='Coletar somente um veículo; os dados ficam em saida/equipes/VEICULO')
     parser.add_argument('--ssd-mount', type=Path, help='Linux: exigir que a saída permaneça neste SSD montado')
+    parser.add_argument('--refazer', action='store_true', help='Recoletar dias completos dentro do período informado')
     parser.add_argument('--env', type=Path, default=HERE / '.env' if (HERE / '.env').exists() else HERE.parent / '.env')
     parser.add_argument('--intervalo', type=float, default=.5, help='Espera mínima entre requisições, em segundos')
     parser.add_argument('--sem-tui', action='store_true', help='Progresso em texto para execução sem terminal')

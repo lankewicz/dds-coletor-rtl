@@ -46,6 +46,7 @@ from coletor.historico_parsing import (
     parse_target_date as _parse_target_date,
 )
 from coletor.historico_estado import MonthlyCollectionState
+from coletor.historico_cache import load_unique_day
 from coletor.historico_sync import (
     enqueue_historical_upload as _enqueue_historical_upload,
     flush_historical_uploads as _flush_historical_uploads,
@@ -114,6 +115,7 @@ def executar_coleta_historico_dia(
     progresso: typing.Callable[[str], None] | None = None,
     session: requests.Session | None = None,
     atualizar_terminal: bool = True,
+    coleta_unica_cache_dir: Path | None = None,
 ) -> dict[str, typing.Any]:
     """Raspa a listagem de eventos (/paginas/listagemEventos) e gera arquivo e relatório diário."""
     day_iso = target_date.isoformat()
@@ -135,8 +137,16 @@ def executar_coleta_historico_dia(
     elif progresso:
         progresso(f"Consultando listagem de eventos para {day_br}")
 
-    scraper = RotalogEventosScraper(session=session)
-    eventos = scraper.raspar_periodo(day_br, day_br, progresso=progresso_handler)
+    unique_cache = load_unique_day(target_date, coleta_unica_cache_dir)
+    scraper = None
+    if unique_cache is not None:
+        eventos = unique_cache["eventos"]
+        event_source = "coleta_unica_cache"
+        LOG.info("Reutilizando eventos completos da coleta unica para %s", day_iso)
+    else:
+        scraper = RotalogEventosScraper(session=session)
+        eventos = scraper.raspar_periodo(day_br, day_br, progresso=progresso_handler)
+        event_source = "portal"
     phase_durations["eventosScrapeSeconds"] = round(time.perf_counter() - phase_started, 3)
 
     # Preserva todas as linhas e colunas retornadas pela listagem para auditoria/reprocessamento.
@@ -147,9 +157,15 @@ def executar_coleta_historico_dia(
         "empresa": empresa,
         "empresaKey": company_key(empresa),
         "collectedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "origemDados": event_source,
         "totalRegistros": len(eventos),
         "registros": eventos,
     }
+    if unique_cache is not None:
+        raw_payload["coletaUnica"] = {
+            "schemaVersion": unique_cache["schemaVersion"],
+            "coletadoEm": unique_cache.get("coletadoEm"),
+        }
     raw_dir = output_dir / "rotalog" / "eventos" / "diario"
     raw_path = raw_dir / f"{day_iso}.json.gz"
     salvar_arquivo_gzip(raw_path, raw_payload)
@@ -158,10 +174,18 @@ def executar_coleta_historico_dia(
     phase_started = time.perf_counter()
     equipes = []
     try:
-        equipes_scraper = RotalogEquipesScraper(session=session or scraper.session)
-        equipes = equipes_scraper.raspar_dia(
-            day_br, progresso=progresso_handler, enriquecer_detalhes=True,
+        equipes_scraper = RotalogEquipesScraper(
+            session=session or (scraper.session if scraper is not None else None)
         )
+        if unique_cache is not None:
+            equipes = equipes_scraper.raspar_dia(
+                day_br, progresso=progresso_handler, enriquecer_detalhes=True,
+                cached_turnos=unique_cache["turnos"],
+            )
+        else:
+            equipes = equipes_scraper.raspar_dia(
+                day_br, progresso=progresso_handler, enriquecer_detalhes=True,
+            )
     except Exception as exc:
         raise RuntimeError(f"Coleta de equipes incompleta em {day_br}: {exc}") from exc
     phase_durations["equipesScrapeSeconds"] = round(time.perf_counter() - phase_started, 3)
@@ -270,6 +294,7 @@ def executar_coleta_historico_dia(
         "date": day_iso,
         "durationSeconds": duration_s,
         "phaseDurations": phase_durations,
+        "eventSource": event_source,
         "totalEquipes": payload_km["totalEquipes"],
         "totalServicos": payload_km["totalServicos"],
         "totalKmInformado": payload_km["totalKmInformado"],

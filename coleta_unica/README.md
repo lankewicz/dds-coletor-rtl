@@ -59,7 +59,10 @@ Para conferir apenas o primeiro dia:
 ```
 
 Também aceita `--inicio AAAA-MM-DD`, `--fim AAAA-MM-DD`, `--saida CAMINHO`,
-`--veiculo CODIGO`, `--env CAMINHO`, `--intervalo 0.5` e `--sem-tui`.
+`--veiculo CODIGO`, `--env CAMINHO`, `--intervalo 0.5`, `--sem-tui` e
+`--refazer`. Esta última opção força a atualização dos dias do período mesmo
+quando já têm recibo válido; a pipeline diária a usa para atualizar a janela
+normal de reconciliação antes de consumir o cache.
 Com `--veiculo`, consulta somente o veículo informado e salva em
 `CAMINHO/equipes/CODIGO/AAAA-MM-DD`, sem misturar a exportação com uma coleta
 diária de todas as equipes. O diário completo permanece em `brutos/`, incluindo

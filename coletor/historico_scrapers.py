@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 
 from .client import CrawlerRotalog
 from .historico_parsing import parse_float_br
+from .historico_cache import cached_team_details, team_cache_key
 from .historico_terminal import formatar_numero_br
 
 LOG = logging.getLogger("coletor-historico")
@@ -248,19 +249,37 @@ class RotalogEquipesScraper:
     def _enrich_team_details(
         self, records: list[dict[str, str]], view_state: str,
         progresso: typing.Callable[[str], None] | None = None,
+        cached_turnos: list[dict[str, typing.Any]] | None = None,
     ) -> str:
+        cache = cached_team_details(cached_turnos or [])
+        reused = 0
+        consulted = 0
         for index, record in enumerate(records, 1):
             if progresso:
                 progresso(f"Profissionais {index}/{len(records)} | Equipe {record.get('Veiculo', '')}")
+            candidates = cache.get(team_cache_key(record), [])
+            if len(candidates) == 1:
+                record.update(candidates[0])
+                reused += 1
+                record.pop("_detalheHref", None)
+                record.pop("_detalheSource", None)
+                record.pop("_detalheRender", None)
+                continue
             try:
                 details, view_state = self._fetch_team_details(record, view_state)
                 record.update(details)
+                consulted += 1
             except Exception as exc:
                 LOG.warning("Falha ao consultar detalhes da equipe %s: %s", record.get("Veiculo"), exc)
             finally:
                 record.pop("_detalheHref", None)
                 record.pop("_detalheSource", None)
                 record.pop("_detalheRender", None)
+        if cached_turnos is not None:
+            LOG.info(
+                "Detalhes de equipes em cache: %d reaproveitados, %d consultas ao portal",
+                reused, consulted,
+            )
         return view_state
 
     def raspar_periodo(
@@ -269,6 +288,7 @@ class RotalogEquipesScraper:
         data_fim_br: str,
         progresso: typing.Callable[[str], None] | None = None,
         enriquecer_detalhes: bool = False,
+        cached_turnos: list[dict[str, typing.Any]] | None = None,
     ) -> list[dict[str, str]]:
         """Pesquisa e extrai todos os fechamentos de equipes do período na tela /paginas/equipes."""
         LOG.debug("Consultando fechamento de equipes: período %s até %s", data_inicio_br, data_fim_br)
@@ -354,7 +374,9 @@ class RotalogEquipesScraper:
         # paginação invalida as requisições das páginas seguintes; por isso a lista
         # completa é carregada primeiro e somente então os detalhes são consultados.
         if enriquecer_detalhes:
-            self._enrich_team_details(records, current_state, progresso=progresso)
+            self._enrich_team_details(
+                records, current_state, progresso=progresso, cached_turnos=cached_turnos,
+            )
 
         LOG.debug("Fechamentos de equipes obtidos: %d registros em %d páginas", len(records), total_pages)
         return records
@@ -364,10 +386,12 @@ class RotalogEquipesScraper:
         data_br: str,
         progresso: typing.Callable[[str], None] | None = None,
         enriquecer_detalhes: bool = False,
+        cached_turnos: list[dict[str, typing.Any]] | None = None,
     ) -> list[dict[str, str]]:
         return self.raspar_periodo(
             data_br,
             data_br,
             progresso=progresso,
             enriquecer_detalhes=enriquecer_detalhes,
+            cached_turnos=cached_turnos,
         )

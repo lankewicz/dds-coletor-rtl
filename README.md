@@ -305,36 +305,61 @@ python main.py --historico --firebase
 python main.py --historico 2026-09-12 --firebase
 ```
 
-#### Reconciliação diária às 03:00
+#### Coleta única e reconciliação diária às 01:00
 
-O timer persistente atualiza os últimos sete dias completos às 03:00 no fuso
+O timer persistente inicia a coleta única às 01:00 no fuso
 `America/Sao_Paulo`. Se o Orange Pi estiver desligado nesse horário, o systemd
-executa a coleta pendente quando o equipamento voltar.
+executa a coleta pendente quando o equipamento voltar. A coleta única roda
+primeiro e grava seus dados no SSD; em seguida, a reconciliação normal processa
+suas janelas de 7, 30 ou 60 dias.
+
+Em cada ciclo, a coleta única atualiza primeiro a mesma janela da reconciliação:
+7 dias normalmente, 30 no domingo ou 60 no dia 10. A coleta normal começa depois.
+Se o SSD, o portal ou a coleta única falhar, a reconciliação normal ainda é
+executada e consulta o portal como fallback para dias sem cache válido. Só são
+reaproveitados recibos completos, sem filtro por veículo e com até 24 horas.
+Assim, o cache não mascara alterações recentes nos dias que estão sendo
+reconciliados. O cache elimina a segunda raspagem da tabela de eventos e
+reaproveita detalhes de profissionais; a tela `/paginas/equipes` continua sendo
+consultada para preservar as métricas oficiais de quilometragem.
 
 Nos domingos a janela aumenta para 30 dias; no dia 10 de cada mês, para 60 dias.
 Quando coincidem, somente a maior janela é executada. O dia atual fica fora da
 consulta. Cada dia consulta serviços e a tabela principal de equipes, mantendo
 as quilometragens oficiais atualizadas. Os nomes exibidos pela tabela enriquecem
 o cadastro permanente `rotalog/equipes/team-registry.json`. Matrículas e nomes
-completos são consultados individualmente após a paginação, com progresso por
-equipe no terminal. Essa etapa acrescentou cerca de 13 minutos por dia no teste
+completos são reaproveitados do cache da coleta única quando a composição
+corresponde sem ambiguidade; sem cache compatível, são consultados individualmente
+após a paginação. Essa etapa acrescentou cerca de 13 minutos por dia no teste
 com 108 equipes; a janela de 60 dias poderá levar aproximadamente 14 horas.
 O arquivo compactado remoto do cadastro é sincronizado pelo próximo ciclo do
 coletor somente quando seu conteúdo tiver mudado.
 
 ```bash
 sudo install -m 0644 rotalog-history.service /etc/systemd/system/rotalog-history.service
+sudo install -m 0644 coleta-unica.service /etc/systemd/system/coleta-unica.service
 sudo install -m 0644 rotalog-history.timer /etc/systemd/system/rotalog-history.timer
 sudo systemctl daemon-reload
 sudo systemctl enable --now rotalog-history.timer
+sudo systemctl restart rotalog-history.timer
 systemctl list-timers rotalog-history.timer
 ```
 
+O cache fica em
+`/mnt/ssd/dds-coletor-rtl/coleta-unica/dados`; configure
+`COLETA_UNICA_SSD_MOUNT` ou `COLETA_UNICA_SAIDA` no `.env` se necessário. A
+pipeline usa o mesmo Python do coletor normal e pode ser acompanhada com
+`journalctl -u rotalog-history.service`. `coleta-unica.service` permanece
+disponível para preenchimento manual do histórico completo; não o execute ao
+mesmo tempo que `rotalog-history.service`, pois ambos usam a mesma pasta de saída.
+Se o timer mensal legado já estiver habilitado, desative-o com
+`sudo systemctl disable --now rotalog-monthly.timer`.
+
 ### Fechamento mensal no dia 10
 
-Após atualizar os 60 dias, a rotina consulta o fechamento oficial do mês anterior
-uma vez, sem repetir a raspagem diária. O timer mensal aponta para o mesmo serviço
-da rotina diária, evitando duas execuções concorrentes. Basta ativar o timer diário.
+No dia 10, após atualizar os 60 dias, a mesma rotina consulta uma vez o fechamento
+oficial do mês anterior, sem repetir a raspagem diária. Não é necessário habilitar
+um timer mensal separado.
 
 Na primeira passagem, falhas não interrompem os demais dias. Somente as falhas são
 repetidas, até dez tentativas totais por dia, com esperas de 1, 2, 4, 8 e 15 minutos
@@ -353,13 +378,10 @@ python main.py --reconciliar-agendado --no-firebase --output-dir ~/dds-coletor-t
 Para correções com mais de 60 dias, continua disponível `--historico DATA
 --historico-fim DATA`. A janela móvel não alcança automaticamente meses anteriores.
 
-```bash
-sudo install -m 0644 rotalog-monthly.service /etc/systemd/system/rotalog-monthly.service
-sudo install -m 0644 rotalog-monthly.timer /etc/systemd/system/rotalog-monthly.timer
-sudo systemctl daemon-reload
-sudo systemctl enable --now rotalog-monthly.timer
-systemctl list-timers rotalog-monthly.timer
-```
+O `rotalog-monthly.timer` legado não deve ser habilitado: o timer diário já
+executa a janela de 60 dias e o fechamento do mês no dia 10. Se já estiver
+habilitado na instalação, desative-o com
+`sudo systemctl disable --now rotalog-monthly.timer`.
 
 ### Fechamento Mensal e Varredura do Mês Anterior (Notas de Cobrança)
 
