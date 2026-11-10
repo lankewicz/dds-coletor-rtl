@@ -81,11 +81,112 @@ class TeamRegistryTests(unittest.TestCase):
             self.assertTrue(any(item["membersKey"] == "ELIAS|FELIPE" for item in team["memberAliases"]))
             self.assertEqual(team["crewHistory"][0]["professionalIds"], ["390994", "390995"])
 
+    def test_records_daily_assignments_and_only_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = TeamRegistry(Path(directory) / "team-registry.json")
+            dates = [
+                ("2026-09-25", "E3P29", "BSCCEL", "390994", "FELIPE"),
+                ("2026-09-26", "E3P29", "BSCPIN", "390994", "FELIPE"),
+                ("2026-09-27", "E3P29", "BSCPIN", "390995", "ELIAS"),
+                ("2026-09-28", "E3X90", "BSCPIN", "390995", "ELIAS"),
+            ]
+            team_id = None
+            for day, vehicle, base, registration, name in dates:
+                result = registry.enrich_professionals(
+                    vehicle,
+                    [{"registration": registration, "fullName": name}],
+                    f"{day}T08:00:00-03:00",
+                    f"{day} | 08:00 - 17:00",
+                    operational_date=day,
+                    base=base,
+                    tablet="CA231",
+                )
+                team_id = team_id or result
+                self.assertEqual(result, team_id)
+
+            registry.enrich_professionals(
+                "E3X90",
+                [{"registration": "390995", "fullName": "ELIAS"}],
+                "2026-09-28T08:00:00-03:00",
+                "2026-09-28 | 08:00 - 17:00",
+                operational_date="2026-09-28",
+                base="BSCPIN",
+                tablet="CA231",
+            )
+
+            team = registry.data["teams"][team_id]
+            self.assertEqual(len(team["assignmentHistory"]), 4)
+            self.assertEqual(
+                [(change["operationalDate"], change["field"]) for change in team["assignmentChanges"]],
+                [
+                    ("2026-09-26", "base"),
+                    ("2026-09-27", "electricians"),
+                    ("2026-09-28", "vehicle"),
+                ],
+            )
+            self.assertEqual(team["assignmentChanges"][0]["from"], "BSCCEL")
+            self.assertEqual(team["assignmentChanges"][0]["to"], "BSCPIN")
+
+    def test_corrected_shift_replaces_assignment_without_false_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = TeamRegistry(Path(directory) / "team-registry.json")
+            team_id = registry.observe("E3P29", "FELIPE", "2026-09-24T08:00:00-03:00")["teamId"]
+            crew = [{"registration": "390994", "fullName": "FELIPE"}]
+            for day, time, reference, base in [
+                ("2026-09-24", "08:00", "24/09/2026 | 08:00 - 17:00", "BSCCEL"),
+                ("2026-09-25", "08:00", "25/09/2026 | 08:00 - 17:00", "BSCPIN"),
+                ("2026-09-25", "08:15", "25/09/2026 | 08:15 - 17:15", "BSCCEL"),
+                ("2026-09-25", "08:15", "25/09/2026 | 08:15 - 17:15", "BSCCEL"),
+            ]:
+                registry.record_assignment(
+                    team_id, day, f"{day}T{time}:00-03:00", reference,
+                    "E3P29", base, "CA231", crew,
+                )
+
+            team = registry.data["teams"][team_id]
+            self.assertEqual(len(team["assignmentHistory"]), 2)
+            corrected = team["assignmentHistory"][1]
+            self.assertEqual(corrected["observedAt"], "2026-09-25T08:15:00-03:00")
+            self.assertEqual(corrected["shiftReference"], "25/09/2026 | 08:15 - 17:15")
+            self.assertEqual(corrected["base"], "BSCCEL")
+            self.assertEqual(team["assignmentChanges"], [])
+
+    def test_corrected_shift_preserves_other_shift_on_same_day(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = TeamRegistry(Path(directory) / "team-registry.json")
+            team_id = registry.observe("E3P29", "FELIPE", "2026-09-25T08:00:00-03:00")["teamId"]
+            crew = [{"registration": "390994", "fullName": "FELIPE"}]
+            for time, reference, base in [
+                ("08:00", "25/09/2026 | 08:00 - 16:00", "BSCCEL"),
+                ("16:00", "25/09/2026 | 16:00 - 23:00", "BSCPIN"),
+                ("08:15", "25/09/2026 | 08:15 - 16:00", "BSCCEL"),
+            ]:
+                registry.record_assignment(
+                    team_id, "2026-09-25", f"2026-09-25T{time}:00-03:00", reference,
+                    "E3P29", base, "CA231", crew,
+                )
+
+            team = registry.data["teams"][team_id]
+            self.assertEqual(
+                [(item["shiftReference"], item["base"]) for item in team["assignmentHistory"]],
+                [
+                    ("25/09/2026 | 08:15 - 16:00", "BSCCEL"),
+                    ("25/09/2026 | 16:00 - 23:00", "BSCPIN"),
+                ],
+            )
+            self.assertEqual(len(team["assignmentChanges"]), 1)
+            change = team["assignmentChanges"][0]
+            self.assertEqual(change["field"], "base")
+            self.assertEqual((change["from"], change["to"]), ("BSCCEL", "BSCPIN"))
+            self.assertEqual(change["observedAt"], "2026-09-25T16:00:00-03:00")
+
     def test_enriches_all_contracts_from_team_page(self):
         with tempfile.TemporaryDirectory() as directory:
             records = [
                 {
                     "Veiculo": "E3P29",
+                    "Tablet": "CA231",
+                    "Agencia": "BSCCEL",
                     "Contrato": "FORA_DOS_CONTRATOS_ALVO",
                     "Data Referencia - Turno": "24/09/2026 | 07:45 - 16:42",
                     "Eletricista 1 Registro": "390994",
@@ -102,6 +203,9 @@ class TeamRegistryTests(unittest.TestCase):
             self.assertEqual(result["teamsEnriched"], 1)
             self.assertEqual(result["professionalsIdentified"], 2)
             self.assertEqual(len(registry.data["professionals"]), 2)
+            team = next(iter(registry.data["teams"].values()))
+            self.assertEqual(team["assignmentHistory"][0]["base"], "BSCCEL")
+            self.assertEqual(team["assignmentHistory"][0]["tablet"], "CA231")
 
 
 if __name__ == "__main__":

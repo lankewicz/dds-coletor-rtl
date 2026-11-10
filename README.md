@@ -335,6 +335,21 @@ com 108 equipes; a janela de 60 dias poderá levar aproximadamente 14 horas.
 O arquivo compactado remoto do cadastro é sincronizado pelo próximo ciclo do
 coletor somente quando seu conteúdo tiver mudado.
 
+O mesmo cadastro mantém `assignmentHistory` por equipe, com a data observada,
+veículo, agência/base, tablet e eletricistas identificados. `assignmentChanges`
+registra diferenças calculadas automaticamente entre observações consecutivas,
+por campo, com valor anterior e novo; por exemplo, uma troca de veículo é
+registrada mesmo que a composição da equipe permaneça igual. Esse diff é uma
+sugestão baseada na coleta, não uma aprovação manual nem um registro de decisão.
+Reprocessar o mesmo dia atualiza a observação existente em vez de duplicá-la.
+Os dias já disponíveis passam a ser reconstruídos à medida que a reconciliação
+histórica os consulta novamente.
+
+O fluxo pretendido para o site e o aplicativo DDS é descrito em
+[INSTRUCOES_SITE_DDS_ALTERACOES_EQUIPES.md](./INSTRUCOES_SITE_DDS_ALTERACOES_EQUIPES.md):
+o Orange coleta e publica; o site apresenta e permite aprovar/rejeitar; o DDS
+consome o estado aceito e o histórico auditável.
+
 ```bash
 sudo install -m 0644 rotalog-history.service /etc/systemd/system/rotalog-history.service
 sudo install -m 0644 coleta-unica.service /etc/systemd/system/coleta-unica.service

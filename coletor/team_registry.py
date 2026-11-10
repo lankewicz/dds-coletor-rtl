@@ -185,6 +185,10 @@ class TeamRegistry:
         professionals: list[dict[str, str]],
         observed_at: str,
         shift_reference: str = "",
+        *,
+        operational_date: str = "",
+        base: str = "",
+        tablet: str = "",
     ) -> str | None:
         """Inclui registros e nomes oficiais obtidos no histórico do ROTALOG."""
         clean = [
@@ -195,13 +199,13 @@ class TeamRegistry:
             for item in professionals
             if str(item.get("registration") or "").strip() or str(item.get("fullName") or "").strip()
         ]
-        if not clean:
-            return None
 
         short_names = [self._first_name(item["fullName"]) for item in clean]
         short_display = " ".join(name for name in short_names if name)
         team_id = self._team_for_vehicle(vehicle_code, observed_at)
         if not team_id:
+            if not clean:
+                return None
             team_id = self.observe(vehicle_code, short_display, observed_at)["teamId"]
         team = self.data["teams"][team_id]
 
@@ -253,25 +257,170 @@ class TeamRegistry:
                 relation["fullName"] = full_name or relation.get("fullName")
                 self.dirty = True
 
-        crew_key = "|".join(sorted(registrations))
-        crew = next((item for item in team.setdefault("crewHistory", [])
-                     if item.get("observedAt") == observed_at
-                     and item.get("crewKey") == crew_key
-                     and item.get("shiftReference") == shift_reference), None)
-        if not crew:
-            team["crewHistory"].append({
+        if registrations:
+            crew_key = "|".join(sorted(registrations))
+            crew = next((item for item in team.setdefault("crewHistory", [])
+                         if item.get("observedAt") == observed_at
+                         and item.get("shiftReference") == shift_reference
+                         and normalize_team_key(item.get("vehicleCode")) == normalize_team_key(vehicle_code)), None)
+            crew_observation = {
                 "observedAt": observed_at,
                 "shiftReference": shift_reference,
                 "vehicleCode": normalize_team_key(vehicle_code),
                 "crewKey": crew_key,
                 "professionalIds": sorted(registrations),
-            })
-            team["crewHistory"].sort(key=lambda item: str(item.get("observedAt") or ""))
-            self.dirty = True
+            }
+            if crew and crew != crew_observation:
+                crew.update(crew_observation)
+                self.dirty = True
+            elif not crew:
+                team["crewHistory"].append(crew_observation)
+                team["crewHistory"].sort(key=lambda item: str(item.get("observedAt") or ""))
+                self.dirty = True
+
+        self.record_assignment(
+            team_id,
+            operational_date or observed_at[:10],
+            observed_at,
+            shift_reference,
+            vehicle_code,
+            base,
+            tablet,
+            clean,
+        )
         team["updatedAt"] = max(str(team.get("updatedAt") or ""), observed_at)
         return team_id
+
+    def record_assignment(
+        self,
+        team_id: str,
+        operational_date: str,
+        observed_at: str,
+        shift_reference: str,
+        vehicle_code: str,
+        base: str,
+        tablet: str,
+        professionals: list[dict[str, str]],
+    ) -> None:
+        """Registra observações históricas e recalcula as mudanças da equipe."""
+        team = self.data["teams"].get(team_id)
+        if not team:
+            return
+
+        electricians = sorted(
+            (
+                {
+                    "registration": str(item.get("registration") or "").strip(),
+                    "fullName": str(item.get("fullName") or "").strip().upper(),
+                }
+                for item in professionals
+                if str(item.get("registration") or "").strip()
+                or str(item.get("fullName") or "").strip()
+            ),
+            key=lambda item: (item["registration"], item["fullName"]),
+        )
+        assignment = {
+            "operationalDate": operational_date,
+            "observedAt": observed_at,
+            "shiftReference": shift_reference,
+            "vehicleCode": normalize_team_key(vehicle_code),
+            "base": str(base or "").strip(),
+            "tablet": str(tablet or "").replace("*", "").strip(),
+            "electricians": electricians,
+        }
+        history = team.setdefault("assignmentHistory", [])
+        current = next(
+            (
+                item for item in history
+                if item.get("observedAt") == observed_at
+                and item.get("shiftReference") == shift_reference
+                and normalize_team_key(item.get("vehicleCode")) == assignment["vehicleCode"]
+            ),
+            None,
+        )
+        if current is None:
+            # A shift reference can be corrected during reprocessing. Match the
+            # old observation by its time window, but only when that identifies
+            # exactly one shift for this vehicle and operational date.
+            shift_window = _shift_window(shift_reference)
+            if shift_window:
+                candidates = [
+                    item for item in history
+                    if item.get("operationalDate") == operational_date
+                    and normalize_team_key(item.get("vehicleCode")) == assignment["vehicleCode"]
+                    and _windows_overlap(shift_window, _shift_window(item.get("shiftReference", "")))
+                ]
+                if len(candidates) == 1:
+                    current = candidates[0]
+        if current == assignment:
+            return
+        if current:
+            current.update(assignment)
+        else:
+            history.append(assignment)
+        history.sort(key=lambda item: (str(item.get("observedAt") or ""), str(item.get("vehicleCode") or "")))
+
+        changes = []
+        fields = (
+            ("electricians", "electricians"),
+            ("base", "base"),
+            ("vehicleCode", "vehicle"),
+        )
+        previous = None
+        for item in history:
+            if previous is not None:
+                for key, field in fields:
+                    old_value = previous.get(key)
+                    new_value = item.get(key)
+                    same_value = old_value == new_value
+                    if key == "electricians":
+                        old_ids = sorted(
+                            person.get("registration") or f"NAME:{member_signature(person.get('fullName'))}"
+                            for person in old_value or []
+                        )
+                        new_ids = sorted(
+                            person.get("registration") or f"NAME:{member_signature(person.get('fullName'))}"
+                            for person in new_value or []
+                        )
+                        same_value = old_ids == new_ids
+                        if not old_ids or not new_ids:
+                            same_value = True
+                    elif not old_value or not new_value:
+                        same_value = True
+                    if not same_value:
+                        changes.append({
+                            "operationalDate": item.get("operationalDate"),
+                            "observedAt": item.get("observedAt"),
+                            "shiftReference": item.get("shiftReference"),
+                            "field": field,
+                            "from": old_value,
+                            "to": new_value,
+                        })
+            previous = item
+        if team.get("assignmentChanges") != changes:
+            team["assignmentChanges"] = changes
+        self.dirty = True
 
     def save(self) -> None:
         if self.dirty or not self.path.exists():
             write_json(self.path, self.data)
             self.dirty = False
+
+
+def _shift_window(reference: str) -> tuple[int, int] | None:
+    match = re.search(
+        r"(\d{2})/(\d{2})/(\d{4}).*?(\d{2}):(\d{2})\s*-\s*(\d{2}):(\d{2})",
+        str(reference or ""),
+    )
+    if not match:
+        return None
+    day, month, year, start_hour, start_minute, end_hour, end_minute = map(int, match.groups())
+    start = (((year * 12 + month) * 31 + day) * 24 + start_hour) * 60 + start_minute
+    end = (((year * 12 + month) * 31 + day) * 24 + int(end_hour)) * 60 + int(end_minute)
+    if end <= start:
+        end += 24 * 60
+    return start, end
+
+
+def _windows_overlap(left: tuple[int, int], right: tuple[int, int] | None) -> bool:
+    return bool(right and left[0] < right[1] and right[0] < left[1])

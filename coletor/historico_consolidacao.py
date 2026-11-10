@@ -270,7 +270,13 @@ def enriquecer_cadastro_permanente_equipes(
                     if registration:
                         registrations.add(registration)
             team_id = registry.enrich_professionals(
-                vehicle, professionals, observed_at, shift_reference,
+                vehicle,
+                professionals,
+                observed_at,
+                shift_reference,
+                operational_date=day_iso,
+                base=row.get("Agencia") or row.get("Agência") or "",
+                tablet=row.get("Tablet") or "",
             )
             if team_id:
                 enriched_teams.add(team_id)
