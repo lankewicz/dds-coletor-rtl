@@ -12,11 +12,13 @@ from .workers import _load_runtime_status
 from .details import _render_details
 from .panels import _render_operational_panels
 from .overview import _render_overview
+from .daily import use_daily
 from .terminal import C_DEFAULT, C_TITLE, C_OK, C_WARN, C_ERROR, C_STATUS_OK, C_STATUS_WARN, C_STATUS_ERR, C_STATUS_RUN, C_DIM, C_ACCENT, C_HEADER_BAR
 from .terminal import _box, _cp, _fill, _health_color, _init_colors, _line
 
 
-def _compact_summary(last: dict, health: dict, last_success: dict | None = None) -> list[tuple[str, int]]:
+def _compact_summary(last: dict, health: dict, last_success: dict | None = None,
+                     last_collected_at: str | None = None) -> list[tuple[str, int]]:
     """Três linhas operacionais; diagnóstico completo fica no painel de detalhes."""
     stamp = parse_iso(last.get("finishedAt") or last.get("startedAt"))
     when = stamp.astimezone(TZ).strftime("%H:%M:%S") if stamp else "-"
@@ -52,9 +54,9 @@ def _compact_summary(last: dict, health: dict, last_success: dict | None = None)
         alerts.insert(0, f"Sincronizacao: {pending} pendentes / {failed} falhas")
     if last.get("error"):
         alerts.insert(0, f"Coleta: {last['error']}")
-    success_stamp = parse_iso((last_success or {}).get("finishedAt"))
-    success_text = success_stamp.astimezone(TZ).strftime("%H:%M:%S") if success_stamp else "-"
-    third = f"Alertas: {', '.join(alerts) or 'nenhum'} | Sucesso {success_text} | [d] Detalhes"
+    success_stamp = parse_iso(last_collected_at) or parse_iso((last_success or {}).get("finishedAt"))
+    success_text = success_stamp.astimezone(TZ).strftime("%d/%m/%Y %H:%M:%S") if success_stamp else "sem registro"
+    third = f"Ultima coleta valida: {success_text} | Alertas: {', '.join(alerts) or 'nenhum'} | [d] Detalhes"
     first_color = C_ERROR if result == "FALHA" else C_WARN if pending or failed or cloud == "PENDENTE" else C_OK
     return [(first, first_color), (second, _health_color(health)),
             (third, C_ERROR if health.get("overall") == "critical" or last.get("error") else C_WARN if alerts else C_DIM)]
@@ -85,6 +87,8 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
             "details_scroll": state.details_scroll,
             "team_snapshots": dict(state.team_snapshots),
             "teams_collected_at": state.teams_collected_at,
+            "daily_snapshot": dict(state.daily_snapshot),
+            "daily_error": state.daily_error,
             "teams_error": state.teams_error,
             "active_panel": state.active_panel,
             "teams_expanded": state.teams_expanded,
@@ -119,7 +123,7 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     mode_attr = _cp(C_ACCENT, terminal.curses.A_BOLD) if is_viewer else _cp(C_OK, terminal.curses.A_BOLD)
     _line(screen, 0, 24, f"[{title_mode}]", width - 24, mode_attr)
 
-    empresa_str = runner.empresa if runner else os.getenv("DDS_EMPRESA_PADRAO", "ChicoEletro")
+    empresa_str = runner.empresa if runner else state.company or os.getenv("DDS_EMPRESA_PADRAO", "ChicoEletro")
     cur_interval = state.get_interval(now)
     is_peak = 7 <= now.hour < 20
     tag_intervalo = f"{cur_interval}s [PICO 07-20h]" if is_peak else f"{cur_interval}s [NOTURNO 20-07h]"
@@ -197,7 +201,7 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     # Resumo fixo de três linhas; todo o restante da altura fica para eventos.
     summary_top, summary_h = 4, 5
     _box(screen, summary_top, 0, summary_h, width - 1, title="RESUMO OPERACIONAL  [d] DETALHES")
-    for offset, (text, color) in enumerate(_compact_summary(last, health, last_success), start=1):
+    for offset, (text, color) in enumerate(_compact_summary(last, health, last_success, data["teams_collected_at"]), start=1):
         _line(screen, summary_top + offset, 2, text, width - 4, _cp(color))
 
     # -- 5 e 6. Eventos Operacionais e Histórico Diário --------------------
@@ -206,7 +210,12 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     events_top = summary_top + summary_h
     events_h = hist_top - events_top
 
-    if data["teams_expanded"] and events_h >= 9:
+    if use_daily(data, last, now) and data["teams_expanded"] and events_h >= 7:
+        data["active_panel"] = "teams"
+        offsets = _render_operational_panels(screen, last, data, events_top, events_h, width, now)
+        with state.lock:
+            state.teams_scroll = offsets["teams_scroll"]
+    elif data["teams_expanded"] and events_h >= 9:
         offsets = _render_overview(screen, data, events_top, events_h, width, now)
         with state.lock:
             state.overview_scroll = offsets

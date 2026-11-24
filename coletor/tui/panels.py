@@ -6,6 +6,7 @@ from coletor.fleet_control import parse_iso
 from . import terminal
 from .state import TZ
 from .formatting import _format_columns
+from .daily import use_daily
 from .terminal import C_DEFAULT, C_TITLE, C_OK, C_WARN, C_ERROR, C_STATUS_OK, C_STATUS_WARN, C_STATUS_ERR, C_STATUS_RUN, C_DIM, C_ACCENT, C_HEADER_BAR
 from .terminal import _box, _cp, _fill, _health_color, _init_colors, _line
 
@@ -43,6 +44,29 @@ def _team_current_rows(snapshots: dict, now: datetime) -> list[tuple]:
     return [row for _, row in rows]
 
 
+def _render_daily_panel(screen, data, top, x, height, width):
+    daily = data["daily_snapshot"]
+    rows = daily["rows"]
+    day = datetime.fromisoformat(daily["data"]).strftime("%d/%m/%Y")
+    stamp = parse_iso(daily["collectedAt"]).astimezone(TZ).strftime("%d/%m %H:%M")
+    warning = daily.get("outdated") or data.get("daily_error")
+    _box(screen, top, x, height, width, "ULTIMA COLETA DIARIA", C_WARN)
+    _line(screen, top + 1, x + 2, f"ROTALOG | Ref. {day}" + (" | ATRASADA" if daily.get("outdated") else ""), width - 4, _cp(C_WARN))
+    _line(screen, top + 2, x + 2, f"Coletado {stamp}" + (" | aviso" if data.get("daily_error") else ""), width - 4, _cp(C_WARN if warning else C_DIM))
+    _line(screen, top + 3, x + 2, f"{'Equipe':<8} {'Serv.':>5} {'KM inf.':>8} {'KM aut.':>8}", width - 4, _cp(C_TITLE))
+    visible = max(0, height - 6)
+    offset = min(max(0, data["teams_scroll"]), max(0, len(rows) - visible))
+    for y, (team, services, km_informed, km_authorized) in enumerate(rows[offset:offset + visible], top + 4):
+        informed = f"{km_informed:.1f}".replace(".", ",")
+        authorized = f"{km_authorized:.1f}".replace(".", ",")
+        _line(screen, y, x + 2, f"{team:<8} {services:>5} {informed:>8} {authorized:>8}", width - 4, _cp(C_DEFAULT))
+    if not rows and visible:
+        _line(screen, top + 4, x + 2, "Sem equipes no resumo diario", width - 4, _cp(C_DIM))
+    _line(screen, top + height - 2, x + 2,
+          f"{offset + 1 if rows else 0}-{min(offset + visible, len(rows))}/{len(rows)} | Historico; sem estado atual", width - 4, _cp(C_DIM))
+    return offset
+
+
 def _render_operational_panels(screen, last, data, top, height, width, now):
     split = width >= 144 and not data["teams_expanded"]
     show_teams = split or data["active_panel"] == "teams"
@@ -69,11 +93,16 @@ def _render_operational_panels(screen, last, data, top, height, width, now):
         _line(screen, top + height - 2, 2, f"{offset + 1}-{min(offset + visible, len(lines))}/{len(lines)}  Tab: quadro | Setas/Pg: rolar", left_width - 4, _cp(C_DIM))
     if show_teams:
         x = left_width + 1 if split else 0
+        if use_daily(data, last, now) and height >= 7:
+            offsets["teams_scroll"] = _render_daily_panel(screen, data, top, x, height, right_width)
+            return offsets
         _box(screen, top, x, height, right_width, "SITUACAO ATUAL", C_TITLE if data["active_panel"] == "teams" else C_DIM)
         rows = _team_current_rows(data["team_snapshots"], now)
         stamp = parse_iso(data["teams_collected_at"]) if data["teams_collected_at"] else None
         stamp_text = stamp.astimezone(TZ).strftime("%H:%M:%S") if stamp else "—"
         stale = stamp and now - stamp > timedelta(seconds=data["teams_stale_seconds"])
+        if stale:
+            stamp_text = stamp.astimezone(TZ).strftime("%d/%m %H:%M:%S")
         note = "Indice indisponivel" if data["teams_error"] else f"Desatualizado | {stamp_text}" if stale else f"{len(rows)} equipes | Coleta {stamp_text}"
         _line(screen, top + 1, x + 2, note, right_width - 4, _cp(C_WARN if data["teams_error"] or stale else C_DIM))
         _line(screen, top + 2, x + 2, f"{'Equipe':<8} {'Situacao':<9} {'Hora':<8} C/E", right_width - 4, _cp(C_TITLE, terminal.curses.A_BOLD))
@@ -84,5 +113,8 @@ def _render_operational_panels(screen, last, data, top, height, width, now):
             _line(screen, row, x + 2, f"{team:<8} {label:<9} {hour:<8} {queue}", right_width - 4, _cp(color))
         if not rows:
             _line(screen, top + 3, x + 2, "Sem equipes no indice" if not data["teams_error"] else "Aguardando indice local", right_width - 4, _cp(C_DIM))
-        _line(screen, top + height - 2, x + 2, f"{offset + 1 if rows else 0}-{min(offset + visible, len(rows))}/{len(rows)} | C/E: fila", right_width - 4, _cp(C_DIM))
+        footer = f"{offset + 1 if rows else 0}-{min(offset + visible, len(rows))}/{len(rows)} | C/E: fila"
+        if (stale or data["teams_error"] or last.get("status") == "error") and not data.get("daily_snapshot"):
+            footer = "Sem coleta diaria local disponivel"
+        _line(screen, top + height - 2, x + 2, footer, right_width - 4, _cp(C_DIM))
     return offsets

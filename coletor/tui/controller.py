@@ -59,7 +59,8 @@ def _curses_main(screen, runner: LocalRotalogRunner | None, state: TuiState, out
             if key == 9:
                 with state.lock:
                     if state.teams_expanded:
-                        state.overview_group = (state.overview_group + 1) % 6
+                        if not state.uses_daily():
+                            state.overview_group = (state.overview_group + 1) % 6
                     else:
                         state.active_panel = "teams" if state.active_panel == "events" else "events"
                 continue
@@ -69,7 +70,7 @@ def _curses_main(screen, runner: LocalRotalogRunner | None, state: TuiState, out
                     step = 10 if key in (getattr(terminal.curses, "KEY_NPAGE", -1), getattr(terminal.curses, "KEY_PPAGE", -1)) else 1
                     if key in (getattr(terminal.curses, "KEY_UP", -1), getattr(terminal.curses, "KEY_PPAGE", -1)):
                         step = -step
-                    if state.teams_expanded:
+                    if state.teams_expanded and not state.uses_daily():
                         index = state.overview_group
                         state.overview_scroll[index] = max(0, state.overview_scroll[index] + step)
                     else:

@@ -132,6 +132,7 @@ def main() -> int:
         )
 
     state.storage = storage.payload()
+    state.company = args.empresa
 
     if terminal.curses is None:
         print(

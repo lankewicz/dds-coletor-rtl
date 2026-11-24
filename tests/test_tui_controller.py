@@ -63,3 +63,12 @@ class TuiControllerTests(unittest.TestCase):
         self.assertEqual(state.overview_group, 1)
         self.assertEqual(state.overview_scroll[:2], [1, 10])
         self.assertEqual(state.teams_scroll, 0)
+
+    def test_expanded_daily_table_scrolls_teams_instead_of_live_overview(self):
+        state = TuiState(viewer_mode=True)
+        state.daily_snapshot = {"data": "2026-11-23"}
+        state.last_result = {"status": "error"}
+        self.run_keys(state, [ord("e"), 258, 9, 338])
+        self.assertEqual(state.teams_scroll, 11)
+        self.assertEqual(state.overview_group, 0)
+        self.assertEqual(state.overview_scroll, [0] * 6)

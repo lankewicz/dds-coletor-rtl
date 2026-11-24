@@ -39,6 +39,9 @@ class TuiState:
         self.show_details = False
         self.details_scroll = 0
         self.team_snapshots: dict = {}
+        self.company = None
+        self.daily_snapshot: dict = {}
+        self.daily_error = None
         self.teams_collected_at = None
         self.teams_error = "Aguardando indice local"
         self.active_panel = "events"
@@ -58,3 +61,11 @@ class TuiState:
             peak_interval=self.peak_interval,
             offpeak_interval=self.offpeak_interval,
         )
+
+    def uses_daily(self) -> bool:
+        from .daily import use_daily
+        return use_daily({"daily_snapshot": self.daily_snapshot,
+                          "teams_collected_at": self.teams_collected_at,
+                          "teams_error": self.teams_error,
+                          "teams_stale_seconds": max(300, self.get_interval() * 2.5)},
+                         self.last_result or {}, datetime.now(TZ))

@@ -73,6 +73,48 @@ def sample_state():
 
 
 class TuiLayoutTests(unittest.TestCase):
+    def test_daily_fallback_shows_metrics_and_dates_instead_of_current_status(self):
+        state = self.team_state()
+        state.last_result = {"status": "error", "error": "Timeline vazia"}
+        state.history = [state.last_result]
+        state.daily_snapshot = {"data": "2026-10-21", "collectedAt": "2026-10-22T05:00:00-03:00",
+                                "outdated": True, "rows": [("E9000", 12, 145.3, 130.0)]}
+        for width in (80, 180):
+            state.active_panel = "teams"
+            text = "\n".join(self.render(state, width=width))
+            self.assertIn("ULTIMA COLETA DIARIA", text)
+            self.assertIn("21/10/2026", text)
+            self.assertIn("Coletado 22/10 05:00", text)
+            self.assertIn("E9000", text)
+            self.assertIn("145,3", text)
+            self.assertNotIn("SITUACAO ATUAL", text)
+            self.assertNotIn("C/E: fila", text)
+            self.assertNotIn("E2000", text)
+        state.teams_expanded = True
+        expanded = "\n".join(self.render(state))
+        self.assertIn("ULTIMA COLETA DIARIA", expanded)
+        self.assertNotIn("DESLOCAMENTO", expanded)
+
+    def test_last_valid_collection_remains_visible_after_days_of_errors(self):
+        state = self.team_state()
+        state.last_result = {"status": "error", "error": "Timeline vazia " * 30,
+                             "finishedAt": "2026-10-22T10:00:00-03:00"}
+        state.history = [state.last_result]
+        text = "\n".join(self.render(state, height=24, width=80))
+        self.assertIn("Ultima coleta valida: 20/10/2026 09:30:00", text)
+        wide = "\n".join(self.render(state))
+        self.assertIn("Desatualizado | 20/10 09:30:00", wide)
+
+    def test_last_valid_collection_unknown_is_explicit(self):
+        state = sample_state()
+        state.last_result = {"status": "error"}
+        state.history = [state.last_result]
+        self.assertIn("Ultima coleta valida: sem registro", "\n".join(self.render(state)))
+
+    def test_last_valid_collection_falls_back_to_success_log(self):
+        text = "\n".join(self.render(sample_state()))
+        self.assertIn("Ultima coleta valida: 14/10/2026 16:10:18", text)
+
     def team_state(self):
         state = sample_state()
         state.teams_error = None

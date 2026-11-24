@@ -312,6 +312,21 @@ normais são retomados usando a resposta já obtida. A TUI mostra o intervalo e 
 próxima tentativa (1/6 a 6/6), inclusive no visualizador passivo. O ciclo normal
 após a pausa continua podendo sincronizar pendências existentes.
 
+Na TUI, quando a coleta atual falha ou o índice do tempo real está desatualizado,
+o quadro de equipes passa a exibir **Última coleta diária**, se houver histórico
+local válido. O resumo vem de `rotalog/quilometragem/diario/AAAA-MM-DD.json.gz`,
+é relido a cada 30 segundos e mostra a referência, a data da coleta, serviços e
+quilômetros informados/autorizados por equipe. A medição oficial da tela de
+equipes tem prioridade sobre a listagem de eventos; turnos do mesmo veículo são
+somados. Não são exibidos estado operacional ou fila como se fossem atuais.
+Arquivos de outra empresa, incompletos ou corrompidos não são usados. Se o dia
+mais recente estiver inválido, o último dia válido é exibido com aviso; referências
+anteriores a ontem são marcadas como atrasadas. Sem diário válido, o último estado
+do tempo real permanece sinalizado como desatualizado. Uma coleta válida e recente
+restaura automaticamente o quadro de situação atual, inclusive no modo expandido.
+Essa leitura é exclusivamente local e não altera o índice do coletor ou os arquivos
+publicados no Firebase.
+
 Em vez de atualizar cada equipe individualmente (o que geraria centenas de acessos ao Firebase Storage), o sistema consolida todos os serviços e quilometragens em um **ÚNICO arquivo diário** compactado em GZIP filtrado pelos contratos monitorados (`4600026988` e `4600025149`):
 
 * **Estrutura do Arquivo Diário**:

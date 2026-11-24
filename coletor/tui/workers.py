@@ -149,6 +149,7 @@ def _team_state_worker(state: TuiState, output_dir: Path) -> None:
     """Atualiza apenas o índice local, preservando a última leitura em falhas."""
     from coletor.storage import load_json_with_status
     path = output_dir / "rotalog/equipes/current/index.json.gz"
+    next_daily_read = 0
     while not state.stop.is_set():
         try:
             if state.storage:
@@ -171,6 +172,17 @@ def _team_state_worker(state: TuiState, output_dir: Path) -> None:
         except (OSError, ValueError) as exc:
             with state.lock:
                 state.teams_error = str(exc)
+        if time.monotonic() >= next_daily_read:
+            from .daily import load_latest_daily
+            try:
+                if state.storage:
+                    assert_available(StorageSelection(**state.storage))
+                daily, error = load_latest_daily(output_dir, state.company or os.getenv("DDS_EMPRESA_PADRAO", "ChicoEletro"), datetime.now(TZ))
+            except OSError as exc:
+                daily, error = {}, str(exc)
+            with state.lock:
+                state.daily_snapshot, state.daily_error = daily, error
+            next_daily_read = time.monotonic() + 30
         state.stop.wait(2)
 
 
