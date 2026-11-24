@@ -125,6 +125,11 @@ def _render(screen, runner: LocalRotalogRunner | None, state: TuiState) -> None:
     tag_intervalo = f"{cur_interval}s [PICO 07-20h]" if is_peak else f"{cur_interval}s [NOTURNO 20-07h]"
     if state.interval_seconds is not None:
         tag_intervalo = f"{state.interval_seconds}s [FIXO]"
+    retry = (data.get("last_result") or {})
+    if retry.get("retryDelaySeconds"):
+        attempt = retry.get("nextQuickRetry", 0)
+        tag_intervalo = (f"30s [TENTATIVA RAPIDA {attempt}/6]" if attempt
+                        else "180s [PAUSA ENTRE TENTATIVAS]")
 
     _line(screen, 1, 0, f"Empresa: {empresa_str}", width, _cp(C_ACCENT))
     _line(screen, 1, 24, f"Intervalo: {tag_intervalo}", width - 24, _cp(C_DEFAULT))

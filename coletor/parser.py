@@ -893,6 +893,10 @@ def _forcar_cliques_timeline_tempo_real(
     return cliques_by_idx
 
 
+class EmptyTimelineError(RuntimeError):
+    """A página respondeu, mas não trouxe eventos reconhecidos."""
+
+
 def extrair_dados_tempo_real(
     crawler: CrawlerRotalog | None = None,
     max_tentativas: int = 3,
@@ -952,7 +956,7 @@ def extrair_dados_tempo_real(
 
     equipas_map: dict[str, dict[str, typing.Any]] = {}
     if not raw_items:
-        raise RuntimeError("Timeline sem eventos reconhecidos; preservar último snapshot.")
+        raise EmptyTimelineError("Timeline sem eventos reconhecidos; preservar último snapshot.")
 
     servicos_ignorados = carregar_servicos_ignorados()
 

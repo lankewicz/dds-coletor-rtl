@@ -300,6 +300,18 @@ python tui.py --view
 ```
 ### Coleta de Quilometragem Diária e Mensal (Arquivo Único / Custo Mínimo)
 
+Quando a página de tempo real responde com uma timeline sem eventos reconhecidos,
+o coletor preserva o último estado válido e faz seis novas tentativas, com espera
+de 30 segundos após o término de cada coleta. Persistindo a resposta vazia, espera
+180 segundos antes do próximo ciclo normal e repete a sequência. Dados válidos ou
+outro tipo de erro encerram a sequência e restauram o intervalo configurado.
+As tentativas rápidas sem dados válidos consultam somente o ROTALOG e gravam logs
+locais: não consultam o Firebase/GCS, não enviam pendências nem publicam a torre.
+Se uma tentativa rápida recuperar dados válidos, o processamento e a publicação
+normais são retomados usando a resposta já obtida. A TUI mostra o intervalo e a
+próxima tentativa (1/6 a 6/6), inclusive no visualizador passivo. O ciclo normal
+após a pausa continua podendo sincronizar pendências existentes.
+
 Em vez de atualizar cada equipe individualmente (o que geraria centenas de acessos ao Firebase Storage), o sistema consolida todos os serviços e quilometragens em um **ÚNICO arquivo diário** compactado em GZIP filtrado pelos contratos monitorados (`4600026988` e `4600025149`):
 
 * **Estrutura do Arquivo Diário**:

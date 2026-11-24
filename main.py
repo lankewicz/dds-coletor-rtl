@@ -37,7 +37,7 @@ from coletor.historico import (
     varrer_mes,
     varrer_mes_anterior,
 )
-from coletor.parser import extrair_dados_tempo_real
+from coletor.parser import EmptyTimelineError, extrair_dados_tempo_real
 from coletor.shift_policy import apply_shift_limit, preserve_closed_shift, reopen_returning_team
 from coletor.team_registry import TeamRegistry
 from coletor.storage import (
@@ -135,6 +135,7 @@ class LocalRotalogRunner:
         self.exec_log = None
 
         self.processing_led = ProcessingLed()
+        self._empty_retry_count = 0
 
         if self.enable_firebase:
             self.firebase_store, self.team_repo, self.exec_log = _init_firebase_storage(self.empresa)
@@ -807,13 +808,60 @@ class LocalRotalogRunner:
             "dailySyncFailed": daily_sync["failed"],
             **storage_metrics,
         }
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.log_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(result, ensure_ascii=False) + "\n")
+        self._record_cycle(result)
         return result
+
+    def _record_cycle(self, result: dict) -> None:
+        if result.get("errorCode") == "EMPTY_TIMELINE":
+            self._empty_retry_count = self._empty_retry_count % 7 + 1
+            result["retryDelaySeconds"] = 30 if self._empty_retry_count <= 6 else 180
+            result["nextQuickRetry"] = self._empty_retry_count if self._empty_retry_count <= 6 else 0
+        else:
+            self._empty_retry_count = 0
+        record_execution_log(self.log_path, result)
+
+    def _probe_empty_timeline(self) -> tuple[tuple[list, list] | None, dict | None]:
+        """Tentativa rápida: somente portal e arquivos locais até obter dados válidos."""
+        started_at = datetime.now(TZ)
+        started_clock = time.perf_counter()
+        try:
+            index, status = load_json_with_status(self.index_path, {})
+            if status not in ("ok", "missing") or (index.get("company") and company_key(index["company"]) != self.company_key):
+                raise ValueError("Índice local indisponível ou de outra empresa; aguardar ciclo normal")
+            previous = canonicalize_team_snapshots(index.get("equipes") or {})
+            unresolved_groups = []
+            teams = extrair_dados_tempo_real(
+                identificador_para_equipe=build_identifier_map(previous),
+                snapshots_anteriores=previous,
+                unresolved_groups=unresolved_groups,
+            )
+            return (teams, unresolved_groups), None
+        except Exception as exc:
+            result = {
+                "status": "error", "startedAt": started_at.isoformat(),
+                "finishedAt": datetime.now(TZ).isoformat(),
+                "durationSeconds": round(time.perf_counter() - started_clock, 3),
+                "error": str(exc),
+                "errorCode": "EMPTY_TIMELINE" if isinstance(exc, EmptyTimelineError) else "QUICK_RETRY_FAILED",
+                "quickRetry": True, "firebaseUploaded": False,
+                "firebaseSyncStatus": "skipped", "events": {"local": [], "cloud": []},
+            }
+            self._record_cycle(result)
+            return None, result
 
     def run_once(self) -> dict:
         """Executa um ciclo mantendo o LED vermelho até a última gravação local."""
+        prefetched_teams = None
+        if 1 <= self._empty_retry_count <= 6:
+            self._set_runtime_status("COLETANDO", f"Timeline sem eventos: tentativa rápida {self._empty_retry_count}/6")
+            self.processing_led.processing()
+            try:
+                prefetched_teams, failed = self._probe_empty_timeline()
+                if failed is not None:
+                    return failed
+            finally:
+                self._set_runtime_status("AGUARDANDO", "Aguardando próximo ciclo")
+                self.processing_led.idle()
         input_status = None
         if self.torre_inputs is not None:
             try:
@@ -825,7 +873,7 @@ class LocalRotalogRunner:
         self.processing_led.processing()
         try:
             with self.team_registry.exclusive_update():
-                result = self._run_once()
+                result = self._run_once(prefetched_teams) if prefetched_teams is not None else self._run_once()
                 if input_status is not None:
                     result["torreInputs"] = input_status
                 if self.torre_composer is not None:
@@ -861,7 +909,7 @@ class LocalRotalogRunner:
             self._set_runtime_status("AGUARDANDO", "Aguardando próximo ciclo")
             self.processing_led.idle()
 
-    def _run_once(self) -> dict:
+    def _run_once(self, prefetched_teams: tuple[list, list] | None = None) -> dict:
         started_clock = time.perf_counter()
         started_at = datetime.now(TZ)
         daily_sync = {"uploaded": 0, "failed": 0, "pending": 0}
@@ -950,8 +998,8 @@ class LocalRotalogRunner:
             previous_document["identitySource"] = previous_identity["identitySource"]
 
         try:
-            unresolved_groups: list[dict] = []
-            teams = extrair_dados_tempo_real(
+            unresolved_groups: list[dict] = prefetched_teams[1] if prefetched_teams is not None else []
+            teams = prefetched_teams[0] if prefetched_teams is not None else extrair_dados_tempo_real(
                 identificador_para_equipe=build_identifier_map(previous),
                 snapshots_anteriores=previous,
                 unresolved_groups=unresolved_groups,
@@ -1194,6 +1242,7 @@ class LocalRotalogRunner:
                 "finishedAt": datetime.now(TZ).isoformat(),
                 "durationSeconds": round(time.perf_counter() - started_clock, 3),
                 "error": str(exc),
+                "errorCode": "EMPTY_TIMELINE" if isinstance(exc, EmptyTimelineError) else "COLLECTION_FAILED",
                 "firebaseUploaded": False,
                 "firebaseSyncStatus": "pending" if self.firebase_enabled else "disabled",
                 "dailySyncPending": daily_sync["pending"],
@@ -1207,7 +1256,7 @@ class LocalRotalogRunner:
             }
             LOG.exception("Falha no ciclo de coleta")
 
-        record_execution_log(self.log_path, result)
+        self._record_cycle(result)
         return result
 
 
@@ -1504,7 +1553,7 @@ def main() -> int:
                 offpeak_interval=args.offpeak_interval,
             )
 
-        time.sleep(max(1, cycle_interval - elapsed))
+        time.sleep(result.get("retryDelaySeconds", max(1, cycle_interval - elapsed)))
 
 
 if __name__ == "__main__":

@@ -41,7 +41,7 @@ def _worker(runner: LocalRotalogRunner, state: TuiState) -> None:
             state.last_result = result
             now = datetime.now(TZ)
             state.history = _today_entries([*state.history, result], now.date().isoformat())
-            interval = state.get_interval(now)
+            interval = result.get("retryDelaySeconds", state.get_interval(now))
             state.next_run = now + timedelta(seconds=interval)
             if result.get("status") == "error":
                 state.status_message = f"FALHA NO CICLO: {result.get('error') or 'Erro'}"
@@ -71,7 +71,7 @@ def _update_viewer_state_timing(state: TuiState) -> None:
         if fin_dt.tzinfo is None:
             fin_dt = fin_dt.replace(tzinfo=TZ)
         now = datetime.now(TZ)
-        current_interval = state.get_interval(now)
+        current_interval = state.last_result.get("retryDelaySeconds", state.get_interval(now))
         state.next_run = fin_dt + timedelta(seconds=current_interval)
 
         elapsed = (now - fin_dt).total_seconds()
