@@ -14,6 +14,7 @@ from .equipes import normalize_team_key
 from .historico_parsing import (
     extrair_data_iso_de_evento as _extract_event_date,
     parse_float_br,
+    extract_source_diary_id,
     parse_iso_datetime as _parse_iso_datetime,
 )
 from .parser import formatar_protocolo_copel
@@ -277,6 +278,7 @@ def enriquecer_cadastro_permanente_equipes(
                 operational_date=day_iso,
                 base=row.get("Agencia") or row.get("Agência") or "",
                 tablet=row.get("Tablet") or "",
+                source_diary_id=row.get("sourceDiaryId") or extract_source_diary_id(row.get("Diário URL")),
             )
             if team_id:
                 enriched_teams.add(team_id)

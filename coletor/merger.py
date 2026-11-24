@@ -325,6 +325,9 @@ def _merge_service_records(team_key: str, records: list[dict[str, typing.Any]]) 
         _validar_execucao(merged, merged.get("observadoEm"))
         if old.get("statusAtual") == "CONCLUSAO" and item.get("statusAtual") in ("EXECUCAO", "DESLOCAMENTO"):
             merged["statusAtual"] = "CONCLUSAO"
+        if merged.get("statusAtual") == "CONCLUSAO" and merged.get("interrupcao"):
+            merged.pop("interrupcao", None)
+            merged.pop("semExecucaoType", None)
         tipos = list(old.get("historicoTipos") or [])
         for tipo in (old.get("tipo"), item.get("tipo")):
             if tipo and tipo not in tipos:
@@ -435,24 +438,33 @@ def merge_daily_document(
     activity_raw = current.get("atividadeAtual") or {}
     current_service = compact_service(team_key, day, activity_raw, current.get("updatedAtIso") or current.get("updatedAt")) if activity_raw else None
 
-    # Garantia de unicidade de atividade ativa
-    active_in_list = [srv for srv in services if srv.get("statusAtual") in ("EXECUCAO", "DESLOCAMENTO")]
-    if active_in_list:
+    def is_current_service(service):
         if current_service is None:
-            for srv in active_in_list:
-                srv["statusAtual"] = "REDIRECIONADO"
-                srv["semExecucaoType"] = "REDIRECIONADO"
-                srv["fimExecucao"] = srv.get("fimExecucao") or srv.get("inicioExecucao") or srv.get("inicioDeslocamento")
-                srv["retorno"] = srv["fimExecucao"]
-        elif len(active_in_list) > 1:
-            active_most_recent = max(active_in_list, key=lambda item: str(item.get("inicioDeslocamento") or item.get("inicioExecucao") or ""))
-            for srv in active_in_list:
-                if srv != active_most_recent:
-                    proximo_ini = active_most_recent.get("inicioDeslocamento") or active_most_recent.get("inicioExecucao")
-                    srv["statusAtual"] = "REDIRECIONADO"
-                    srv["semExecucaoType"] = "REDIRECIONADO"
-                    srv["fimExecucao"] = proximo_ini or srv.get("inicioExecucao") or srv.get("inicioDeslocamento")
-                    srv["retorno"] = srv["fimExecucao"]
+            return False
+        protocol = service.get("protocolo")
+        current_protocol = current_service.get("protocolo")
+        if protocol and current_protocol and protocol != current_protocol:
+            return False
+        return service.get("serviceId") == current_service.get("serviceId")
+
+    # Uma nova SS evidencia a interrupção da anterior; a ausência, sozinha,
+    # não comprova retirada. Não criar conclusão ou retorno para a SS interrompida.
+    active_in_list = [srv for srv in services if srv.get("statusAtual") in ("EXECUCAO", "DESLOCAMENTO")]
+    if current_service and current_service.get("statusAtual") in ("DESLOCAMENTO", "EXECUCAO"):
+        next_start = current_service.get("inicioDeslocamento") or current_service.get("inicioExecucao")
+        for srv in active_in_list:
+            start = srv.get("inicioDeslocamento") or srv.get("inicioExecucao")
+            if is_current_service(srv) or not start or not next_start or start >= next_start:
+                continue
+            status = "RETIRADO_PELO_COD" if srv["statusAtual"] == "EXECUCAO" else "DESLOCAMENTO_ISOLADO"
+            srv["statusAtual"] = status
+            srv["semExecucaoType"] = status
+            srv["interrupcao"] = {
+                "inferida": True,
+                "observadoEm": current.get("updatedAtIso") or current.get("updatedAt"),
+                "servicoSeguinteId": current_service.get("serviceId"),
+                "protocoloSeguinte": current_service.get("protocolo"),
+            }
 
     # Fila de pendências (usada para registrar filaNaAbertura se o turno estiver abrindo)
     fila_total = int(current.get("ssPendentesCount") or 0)
@@ -494,8 +506,8 @@ def merge_daily_document(
     else:
         fila_na_abertura = None
 
-    # Histórico de serviços concluídos / redirecionados
-    historico = [srv for srv in services if srv.get("statusAtual") in ("CONCLUSAO", "REDIRECIONADO", "CANCELADO")]
+    # Preservar também SS ausentes da coleta, sem classificá-las como retiradas.
+    historico = [srv for srv in services if not is_current_service(srv)]
 
     prev_version = int(previous.get("version") or (previous.get("current") or {}).get("version") or 0)
     prev_date = str(previous.get("date") or "")

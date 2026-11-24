@@ -155,6 +155,62 @@ chegou uma nova coleta. A aprovacao manual e a decisao de negocio.
 > - Ao final, documentar os arquivos/API alterados, o fluxo de aprovacao,
 >   eventuais migracoes e os comandos/resultados de validacao.
 
+## Ajustes pendentes no DDS/Site - registrados em 10/11/2026
+
+Esta lista registra trabalho futuro nos consumidores. Nesta etapa, o trabalho
+de implementacao continua apenas no coletor. Os itens abaixo ainda precisam
+ser implementados e validados nos repositorios do DDS/Site.
+
+### Historico de SS interrompidas
+
+Contrato de campos e regra de deteccao:
+[README_INTEGRACAO_DDS.md - SS interrompidas](README_INTEGRACAO_DDS.md#ss-interrompidas-pela-entrada-de-outra-ss).
+
+- [ ] Adaptar o leitor/adaptador de diarios e as APIs que entregam esses
+  registros ao site e ao aplicativo, preservando `statusAtual`,
+  `semExecucaoType` e o objeto `interrupcao`.
+- [ ] Exibir `DESLOCAMENTO_ISOLADO` como **Deslocamento Isolado** e
+  `RETIRADO_PELO_COD` como **Retirado pelo COD**, no historico, detalhes e
+  filtros de SS. Usar os valores publicados pelo coletor; nao tentar deduzir
+  novamente a retirada no consumidor.
+- [ ] Mostrar que a classificacao e inferida quando `interrupcao.inferida`
+  for verdadeira. Apresentar `interrupcao.observadoEm` como horario em que a
+  troca foi observada, sem chama-lo de horario confirmado da retirada.
+- [ ] Vincular a SS seguinte por `servicoSeguinteId` e `protocoloSeguinte`,
+  respeitando a equipe e a empresa do registro.
+- [ ] Preservar os horarios recebidos de deslocamento e execucao. Mostrar
+  conclusao/retorno ausentes como nao informados, sem preencher com a coleta
+  ou com o inicio da proxima SS e sem calcular duracao final ficticia.
+- [ ] Excluir ambos os estados dos contadores de servicos concluidos e dos
+  indicadores que exigem conclusao. Se forem mostrados totais de interrupcoes,
+  identifica-los separadamente.
+- [ ] Nao apresentar uma SS ausente da atividade atual como ainda ativa apenas
+  porque seu ultimo estado no historico e deslocamento/execucao. O simples
+  desaparecimento nao comprova retirada; consultar `ordensServico.atual` para
+  a atividade atual.
+- [ ] Atualizar o registro existente quando uma coleta posterior trouxer a
+  conclusao, removendo a indicacao inferida e evitando duplicar a SS ou os
+  contadores. Preservar compatibilidade com diarios antigos e `REDIRECIONADO`;
+  nao converter esse estado antigo automaticamente para um dos novos rotulos.
+- [ ] Conferir a disponibilidade dos diarios publicados antes da integracao.
+  O indice compacto, sozinho, nao contem todo o historico de interrupcoes.
+- [ ] Testar SS anterior em deslocamento e em execucao, seguida por outra SS
+  em deslocamento ou execucao; comercial, emergencial e Emergencia - Generica
+  de EP; desaparecimento sem substituta; conclusao posterior; repeticao da
+  leitura; contadores; dados antigos e isolamento por empresa.
+
+### Mudancas de equipe e torre
+
+- [ ] Implementar o fluxo de sugestoes, aprovacao/rejeicao, estado oficial e
+  auditoria descrito neste documento, com autorizacao no servidor.
+- [ ] Verificar quais campos sao efetivamente publicados antes de construir
+  os filtros: o coletor calcula diferencas de eletricistas, base e veiculo;
+  tablet e armazenado, mas ainda nao gera `assignmentChanges`, e contrato
+  ainda nao consta em `assignmentHistory`.
+- [ ] Validar a composicao local da torre com cadastro, historico DDS e dados
+  reais antes de trocar sua fonte, conforme `README_API_TORRE.md` e
+  `CONTRATO_TORRE.md`. Consolidar o contrato da rota utilizada pelos clientes.
+
 ## Nota sobre o estado atual
 
 O coletor ja grava observacoes e calcula `assignmentChanges` no cadastro

@@ -8,6 +8,17 @@ Projetado especificamente para rodar em hardware de baixo consumo como o **Orang
 
 ## 1. Arquitetura da Solução
 
+### Limite de duração do turno
+
+Turnos abertos há **mais de 18 horas** são considerados fechados no próximo
+ciclo de coleta, inclusive quando a equipe não aparece mais na coleta. O fim
+é estimado em início + 18 horas, com motivo `LIMITE_18_HORAS`; isso não conclui
+automaticamente as OS. O diário e a fila de sincronização registram o fechamento.
+Se o diário não puder ser recuperado, somente o índice é fechado e a falha é registrada.
+Após esse fechamento, a abertura antiga só é substituída por um novo comando
+**T reconhecido como abertura**, posterior ao fim do turno anterior. Reaparecer
+na coleta ou ter uma OS ativa, sem esse comando, mantém o turno fechado.
+
 ```text
 +-------------------------------------------------------------+
 |                      REDE LOCAL (EDGE)                      |
@@ -77,7 +88,7 @@ identidades já existem no cadastro.
    - **Disco Local (`dados-local`)**: Grava todas as etapas (deslocamento, execução, intervalo, etc.) com fidelidade cirúrgica.
    - **Firebase Storage**:
      - `index.json.gz`: Enviado apenas quando os dados operacionais mudam. Horário de coleta e versão interna não provocam envio.
-     - `daily/<data>/<equipe>.json.gz`: Enviado na **abertura do turno**, quando a equipe **conclui um serviço**, quando **fecha o turno** e quando um serviço concluído recebe uma correção posterior.
+     - `daily/<data>/<equipe>.json.gz`: Enviado na **abertura do turno**, quando a equipe **conclui um serviço**, quando **fecha o turno** e quando um serviço concluído recebe uma correção posterior. Inclusões, correções e remoções das classificações **Deslocamento Isolado** e **Retirado pelo COD** também acionam a fila de envio, inclusive com o turno aberto.
    - **Economia**: O volume mensal para 115 equipes fica em **~40.000 gravações**, ficando **100% coberto pela cota gratuita de 50.000 gravações do Google Cloud Storage (Custo: R$ 0,00)**.
 
 ---
@@ -341,9 +352,20 @@ registra diferenças calculadas automaticamente entre observações consecutivas
 por campo, com valor anterior e novo; por exemplo, uma troca de veículo é
 registrada mesmo que a composição da equipe permaneça igual. Esse diff é uma
 sugestão baseada na coleta, não uma aprovação manual nem um registro de decisão.
-Reprocessar o mesmo dia atualiza a observação existente em vez de duplicá-la.
-Os dias já disponíveis passam a ser reconstruídos à medida que a reconciliação
-histórica os consulta novamente.
+Quando disponível, `sourceDiaryId` preserva o `id` do link do diário no ROTALOG
+em `assignmentHistory` e `crewHistory`. O mesmo ID atualiza a observação mesmo
+se o horário ou a referência forem corrigidos; IDs diferentes permanecem
+separados, inclusive com horários iguais. O ID é extraído do diário atual,
+nunca do diário antigo usado para reaproveitar nomes e matrículas.
+Registros legados sem ID só são associados por referência exata ou sobreposição
+quando há um único candidato compatível. Sem ID e sem correspondência segura,
+a nova observação é preservada separadamente; não há deduplicação garantida.
+A adoção do identificador vale para observações recebidas pelas próximas
+coletas, quando a origem fornecer o ID. Os dados antigos continuam com o
+tratamento atual, sem migração em massa, reconstrução obrigatória ou criação
+de IDs retroativos. A reconciliação histórica existente continua funcionando;
+se uma nova consulta trouxer o ID real e corresponder de forma única a uma
+observação antiga, o cadastro pode preservá-lo nessa atualização normal.
 
 O fluxo pretendido para o site e o aplicativo DDS é descrito em
 [INSTRUCOES_SITE_DDS_ALTERACOES_EQUIPES.md](./INSTRUCOES_SITE_DDS_ALTERACOES_EQUIPES.md):

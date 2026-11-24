@@ -84,7 +84,56 @@ O leitor do DDS adapta o diário v2 para `services`, `turno` e `current`, usados
 pelos consumidores existentes. O coletor não precisa duplicar esses campos
 legados por causa desta remoção da raspagem.
 
+### SS interrompidas pela entrada de outra SS
+
+Quando uma nova SS assume a atividade da equipe em deslocamento ou execução,
+sem conclusão recebida da SS anterior, o histórico usa os seguintes valores
+de `statusAtual` e `semExecucaoType`, conforme a etapa anterior:
+
+| Etapa anterior | Valor publicado | Rótulo para apresentação |
+| --- | --- | --- |
+| Deslocamento | `DESLOCAMENTO_ISOLADO` | Deslocamento Isolado |
+| Execução | `RETIRADO_PELO_COD` | Retirado pelo COD |
+
+A regra vale para comerciais e emergenciais, incluindo Emergência - Genérica
+das equipes EP. A próxima SS deve ter início posterior ao da anterior.
+O objeto `interrupcao` informa `inferida: true`, `observadoEm`,
+`servicoSeguinteId` e `protocoloSeguinte`. Não são criados horários de
+execução, conclusão ou retorno para justificar a interrupção; esses registros
+não contam como serviços concluídos. O horário observado da troca não deve
+ser apresentado como horário confirmado de retirada.
+
+O simples desaparecimento de uma SS, sem outra assumir, preserva o último
+estado recebido no histórico e não a classifica como retirada. Uma conclusão
+recebida posteriormente substitui a classificação inferida. O consumidor DDS
+deve reconhecer os novos valores e apresentar os rótulos acima.
+
+Inclusões, correções e remoções dessas classificações acionam a fila persistente
+de publicação do diário com o motivo `alteracao_interrupcao`, mesmo com turno
+aberto. Falhas são retomadas após reiniciar; leituras sem mudança operacional
+não provocam novo envio. Uma conclusão posterior também aciona a publicação.
+
+Os ajustes pendentes de leitura, apresentação, contadores e testes no DDS/Site
+estão registrados em
+[INSTRUCOES_SITE_DDS_ALTERACOES_EQUIPES.md](INSTRUCOES_SITE_DDS_ALTERACOES_EQUIPES.md#ajustes-pendentes-no-ddssite---registrados-em-10112026).
+Sua implementação fica para uma etapa posterior; o escopo atual é o coletor.
+
 ## Datas e mudanças de status
+
+No cadastro permanente, `assignmentHistory` e `crewHistory` podem conter
+`sourceDiaryId`, extraído do `id` do link do diário ROTALOG. Esse identificador
+tem prioridade sobre horários para atualizar observações. Diários de IDs
+diferentes permanecem separados. O campo é opcional em dados antigos; não deve
+ser confundido com `turnoId`, que identifica turnos no histórico operacional.
+Sem o ID na origem, a associação continua limitada a correspondências únicas
+por referência ou sobreposição. Uma correção posterior no mesmo diário atualiza
+a observação existente, sem representar decisão ou aprovação manual.
+
+A preparação é para as próximas coletas. O histórico antigo continua com o
+tratamento atual; não há migração em massa nem geração de IDs retroativos.
+O consumidor deve aceitar registros com e sem `sourceDiaryId`. A reconciliação
+normal pode acrescentar o ID real quando ele vier da origem e houver uma
+correspondência única com a observação existente.
 
 Use `AAAA-MM-DD` para a data do diário e ISO 8601 com fuso para os horários
 completos, por exemplo `2026-10-08T17:00:00-03:00`.

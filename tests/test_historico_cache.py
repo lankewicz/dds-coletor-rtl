@@ -118,6 +118,17 @@ class HistoricalCacheTests(unittest.TestCase):
         self.assertEqual("001234", row["Eletricista 1 Registro"])
         self.assertEqual("RENNA NOME COMPLETO", row["Eletricista 1 Nome"])
         self.assertEqual("AGÊNCIA TESTE", row["Agência Nome completo"])
+        self.assertEqual("123", row["sourceDiaryId"])
+
+    def test_current_diary_id_is_not_overwritten_by_cached_id(self):
+        row = {
+            "Veiculo": "E3C02", "Contrato": "4600026988", "Agencia": "BSCCEL",
+            "Data Referencia - Turno": "14/09/2026 | 08:05 - 18:44",
+            "sourceDiaryId": "456",
+        }
+        scraper = RotalogEquipesScraper(session=Mock())
+        scraper._enrich_team_details([row], "view-state", cached_turnos=[unique_record()])
+        self.assertEqual(row["sourceDiaryId"], "456")
 
     def test_ambiguous_team_details_fall_back_to_portal(self):
         row = {

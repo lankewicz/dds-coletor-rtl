@@ -9,6 +9,31 @@ from main import LocalRotalogRunner
 
 
 class DailySyncQueueTests(unittest.TestCase):
+    def test_absent_expired_shift_recovers_full_daily_and_enqueues_close(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from coletor.storage import compactar_equipe_para_index
+        from coletor.transitions import changed_fields
+
+        self.document["jornada"]["turno"]["inicio"] = "2026-09-14T07:00:00-03:00"
+        self.document["ordensServico"]["historico"] = [{"serviceId": "preserved"}]
+        write_json(self.daily_path, self.document)
+        index = {self.team_key: compactar_equipe_para_index(self.document)}
+        now = datetime(2026, 11, 23, 10, tzinfo=ZoneInfo("America/Sao_Paulo"))
+        prepared = self.runner._apply_shift_limits(index, [], now)
+        self.assertEqual(len(prepared), 1)
+        key, day, path, old, closed = prepared[0]
+        self.assertEqual(day, self.day)
+        self.assertEqual(closed["ordensServico"]["historico"], self.document["ordensServico"]["historico"])
+        self.assertEqual(closed["jornada"]["turno"]["status"], "FECHADO")
+        self.assertTrue(closed["jornada"]["turno"]["ausenteNaColeta"])
+        self.assertTrue(changed_fields(old, closed))
+        self.assertIn("turno_fechado", self.runner._daily_sync_reasons(old, closed))
+        write_json(path, closed)
+        self.runner._enqueue_daily_sync(day, key, self.runner._daily_sync_reasons(old, closed))
+        self.assertIn(f"{day}/{key}", self.queue_items())
+        self.assertEqual(self.runner._apply_shift_limits({key: compactar_equipe_para_index(closed)}, [], now), [])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -103,6 +128,49 @@ class DailySyncQueueTests(unittest.TestCase):
         # Equipe que começa o dia já fechada (sem estado prévio) NÃO deve disparar turno_fechado
         self.assertNotIn("turno_fechado", self.runner._daily_sync_reasons({}, closed))
         self.assertEqual(self.runner._daily_sync_reasons({}, {"jornada": {"turno": {"status": "FECHADO"}}}), [])
+
+    def test_interruptions_are_queued_retried_after_restart_and_not_repeated(self):
+        for status in ("DESLOCAMENTO_ISOLADO", "RETIRADO_PELO_COD"):
+            with self.subTest(status=status):
+                current = copy.deepcopy(self.document)
+                current["ordensServico"]["historico"] = [{
+                    "serviceId": "E3733_interrupted",
+                    "protocolo": "50954710",
+                    "statusAtual": status,
+                    "interrupcao": {"inferida": True, "protocoloSeguinte": "10000123456"},
+                }]
+                reasons = self.runner._daily_sync_reasons(self.document, current)
+                self.assertEqual(reasons, ["alteracao_interrupcao"])
+                write_json(self.daily_path, current)
+                self.runner._enqueue_daily_sync(self.day, self.team_key, reasons)
+                self.repo.save_daily.side_effect = OSError("offline")
+                self.assertEqual(self.runner._flush_daily_sync_queue()["pending"], 1)
+                self.runner = self.new_runner()
+                self.repo.save_daily.side_effect = None
+                self.repo.reset_mock()
+                self.assertEqual(self.runner._flush_daily_sync_queue()["uploaded"], 1)
+                self.repo.save_daily.assert_called_once_with(current, self.day)
+                self.assertEqual(self.queue_items(), {})
+                repeated = copy.deepcopy(current)
+                repeated["ordensServico"]["historico"][0]["interrupcao"]["observadoEm"] = "10:01"
+                self.assertEqual(self.runner._daily_sync_reasons(current, repeated), [])
+                self.runner._enqueue_daily_sync(self.day, self.team_key, reasons)
+                self.assertEqual(self.queue_items(), {})
+
+    def test_interruption_correction_and_later_completion_trigger_publication(self):
+        previous = copy.deepcopy(self.document)
+        previous["ordensServico"]["historico"] = [{
+            "serviceId": "E3733_interrupted", "protocolo": "50954710",
+            "statusAtual": "DESLOCAMENTO_ISOLADO",
+        }]
+        corrected = copy.deepcopy(previous)
+        corrected["ordensServico"]["historico"][0]["statusAtual"] = "RETIRADO_PELO_COD"
+        self.assertEqual(self.runner._daily_sync_reasons(previous, corrected), ["alteracao_interrupcao"])
+        completed = copy.deepcopy(corrected)
+        completed["ordensServico"]["historico"][0]["statusAtual"] = "CONCLUSAO"
+        reasons = self.runner._daily_sync_reasons(corrected, completed)
+        self.assertIn("servico_concluido", reasons)
+        self.assertIn("alteracao_interrupcao", reasons)
 
     def test_corrected_service_id_does_not_repeat_same_completion(self):
         previous = copy.deepcopy(self.document)

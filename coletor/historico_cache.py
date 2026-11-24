@@ -11,6 +11,8 @@ import unicodedata
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from .historico_parsing import extract_source_diary_id
+
 LOG = logging.getLogger("coletor-historico")
 COLETA_UNICA_SCHEMA_VERSION = 2
 MAX_CACHE_AGE = datetime.timedelta(hours=24)
@@ -167,6 +169,9 @@ def cached_team_details(turnos: list[dict[str, Any]]) -> dict[tuple[str, str, st
         details: dict[str, str] = {
             "Agência Nome completo": record["Agência Nome completo"],
         }
+        diary_id = extract_source_diary_id(record.get("Diário URL"))
+        if diary_id:
+            details["sourceDiaryId"] = diary_id
         for number in (1, 2):
             details[f"Eletricista {number} Registro"] = record[f"Eletricista {number} Matrícula"]
             details[f"Eletricista {number} Nome"] = record[f"Eletricista {number} Nome completo"]

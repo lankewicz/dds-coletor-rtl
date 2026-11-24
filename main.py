@@ -38,6 +38,7 @@ from coletor.historico import (
     varrer_mes_anterior,
 )
 from coletor.parser import extrair_dados_tempo_real
+from coletor.shift_policy import apply_shift_limit, preserve_closed_shift, reopen_returning_team
 from coletor.team_registry import TeamRegistry
 from coletor.storage import (
     RotalogExecutionLog,
@@ -240,6 +241,41 @@ class LocalRotalogRunner:
         if inicio and len(str(inicio)) >= 10:
             return str(inicio)[:10]
         return fallback_day
+
+    def _apply_shift_limits(self, previous: dict, prepared: list, now: datetime) -> list:
+        result = []
+        observed = {item[0] for item in prepared}
+        for key, day, path, old, document in prepared:
+            closed = apply_shift_limit(document, now)
+            if closed is not document:
+                event_key = self._shift_event_key(closed, "turno_fechado")
+                if event_key:
+                    closed.setdefault("observedShiftEvents", {})[event_key] = True
+            result.append((key, day, path, old, closed))
+        for key, snapshot in previous.items():
+            if key in observed:
+                continue
+            if apply_shift_limit(snapshot, now, absent=True) is snapshot:
+                continue
+            shift = (snapshot.get("jornada") or {}).get("turno") or {}
+            day = str(shift.get("inicio") or snapshot.get("operationalDate") or snapshot.get("date"))[:10]
+            path = self._daily_path(day, key)
+            # O índice não contém o histórico completo de OS.
+            old = self._load_daily_with_recovery(path, day, key)
+            if not old and self.firebase_enabled and self.team_repo:
+                old = self.firebase_store.load_blob(self.team_repo.daily_path(day, key))
+                if not self._valid_daily_recovery(old, day, key):
+                    old = {}
+            if not old:
+                LOG.error("Turno de %s excedeu 18h, mas o diário de %s não foi recuperado; fechando somente o índice", key, day)
+                previous[key] = apply_shift_limit(snapshot, now, absent=True)
+                continue
+            document = apply_shift_limit(old, now, absent=True)
+            event_key = self._shift_event_key(document, "turno_fechado")
+            if event_key and document is not old:
+                document.setdefault("observedShiftEvents", {})[event_key] = True
+            result.append((key, day, path, old, document))
+        return result
 
     @staticmethod
     def _tower_summary(equipes: dict) -> dict:
@@ -572,6 +608,22 @@ class LocalRotalogRunner:
         if any(not any(same_completion(old, new) for old in previous_concluded)
                for new in completed(current)):
             reasons.append("servico_concluido")
+
+        def interruptions(document):
+            return {
+                str(service.get("serviceId") or (
+                    service.get("protocolo"),
+                    service.get("inicioDeslocamento") or service.get("inicioExecucao"),
+                )): service
+                for service in (document.get("ordensServico") or {}).get("historico") or []
+                if isinstance(service, dict)
+                and service.get("statusAtual") in ("DESLOCAMENTO_ISOLADO", "RETIRADO_PELO_COD")
+            }
+
+        previous_interruptions = LocalRotalogRunner._daily_document_digest(interruptions(previous))
+        current_interruptions = LocalRotalogRunner._daily_document_digest(interruptions(current))
+        if previous_interruptions != current_interruptions:
+            reasons.append("alteracao_interrupcao")
         known = previous.get("observedShiftEvents") or {}
         return [reason for reason in reasons if reason not in ("turno_aberto", "turno_fechado")
                 or LocalRotalogRunner._shift_event_key(current, reason) not in known]
@@ -928,6 +980,7 @@ class LocalRotalogRunner:
                 team_key = normalize_team_key(team.get("equipe_codigo"))
                 if not team_key:
                     continue
+                allow_reopening = reopen_returning_team(team, previous.get(team_key, {}), scraped_at)
                 identity = self.team_registry.observe(
                     team_key,
                     team.get("colaborador"),
@@ -961,6 +1014,8 @@ class LocalRotalogRunner:
                                 team_key, previous_daily["teamId"], document["teamId"], archive)
                 merged_daily = merge_daily_document(previous_daily, document, operational_day,
                                                     allow_identity_uncertainty=True)
+                if not allow_reopening:
+                    merged_daily = preserve_closed_shift(merged_daily, previous[team_key])
                 merged_daily["fila"] = queue_counts(team)
                 known = dict(previous_daily.get("observedShiftEvents") or {})
                 recognized = self._daily_sync_reasons(previous_daily, merged_daily)
@@ -980,6 +1035,8 @@ class LocalRotalogRunner:
                     )
 
                 prepared_daily.append((team_key, operational_day, daily_path, previous_daily, merged_daily))
+
+            prepared_daily = self._apply_shift_limits(previous, prepared_daily, scraped_at)
 
             # Salva todos os documentos completos antes de distribuí-los por equipe.
             # Este caminho não participa das filas nem dos destinos de upload.

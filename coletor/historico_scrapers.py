@@ -12,7 +12,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from .client import CrawlerRotalog
-from .historico_parsing import parse_float_br
+from .historico_parsing import parse_float_br, extract_source_diary_id
 from .historico_cache import cached_team_details, team_cache_key
 from .historico_terminal import formatar_numero_br
 
@@ -183,6 +183,9 @@ class RotalogEquipesScraper:
                     render_match = re.search(r"(?:u|update)\s*:\s*['\"]([^'\"]+)", onclick)
                     source = source_match.group(1) if source_match else str(team_link.get("id") or "").strip()
                     record["_detalheHref"] = href
+                    diary_id = extract_source_diary_id(href)
+                    if diary_id:
+                        record["sourceDiaryId"] = diary_id
                     record["_detalheSource"] = source
                     record["_detalheRender"] = render_match.group(1) if render_match else "@all"
                 records.append(record)
@@ -259,7 +262,10 @@ class RotalogEquipesScraper:
                 progresso(f"Profissionais {index}/{len(records)} | Equipe {record.get('Veiculo', '')}")
             candidates = cache.get(team_cache_key(record), [])
             if len(candidates) == 1:
-                record.update(candidates[0])
+                details = dict(candidates[0])
+                if record.get("sourceDiaryId"):
+                    details.pop("sourceDiaryId", None)
+                record.update(details)
                 reused += 1
                 record.pop("_detalheHref", None)
                 record.pop("_detalheSource", None)

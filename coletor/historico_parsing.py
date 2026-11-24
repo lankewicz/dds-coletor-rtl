@@ -6,6 +6,18 @@ import datetime
 import re
 import typing
 from zoneinfo import ZoneInfo
+from urllib.parse import urljoin, urlparse, parse_qs
+
+
+def extract_source_diary_id(value: typing.Any) -> str:
+    """Extrai somente o ID do diário atual em uma URL do portal ROTALOG."""
+    parsed = urlparse(urljoin("https://www.copel.com/rtlweb/paginas/equipes", str(value or "")))
+    ids = parse_qs(parsed.query).get("id", [])
+    if (parsed.scheme == "https" and parsed.netloc == "www.copel.com"
+            and parsed.path == "/rtlweb/paginas/timeline"
+            and len(ids) == 1 and ids[0].isascii() and ids[0].isdigit()):
+        return ids[0]
+    return ""
 
 
 def parse_float_br(val: typing.Any) -> float:

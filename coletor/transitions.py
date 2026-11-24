@@ -68,7 +68,7 @@ def changed_fields(
 
         prev_turno = prev_jornada.get("turno") or {}
         curr_turno = curr_jornada.get("turno") or {}
-        for k in ("status", "inicio", "fim"):
+        for k in ("status", "inicio", "fim", "ausenteNaColeta"):
             if prev_turno.get(k) != curr_turno.get(k):
                 changes[f"jornada.turno.{k}"] = {"anterior": prev_turno.get(k), "novo": curr_turno.get(k)}
 
@@ -209,6 +209,21 @@ def summarize_team_transition(
         return "OS concluída"
     if "correcao_servico_concluido" in reasons:
         return _summarize_history_correction(previous, current)
+    if "alteracao_interrupcao" in reasons:
+        labels = {
+            "DESLOCAMENTO_ISOLADO": "Deslocamento Isolado",
+            "RETIRADO_PELO_COD": "Retirado pelo COD",
+        }
+        previous_history = ((previous or {}).get("ordensServico") or {}).get("historico") or []
+        for service in reversed((current.get("ordensServico") or {}).get("historico") or []):
+            if service.get("statusAtual") not in labels:
+                continue
+            if service in previous_history:
+                continue
+            label = labels[service["statusAtual"]]
+            protocol = service.get("protocolo")
+            return f"{protocol}: {label}" if protocol else label
+        return "Atualização de SS interrompida"
     if "turno_aberto" in reasons:
         return "Início de Turno"
     if "turno_fechado" in reasons:
@@ -244,10 +259,12 @@ def summarize_team_transition(
 
     prev_concluidos = prev_os.get("totalConcluidos")
     if prev_concluidos is None:
-        prev_concluidos = len(prev_os.get("historico") or [])
+        prev_concluidos = sum(service.get("statusAtual") == "CONCLUSAO"
+                             for service in prev_os.get("historico") or [])
     curr_concluidos = curr_os.get("totalConcluidos")
     if curr_concluidos is None:
-        curr_concluidos = len(curr_os.get("historico") or [])
+        curr_concluidos = sum(service.get("statusAtual") == "CONCLUSAO"
+                             for service in curr_os.get("historico") or [])
 
     if curr_concluidos > prev_concluidos:
         return "Execução --> Conclusão"

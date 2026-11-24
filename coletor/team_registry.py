@@ -189,6 +189,7 @@ class TeamRegistry:
         operational_date: str = "",
         base: str = "",
         tablet: str = "",
+        source_diary_id: str = "",
     ) -> str | None:
         """Inclui registros e nomes oficiais obtidos no histórico do ROTALOG."""
         clean = [
@@ -259,18 +260,18 @@ class TeamRegistry:
 
         if registrations:
             crew_key = "|".join(sorted(registrations))
-            crew = next((item for item in team.setdefault("crewHistory", [])
-                         if item.get("observedAt") == observed_at
-                         and item.get("shiftReference") == shift_reference
-                         and normalize_team_key(item.get("vehicleCode")) == normalize_team_key(vehicle_code)), None)
             crew_observation = {
+                "operationalDate": operational_date or observed_at[:10],
                 "observedAt": observed_at,
                 "shiftReference": shift_reference,
                 "vehicleCode": normalize_team_key(vehicle_code),
                 "crewKey": crew_key,
                 "professionalIds": sorted(registrations),
             }
-            if crew and crew != crew_observation:
+            if source_diary_id:
+                crew_observation["sourceDiaryId"] = str(source_diary_id)
+            crew = _find_shift_observation(team.setdefault("crewHistory", []), crew_observation)
+            if crew and {**crew, **crew_observation} != crew:
                 crew.update(crew_observation)
                 self.dirty = True
             elif not crew:
@@ -287,6 +288,7 @@ class TeamRegistry:
             base,
             tablet,
             clean,
+            source_diary_id=source_diary_id,
         )
         team["updatedAt"] = max(str(team.get("updatedAt") or ""), observed_at)
         return team_id
@@ -301,6 +303,8 @@ class TeamRegistry:
         base: str,
         tablet: str,
         professionals: list[dict[str, str]],
+        *,
+        source_diary_id: str = "",
     ) -> None:
         """Registra observações históricas e recalcula as mudanças da equipe."""
         team = self.data["teams"].get(team_id)
@@ -328,31 +332,11 @@ class TeamRegistry:
             "tablet": str(tablet or "").replace("*", "").strip(),
             "electricians": electricians,
         }
+        if source_diary_id:
+            assignment["sourceDiaryId"] = str(source_diary_id)
         history = team.setdefault("assignmentHistory", [])
-        current = next(
-            (
-                item for item in history
-                if item.get("observedAt") == observed_at
-                and item.get("shiftReference") == shift_reference
-                and normalize_team_key(item.get("vehicleCode")) == assignment["vehicleCode"]
-            ),
-            None,
-        )
-        if current is None:
-            # A shift reference can be corrected during reprocessing. Match the
-            # old observation by its time window, but only when that identifies
-            # exactly one shift for this vehicle and operational date.
-            shift_window = _shift_window(shift_reference)
-            if shift_window:
-                candidates = [
-                    item for item in history
-                    if item.get("operationalDate") == operational_date
-                    and normalize_team_key(item.get("vehicleCode")) == assignment["vehicleCode"]
-                    and _windows_overlap(shift_window, _shift_window(item.get("shiftReference", "")))
-                ]
-                if len(candidates) == 1:
-                    current = candidates[0]
-        if current == assignment:
+        current = _find_shift_observation(history, assignment)
+        if current is not None and {**current, **assignment} == current:
             return
         if current:
             current.update(assignment)
@@ -405,6 +389,31 @@ class TeamRegistry:
         if self.dirty or not self.path.exists():
             write_json(self.path, self.data)
             self.dirty = False
+
+
+def _find_shift_observation(history: list[dict], observation: dict) -> dict | None:
+    diary_id = observation.get("sourceDiaryId")
+    if diary_id:
+        identified = [item for item in history if item.get("sourceDiaryId") == diary_id]
+        if identified:
+            return identified[0] if len(identified) == 1 else None
+    # Diários conhecidos e diferentes nunca são combinados por horário.
+    candidates = [
+        item for item in history
+        if (not diary_id or not item.get("sourceDiaryId"))
+        and (item.get("operationalDate") or str(item.get("observedAt") or "")[:10]) == observation["operationalDate"]
+        and normalize_team_key(item.get("vehicleCode")) == observation["vehicleCode"]
+    ]
+    exact = [item for item in candidates
+             if item.get("observedAt") == observation["observedAt"]
+             and item.get("shiftReference") == observation["shiftReference"]]
+    if exact:
+        return exact[0] if len(exact) == 1 else None
+    window = _shift_window(observation["shiftReference"])
+    overlapping = [item for item in candidates
+                   if not item.get("sourceDiaryId") and window
+                   and _windows_overlap(window, _shift_window(item.get("shiftReference", "")))]
+    return overlapping[0] if len(overlapping) == 1 else None
 
 
 def _shift_window(reference: str) -> tuple[int, int] | None:
